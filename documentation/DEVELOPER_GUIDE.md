@@ -51,8 +51,13 @@ The script has two halves:
 ### The scanning pipeline
 
 ```
-Get-LiveListeners            netstat-equivalent scan → per-port process info
-  → Get-ProcessWorkingDirectory   PEB read to find the real project folder
+[background runspace, own loop] netstat-equivalent scan → per-port process
+  info → Get-ProcessWorkingDirectory (PEB read) → written into
+  $script:LiveCache every ~4s
+
+Get-LiveListeners            reads the current $script:LiveCache snapshot
+                              (no scanning on this thread — see
+                              "Background polling" below)
   → Build-Rows                   merges live + remembered (history) ports,
                                   applies OnlyNode/RootDir filters,
                                   attaches CustomName
@@ -122,11 +127,55 @@ about before touching that code:
   not on every timer tick — rebuilding it while it's already open (from a
   background timer) made it visibly blink.
 
+### Background polling
+
+`Get-NetTCPConnection` and `Get-NetIPAddress` are WMI-backed and routinely
+take 200ms-1s+ to return. Earlier versions called them directly from the
+UI-thread refresh timer, which froze the whole window (most visibly, drag
+via the title bar would stutter every ~4 seconds — the timer tick blocked
+the same thread that pumps mouse-move messages).
+
+As of v1.5.2 the scan runs on its own background runspace instead:
+
+```
+$script:LiveCache          [hashtable]::Synchronized — the only thing
+                            shared between the UI runspace and the poller
+$script:BackgroundPollScript   scriptblock run in the background runspace:
+                            loops forever, does the actual
+                            Get-NetTCPConnection / Get-NetIPAddress /
+                            Get-ProcessWorkingDirectory work, and swaps a
+                            freshly-built hashtable into
+                            $Cache.Listeners / $Cache.LanIps each cycle
+                            (whole-object reference swap, never mutates
+                            a dict the UI thread might be mid-iteration on)
+$script:PollRunspace /
+$script:PollShell          created once near startup via
+                            [runspacefactory]::CreateRunspace() +
+                            [powershell]::Create(), invoked with
+                            .BeginInvoke() (non-blocking)
+Stop-BackgroundPoller       sets $Cache.StopRequested, stops/disposes the
+                            shell, closes the runspace — called from
+                            FormClosing on real exit
+```
+
+The background scriptblock re-declares `Get-ProcessWorkingDirectory`
+rather than reusing the one defined in the main runspace's script scope —
+runspaces don't share function/variable scope, only the process's
+AppDomain, so the `LocalhostManager.ProcCwd` P/Invoke type (loaded once
+via `Add-Type` at the top of the file) is visible from it, but functions
+and `$script:` variables are not.
+
+At startup, `Application.Run` is preceded by a short bounded wait (up to
+3s) for `$script:LiveCache.Ready` so the first paint isn't an empty grid
+that immediately repopulates.
+
 ### Refresh loop and edit-safety
 
 A `System.Windows.Forms.Timer` on a 4-second interval drives
-`Refresh-Grid`. It bails out early if `$grid.IsCurrentCellInEditMode` is
-true, so it never clobbers an in-progress Custom Name edit.
+`Refresh-Grid`, which now just reads the current `$script:LiveCache`
+snapshot (effectively instant) instead of scanning. It bails out early if
+`$grid.IsCurrentCellInEditMode` is true, so it never clobbers an
+in-progress Custom Name edit.
 
 ### Tray / close-to-tray
 

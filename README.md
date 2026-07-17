@@ -30,8 +30,14 @@ module:
 Install-Module ps2exe -Scope CurrentUser
 Import-Module ps2exe
 Invoke-PS2EXE -InputFile LocalhostManager.ps1 -OutputFile LocalhostManager.exe `
-  -noConsole -iconFile LocalhostManager.ico -title "Localhost Manager"
+  -noConsole -iconFile LocalhostManager.ico -title "Localhost Manager" -x64
 ```
 
 Keep `LocalhostManager.ico` and `LocalhostManager-alert.ico` next to the
 compiled `.exe` — they're loaded at runtime for the window/tray icons.
+
+`-x64` is required: the app reads a target process's PEB directly
+(`Get-ProcessWorkingDirectory`) to recover its working directory, and a
+32-bit build cannot read the memory of 64-bit processes like `node.exe`.
+Without `-x64`, every Node/npm dev server silently fails working-directory
+detection and gets filtered out by the "Node/npm projects only" checkbox.

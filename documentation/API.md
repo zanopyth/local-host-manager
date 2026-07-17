@@ -15,18 +15,26 @@ reading its PEB, or `$null` if the read fails for any reason. See
 `NtQueryInformationProcess`/`ReadProcessMemory` P/Invoke calls.
 
 ### `Get-LiveListeners`
-No parameters. Scans every TCP port currently in the `Listen` state
-(`Get-NetTCPConnection`), resolves each to a process name + working
-directory, and filters out well-known Windows system processes
-(`$script:ExcludedProcessNames`). Returns a hashtable keyed by port
-(string) → `@{ Port; ProcId; ProcessName; LocalAddr; ProjectPath; IsNode }`.
-`IsNode` is `$true` when `package.json` exists in the recovered
-`ProjectPath`.
+No parameters. Returns the most recent snapshot from `$script:LiveCache`
+(a `[hashtable]::Synchronized` shared with the background poller runspace
+— see "Background polling" in `DEVELOPER_GUIDE.md`): a hashtable keyed by
+port (string) → `@{ Port; ProcId; ProcessName; LocalAddr; ProjectPath;
+IsNode }`. `IsNode` is `$true` when `package.json` exists in the recovered
+`ProjectPath`. This call itself never touches the network/WMI — the
+actual `Get-NetTCPConnection` scan, process resolution, and PEB read
+happen off the UI thread in `$script:BackgroundPollScript`.
 
 ### `Get-LanIPv4Addresses`
-No parameters. Returns every non-loopback, non-APIPA IPv4 address bound
-to this machine (LAN, VPN/Tailscale, virtual adapters — anything) as a
-string array. Used to build the "Network URL(s)" column.
+No parameters. Returns the background poller's most recent list of
+non-loopback, non-APIPA IPv4 addresses bound to this machine (LAN,
+VPN/Tailscale, virtual adapters — anything), read from
+`$script:LiveCache.LanIps`. Used to build the "Network URL(s)" column.
+
+### `Stop-BackgroundPoller`
+No parameters, no return value. Signals the background poller runspace to
+stop (`$script:LiveCache.StopRequested = $true`), then stops/disposes the
+`PowerShell` instance and closes the runspace. Called from `FormClosing`
+when the app is actually exiting (not minimizing to tray).
 
 ## Row building / filtering
 
