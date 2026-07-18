@@ -155,13 +155,6 @@ function Get-AllGroupedPaths {
     return $paths
 }
 
-function Limit-ToGroupedRows {
-    param($Rows)
-    # Used by the tray icon/menu, which always shows every known server
-    # regardless of the main window's "Use Groups" filter.
-    return $Rows
-}
-
 function Get-StatusRank {
     param([string]$Status)
     switch ($Status) {
@@ -431,6 +424,101 @@ function Build-Rows {
 # ---------------------------------------------------------------------------
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# ---------------------------------------------------------------------------
+# Theme — flat, light, GNOME/Adwaita-inspired palette. Swapped in for the
+# default WinForms 3D-bevel gray look: flat bordered buttons with rounded
+# corners, a real background/foreground color system, and a white grid
+# instead of the OS default ButtonFace gray filling unused rows.
+# ---------------------------------------------------------------------------
+$script:Theme = @{
+    WindowBg    = [System.Drawing.Color]::FromArgb(0xFA, 0xFA, 0xFA)
+    PanelBg     = [System.Drawing.Color]::FromArgb(0xF2, 0xF1, 0xF0)
+    CardBg      = [System.Drawing.Color]::White
+    Border      = [System.Drawing.Color]::FromArgb(0xD1, 0xD1, 0xD1)
+    TextPrimary = [System.Drawing.Color]::FromArgb(0x2E, 0x34, 0x36)
+    TextDim     = [System.Drawing.Color]::FromArgb(0x77, 0x76, 0x7B)
+    Accent      = [System.Drawing.Color]::FromArgb(0x35, 0x84, 0xE4)
+    AccentDark  = [System.Drawing.Color]::FromArgb(0x1C, 0x71, 0xD8)
+    AccentTint  = [System.Drawing.Color]::FromArgb(0xE3, 0xEE, 0xFB)
+    Success     = [System.Drawing.Color]::FromArgb(0x26, 0xA2, 0x69)
+    SuccessTint = [System.Drawing.Color]::FromArgb(0xE3, 0xF6, 0xEC)
+    Danger      = [System.Drawing.Color]::FromArgb(0xC0, 0x1C, 0x28)
+    DangerTint  = [System.Drawing.Color]::FromArgb(0xFB, 0xE6, 0xE7)
+    RowAlt      = [System.Drawing.Color]::FromArgb(0xF7, 0xF6, 0xF5)
+}
+
+function Initialize-ModernButton {
+    # Fully owner-drawn button: a Region-based clip would leave hard,
+    # stair-stepped corners (Region has no anti-aliasing). Instead this
+    # erases the button to its parent's background color, then fills +
+    # strokes an anti-aliased rounded-rect path and draws the text itself,
+    # for genuinely smooth "vector" corners with proper hover/press states.
+    # Neutral = white with a gray border. Accent/Success/Danger keep a white
+    # fill but swap the border + text color, so semantic buttons (Save,
+    # Delete, Stop All) read as colored without becoming a solid block.
+    param($Button, [string]$Variant = 'Neutral', [int]$Radius = 8)
+
+    switch ($Variant) {
+        'Accent'  { $fg = $script:Theme.Accent;  $borderNormal = $script:Theme.Border;  $fillActive = $script:Theme.AccentTint;  $borderActive = $script:Theme.Accent }
+        'Success' { $fg = $script:Theme.Success; $borderNormal = $script:Theme.Success; $fillActive = $script:Theme.SuccessTint; $borderActive = $script:Theme.Success }
+        'Danger'  { $fg = $script:Theme.Danger;  $borderNormal = $script:Theme.Danger;  $fillActive = $script:Theme.DangerTint;  $borderActive = $script:Theme.Danger }
+        default   { $fg = $script:Theme.TextPrimary; $borderNormal = $script:Theme.Border; $fillActive = $script:Theme.PanelBg; $borderActive = $script:Theme.Border }
+    }
+
+    $Button.FlatStyle = 'Flat'
+    $Button.FlatAppearance.BorderSize = 0
+    $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::Transparent
+    $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::Transparent
+    $Button.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Button.UseVisualStyleBackColor = $false
+    $Button.Tag = [PSCustomObject]@{
+        State = 'Normal'; Fg = $fg; BorderNormal = $borderNormal; FillActive = $fillActive; BorderActive = $borderActive; Radius = $Radius
+    }
+
+    $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+    $dbProp.SetValue($Button, $true, $null)
+
+    $Button.Add_MouseEnter({ param($s, $e) $s.Tag.State = 'Hover'; $s.Invalidate() })
+    $Button.Add_MouseLeave({ param($s, $e) $s.Tag.State = 'Normal'; $s.Invalidate() })
+    $Button.Add_MouseDown({ param($s, $e) $s.Tag.State = 'Pressed'; $s.Invalidate() })
+    $Button.Add_MouseUp({ param($s, $e) $s.Tag.State = 'Hover'; $s.Invalidate() })
+
+    $Button.Add_Paint({
+        param($s, $e)
+        $t = $s.Tag
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { [System.Drawing.Color]::White }
+        $g.Clear($parentColor)
+
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+        $d = [Math]::Min($t.Radius * 2, [Math]::Min($rect.Width, $rect.Height))
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
+        $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
+        $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
+        $path.CloseFigure()
+
+        $fillColor = if ($t.State -eq 'Normal') { [System.Drawing.Color]::White } else { $t.FillActive }
+        $borderColor = if ($t.State -eq 'Normal') { $t.BorderNormal } else { $t.BorderActive }
+
+        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+        $g.FillPath($fillBrush, $path)
+        $fillBrush.Dispose()
+
+        $borderPen = New-Object System.Drawing.Pen($borderColor, 1.4)
+        $g.DrawPath($borderPen, $path)
+        $borderPen.Dispose()
+
+        $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $t.Fg, $flags)
+
+        $path.Dispose()
+    })
+}
+
 $script:Settings = Load-Settings
 $script:RootDir = $script:Settings.RootDir
 $script:CustomNames = Load-CustomNames
@@ -444,10 +532,49 @@ $script:SelectedGroups = @($script:Settings.SelectedGroups | Where-Object { $scr
 # is often a few process-tree hops downstream of this one.
 $script:ManagedProcesses = @{}
 $script:LogCap = 1000
+$script:LogDir = Join-Path $script:HistoryDir 'logs'
+$script:LogDiskCap = 2000
 
 function New-ManagedLogLine {
     param([string]$Text)
     return "[$(Get-Date -Format 'HH:mm:ss')] $Text"
+}
+
+function Get-ProjectLogFilePath {
+    # In-memory logs (below) don't survive the app restarting — the process
+    # handle/redirected-output streams they depend on are gone the moment
+    # this app's own process exits, even if the launched dev server itself
+    # is still running. Mirroring each line to a per-project file here is
+    # what lets Show-LogViewer still show history after a restart (app
+    # update, crash, machine sleep/wake killing the tray process, etc).
+    param([string]$ProjectPath)
+    $key = Get-NormalizedPath $ProjectPath
+    if (-not $key) { return $null }
+    $safe = ($key -replace '[:\\/]', '_') -replace '[^a-z0-9_\-. ]', '_'
+    if ($safe.Length -gt 150) { $safe = $safe.Substring(0, 150) }
+    return Join-Path $script:LogDir "$safe.log"
+}
+
+function Save-ProjectLogLine {
+    param([string]$ProjectPath, [string]$Line)
+    $path = Get-ProjectLogFilePath -ProjectPath $ProjectPath
+    if (-not $path) { return }
+    try {
+        if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+        Add-Content -Path $path -Value $Line -Encoding UTF8
+    } catch {}
+}
+
+function Limit-ProjectLogFile {
+    # Called once per project start (not per line) to keep the on-disk log
+    # from growing unbounded across many restarts/sessions.
+    param([string]$ProjectPath)
+    $path = Get-ProjectLogFilePath -ProjectPath $ProjectPath
+    if (-not $path -or -not (Test-Path $path)) { return }
+    try {
+        $lines = @(Get-Content -Path $path -Tail $script:LogDiskCap -ErrorAction Stop)
+        Set-Content -Path $path -Value $lines -Encoding UTF8
+    } catch {}
 }
 
 function Add-ManagedLog {
@@ -455,9 +582,11 @@ function Add-ManagedLog {
     if (-not $Text) { return }
     foreach ($line in ($Text -split "`r?`n")) {
         if ($line -eq '') { continue }
-        $Entry.Log.Enqueue((New-ManagedLogLine $line))
+        $logLine = New-ManagedLogLine $line
+        $Entry.Log.Enqueue($logLine)
         $discard = $null
         while ($Entry.Log.Count -gt $script:LogCap) { [void]$Entry.Log.TryDequeue([ref]$discard) }
+        if ($Entry.ProjectPath) { Save-ProjectLogLine -ProjectPath $Entry.ProjectPath -Line $logLine }
     }
 }
 
@@ -493,7 +622,7 @@ function New-ToggleSwitch {
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $isOn = $s.Tag.Checked
-        $bg = if ($isOn) { [System.Drawing.Color]::FromArgb(46, 160, 67) } else { [System.Drawing.Color]::FromArgb(130, 130, 135) }
+        $bg = if ($isOn) { $script:Theme.Accent } else { [System.Drawing.Color]::FromArgb(0xC6, 0xC6, 0xC6) }
         $d = $s.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
         $path.AddArc(0, 0, $d, $d, 90, 180)
@@ -543,65 +672,151 @@ function Connect-ToggleLabel {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Localhost Manager'
-$form.Size = New-Object System.Drawing.Size(920, 560)
+$form.Size = New-Object System.Drawing.Size(960, 580)
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(700, 400)
 $form.Icon = $script:IconOk
+$form.BackColor = $script:Theme.WindowBg
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+# ---------------------------------------------------------------------------
+# Menu bar — the standard File / Settings / About a desktop app is expected
+# to have. Menu items call straight into the same functions the old toolbar
+# buttons used (Show-SettingsDialog, Show-ManageGroupsDialog, Refresh-Grid,
+# the tray Exit path); no persistence/business logic lives here.
+# ---------------------------------------------------------------------------
+$menuStrip = New-Object System.Windows.Forms.MenuStrip
+$menuStrip.BackColor = [System.Drawing.Color]::White
+$menuStrip.ForeColor = $script:Theme.TextPrimary
+$menuStrip.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$menuStrip.Padding = New-Object System.Windows.Forms.Padding(8, 3, 0, 3)
+
+$menuFile = New-Object System.Windows.Forms.ToolStripMenuItem('File')
+$menuFileRefresh = New-Object System.Windows.Forms.ToolStripMenuItem('Refresh')
+$menuFileRefresh.ShortcutKeys = [System.Windows.Forms.Keys]::F5
+$menuFileRefresh.Add_Click({ Refresh-Grid })
+$menuFileExit = New-Object System.Windows.Forms.ToolStripMenuItem('Exit')
+$menuFileExit.Add_Click({
+    $script:ReallyExit = $true
+    $notifyIcon.Visible = $false
+    $form.Close()
+})
+[System.Windows.Forms.ToolStripItem[]]$menuFileItems = @($menuFileRefresh, (New-Object System.Windows.Forms.ToolStripSeparator), $menuFileExit)
+$menuFile.DropDownItems.AddRange($menuFileItems)
+
+$menuSettings = New-Object System.Windows.Forms.ToolStripMenuItem('Settings')
+$menuSettingsPrefs = New-Object System.Windows.Forms.ToolStripMenuItem('Preferences...')
+$menuSettingsPrefs.Add_Click({ Show-SettingsDialog })
+$menuSettingsGroups = New-Object System.Windows.Forms.ToolStripMenuItem('Manage Groups...')
+$menuSettingsGroups.Add_Click({ Show-ManageGroupsDialog })
+$menuSettingsNodeOnly = New-Object System.Windows.Forms.ToolStripMenuItem('Node/npm projects only')
+$menuSettingsNodeOnly.Checked = $script:Settings.OnlyNode
+$menuSettingsNodeOnly.Add_Click({
+    Invoke-ToggleClick -Switch $nodeOnlySwitch
+    $menuSettingsNodeOnly.Checked = Get-ToggleChecked $nodeOnlySwitch
+})
+$menuSettingsUseGroups = New-Object System.Windows.Forms.ToolStripMenuItem('Use Groups')
+$menuSettingsUseGroups.Checked = $script:Settings.ShowGroups
+$menuSettingsUseGroups.Add_Click({
+    Invoke-ToggleClick -Switch $useGroupsSwitch
+    $menuSettingsUseGroups.Checked = Get-ToggleChecked $useGroupsSwitch
+})
+[System.Windows.Forms.ToolStripItem[]]$menuSettingsItems = @($menuSettingsPrefs, $menuSettingsGroups, (New-Object System.Windows.Forms.ToolStripSeparator), $menuSettingsNodeOnly, $menuSettingsUseGroups)
+$menuSettings.DropDownItems.AddRange($menuSettingsItems)
+
+$menuAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
+$menuAbout.Add_Click({ Show-AboutDialog })
+
+[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuAbout)
+$menuStrip.Items.AddRange($menuTopItems)
+$form.MainMenuStrip = $menuStrip
 
 $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = 'Top'
-$topPanel.Height = 76
+$topPanel.Height = 90
+$topPanel.BackColor = $script:Theme.PanelBg
 
+$topPanelDivider = New-Object System.Windows.Forms.Panel
+$topPanelDivider.Dock = 'Bottom'
+$topPanelDivider.Height = 1
+$topPanelDivider.BackColor = $script:Theme.Border
+
+function New-VerticalDivider {
+    param([int]$X)
+    $div = New-Object System.Windows.Forms.Panel
+    $div.Location = New-Object System.Drawing.Point($X, 12)
+    $div.Size = New-Object System.Drawing.Size(1, 28)
+    $div.BackColor = $script:Theme.Border
+    return $div
+}
+
+# ---------------------------------------------------------------------------
+# Toolbar layout. Everything sits on a shared grid: 16px outer margin, 12px
+# between neighbors in the same cluster, 16px around dividers, and every
+# control on a row is vertically centered on the same line (buttons are
+# 28px tall at y=12, so 20-22px controls sit at y=15/16). Row 2's buttons
+# line up with row 1's columns (Start All starts where the group dropdown
+# ends + 12; Stop All's right edge meets the scope divider).
+# ---------------------------------------------------------------------------
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = 'Refresh'
-$refreshButton.Location = New-Object System.Drawing.Point(10, 8)
-$refreshButton.Size = New-Object System.Drawing.Size(80, 24)
+$refreshButton.Location = New-Object System.Drawing.Point(16, 12)
+$refreshButton.Size = New-Object System.Drawing.Size(84, 28)
+
+$divider1 = New-VerticalDivider -X 112
 
 $nodeOnlySwitch = New-ToggleSwitch -Checked $script:Settings.OnlyNode
-$nodeOnlySwitch.Location = New-Object System.Drawing.Point(100, 10)
+$nodeOnlySwitch.Location = New-Object System.Drawing.Point(128, 16)
 
 $nodeOnlyLabel = New-Object System.Windows.Forms.Label
 $nodeOnlyLabel.Text = 'Node/npm projects only'
-$nodeOnlyLabel.Location = New-Object System.Drawing.Point(143, 11)
-$nodeOnlyLabel.Size = New-Object System.Drawing.Size(150, 20)
-
-$settingsButton = New-Object System.Windows.Forms.Button
-$settingsButton.Text = 'Settings...'
-$settingsButton.Location = New-Object System.Drawing.Point(298, 8)
-$settingsButton.Size = New-Object System.Drawing.Size(80, 24)
+$nodeOnlyLabel.Location = New-Object System.Drawing.Point(174, 15)
+$nodeOnlyLabel.Size = New-Object System.Drawing.Size(152, 22)
+$nodeOnlyLabel.TextAlign = 'MiddleLeft'
+$nodeOnlyLabel.ForeColor = $script:Theme.TextPrimary
 
 $useGroupsSwitch = New-ToggleSwitch -Checked $script:Settings.ShowGroups
-$useGroupsSwitch.Location = New-Object System.Drawing.Point(388, 10)
+$useGroupsSwitch.Location = New-Object System.Drawing.Point(338, 16)
 
 $useGroupsLabel = New-Object System.Windows.Forms.Label
 $useGroupsLabel.Text = 'Use Groups'
-$useGroupsLabel.Location = New-Object System.Drawing.Point(431, 11)
-$useGroupsLabel.Size = New-Object System.Drawing.Size(85, 20)
+$useGroupsLabel.Location = New-Object System.Drawing.Point(384, 15)
+$useGroupsLabel.Size = New-Object System.Drawing.Size(76, 22)
+$useGroupsLabel.TextAlign = 'MiddleLeft'
+$useGroupsLabel.ForeColor = $script:Theme.TextPrimary
+
+$divider2 = New-VerticalDivider -X 474
 
 $scopeLabel = New-Object System.Windows.Forms.Label
 $scopeLabel.Text = ''
-$scopeLabel.Location = New-Object System.Drawing.Point(525, 12)
-$scopeLabel.Size = New-Object System.Drawing.Size(180, 20)
-$scopeLabel.ForeColor = [System.Drawing.Color]::SteelBlue
+$scopeLabel.Location = New-Object System.Drawing.Point(490, 15)
+$scopeLabel.Size = New-Object System.Drawing.Size(224, 22)
+$scopeLabel.TextAlign = 'MiddleLeft'
+$scopeLabel.ForeColor = $script:Theme.Accent
 $scopeLabel.AutoEllipsis = $true
+$scopeLabel.Anchor = 'Top,Left,Right'
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = ''
-$statusLabel.Location = New-Object System.Drawing.Point(710, 12)
-$statusLabel.Size = New-Object System.Drawing.Size(200, 20)
-$statusLabel.ForeColor = [System.Drawing.Color]::DimGray
+$statusLabel.Location = New-Object System.Drawing.Point(730, 15)
+$statusLabel.Size = New-Object System.Drawing.Size(210, 22)
+$statusLabel.ForeColor = $script:Theme.TextDim
 $statusLabel.TextAlign = 'MiddleRight'
+$statusLabel.Anchor = 'Top,Right'
 
 $groupLabel = New-Object System.Windows.Forms.Label
 $groupLabel.Text = 'Group:'
-$groupLabel.Location = New-Object System.Drawing.Point(10, 48)
-$groupLabel.Size = New-Object System.Drawing.Size(45, 20)
+$groupLabel.Location = New-Object System.Drawing.Point(16, 53)
+$groupLabel.Size = New-Object System.Drawing.Size(46, 22)
+$groupLabel.TextAlign = 'MiddleLeft'
+$groupLabel.ForeColor = $script:Theme.TextPrimary
 
 $groupsButton = New-Object System.Windows.Forms.Button
 $groupsButton.Text = 'Groups: none selected'
 $groupsButton.TextAlign = 'MiddleLeft'
-$groupsButton.Location = New-Object System.Drawing.Point(55, 44)
-$groupsButton.Size = New-Object System.Drawing.Size(170, 24)
+$groupsButton.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+$groupsButton.Location = New-Object System.Drawing.Point(66, 50)
+$groupsButton.Size = New-Object System.Drawing.Size(200, 28)
 
 # Multi-select "dropdown": a plain Button that pops open a checked-list so
 # 2+ groups can be active in the table at once (a normal ComboBox only
@@ -609,12 +824,14 @@ $groupsButton.Size = New-Object System.Drawing.Size(170, 24)
 $groupsPopup = New-Object System.Windows.Forms.ToolStripDropDown
 $groupsPopup.AutoClose = $true
 $groupsPopup.Padding = New-Object System.Windows.Forms.Padding(2)
+$groupsPopup.BackColor = [System.Drawing.Color]::White
 
 $groupsCheckedList = New-Object System.Windows.Forms.CheckedListBox
 $groupsCheckedList.CheckOnClick = $true
 $groupsCheckedList.BorderStyle = 'None'
 $groupsCheckedList.IntegralHeight = $false
 $groupsCheckedList.Size = New-Object System.Drawing.Size(200, 130)
+$groupsCheckedList.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
 $groupsListHost = New-Object System.Windows.Forms.ToolStripControlHost($groupsCheckedList)
 $groupsListHost.AutoSize = $false
@@ -624,20 +841,20 @@ $groupsPopup.Items.Add($groupsListHost) | Out-Null
 
 $startAllButton = New-Object System.Windows.Forms.Button
 $startAllButton.Text = 'Start All'
-$startAllButton.Location = New-Object System.Drawing.Point(235, 44)
-$startAllButton.Size = New-Object System.Drawing.Size(80, 24)
+$startAllButton.Location = New-Object System.Drawing.Point(278, 50)
+$startAllButton.Size = New-Object System.Drawing.Size(84, 28)
 
 $stopAllButton = New-Object System.Windows.Forms.Button
 $stopAllButton.Text = 'Stop All'
-$stopAllButton.Location = New-Object System.Drawing.Point(320, 44)
-$stopAllButton.Size = New-Object System.Drawing.Size(80, 24)
+$stopAllButton.Location = New-Object System.Drawing.Point(374, 50)
+$stopAllButton.Size = New-Object System.Drawing.Size(84, 28)
 
-$manageGroupsButton = New-Object System.Windows.Forms.Button
-$manageGroupsButton.Text = 'Manage Groups...'
-$manageGroupsButton.Location = New-Object System.Drawing.Point(410, 44)
-$manageGroupsButton.Size = New-Object System.Drawing.Size(130, 24)
+Initialize-ModernButton -Button $refreshButton
+Initialize-ModernButton -Button $groupsButton
+Initialize-ModernButton -Button $startAllButton -Variant Success
+Initialize-ModernButton -Button $stopAllButton -Variant Danger
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $nodeOnlySwitch, $nodeOnlyLabel, $settingsButton, $useGroupsSwitch, $useGroupsLabel, $scopeLabel, $statusLabel, $groupLabel, $groupsButton, $startAllButton, $stopAllButton, $manageGroupsButton)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $divider1, $nodeOnlySwitch, $nodeOnlyLabel, $useGroupsSwitch, $useGroupsLabel, $divider2, $scopeLabel, $statusLabel, $groupLabel, $groupsButton, $startAllButton, $stopAllButton, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -648,11 +865,11 @@ function Update-GroupsVisibility {
     $groupsButton.Visible = $show
     $startAllButton.Visible = $show
     $stopAllButton.Visible = $show
-    $manageGroupsButton.Visible = $show
-    $topPanel.Height = if ($show) { 76 } else { 40 }
-    if ($grid) {
-        $grid.Location = New-Object System.Drawing.Point(0, $topPanel.Height)
-        $grid.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $topPanel.Height))
+    $topPanel.Height = if ($show) { 90 } else { 46 }
+    if ($tabControl) {
+        $gridTop = $menuStrip.Height + $topPanel.Height
+        $tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
+        $tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop))
     }
 }
 
@@ -700,95 +917,159 @@ function Update-ScopeLabel {
 }
 Update-ScopeLabel
 
-$grid = New-Object System.Windows.Forms.DataGridView
-$grid.AutoGenerateColumns = $false
-$grid.ReadOnly = $false
-$grid.AllowUserToAddRows = $false
-$grid.AllowUserToDeleteRows = $false
-$grid.AllowUserToResizeRows = $false
-$grid.RowHeadersVisible = $false
-$grid.SelectionMode = 'FullRowSelect'
-$grid.MultiSelect = $false
-$grid.EditMode = 'EditOnKeystrokeOrF2'
-$grid.EnableHeadersVisualStyles = $false
-$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 48)
-$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-$grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
-$grid.ColumnHeadersHeight = 28
-$grid.RowTemplate.Height = 26
-
-$colStatus = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.FillWeight = 45; $colStatus.ReadOnly = $true
-
-$colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.ReadOnly = $true
-
-$colCustomName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colCustomName.Name = 'CustomName'; $colCustomName.HeaderText = 'Custom Name'; $colCustomName.FillWeight = 90; $colCustomName.ReadOnly = $false
-
-$colProc = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colProc.Name = 'Process'; $colProc.HeaderText = 'Process'; $colProc.FillWeight = 70; $colProc.ReadOnly = $true
-
-$colPid = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colPid.Name = 'PID'; $colPid.HeaderText = 'PID'; $colPid.FillWeight = 45; $colPid.ReadOnly = $true
-
-$colLocal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colLocal.Name = 'LocalUrl'; $colLocal.HeaderText = 'Local URL'; $colLocal.FillWeight = 110; $colLocal.ReadOnly = $true
-
-$colLan = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colLan.Name = 'LanUrls'; $colLan.HeaderText = 'Network URL(s)'; $colLan.FillWeight = 180; $colLan.ReadOnly = $true
-
-$colPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-$colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 180; $colPath.ReadOnly = $true
-
-$colLog = New-Object System.Windows.Forms.DataGridViewButtonColumn
-$colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65; $colLog.Text = 'View Log'
-$colLog.UseColumnTextForButtonValue = $true
-$colLog.ReadOnly = $true
-
-$colAction = New-Object System.Windows.Forms.DataGridViewButtonColumn
-$colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.FillWeight = 60
-$colAction.UseColumnTextForButtonValue = $false
-$colAction.ReadOnly = $true
-
-[System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
-$grid.Columns.AddRange($gridColumns)
-$grid.AutoSizeColumnsMode = 'Fill'
-
+# Column layout is identical for the Live and History grids (same order,
+# same indices), so event handlers can address cells by a single shared
+# index map instead of per-grid column objects.
+$script:ColIdx = @{ Status = 0; Port = 1; CustomName = 2; Process = 3; PID = 4; LocalUrl = 5; LanUrls = 6; ProjectPath = 7; Log = 8; Action = 9 }
 $dgvDoubleBufferProp = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
-$dgvDoubleBufferProp.SetValue($grid, $true, $null)
-$grid.Anchor = 'Top,Bottom,Left,Right'
-$grid.Location = New-Object System.Drawing.Point(0, 76)
-$grid.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - 76))
 
+function New-PortsGrid {
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.AutoGenerateColumns = $false
+    $g.ReadOnly = $false
+    $g.AllowUserToAddRows = $false
+    $g.AllowUserToDeleteRows = $false
+    $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false
+    $g.SelectionMode = 'FullRowSelect'
+    $g.MultiSelect = $false
+    $g.EditMode = 'EditOnKeystrokeOrF2'
+    $g.BackgroundColor = $script:Theme.CardBg
+    $g.BorderStyle = 'None'
+    $g.CellBorderStyle = 'SingleHorizontal'
+    $g.GridColor = $script:Theme.Border
+    $g.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $g.EnableHeadersVisualStyles = $false
+    $g.ColumnHeadersDefaultCellStyle.BackColor = $script:Theme.PanelBg
+    $g.ColumnHeadersDefaultCellStyle.ForeColor = $script:Theme.TextPrimary
+    $g.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $g.ColumnHeadersDefaultCellStyle.Alignment = 'MiddleLeft'
+    $g.ColumnHeadersBorderStyle = 'None'
+    $g.ColumnHeadersHeightSizeMode = 'DisableResizing'
+    $g.ColumnHeadersHeight = 34
+    $g.RowTemplate.Height = 32
+    $g.DefaultCellStyle.BackColor = [System.Drawing.Color]::White
+    $g.DefaultCellStyle.ForeColor = $script:Theme.TextPrimary
+    $g.DefaultCellStyle.SelectionBackColor = $script:Theme.AccentTint
+    $g.DefaultCellStyle.SelectionForeColor = $script:Theme.TextPrimary
+    $g.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4, 0, 4, 0)
+    $g.AlternatingRowsDefaultCellStyle.BackColor = $script:Theme.RowAlt
+    $g.AlternatingRowsDefaultCellStyle.SelectionBackColor = $script:Theme.AccentTint
+
+    $colStatus = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.FillWeight = 55; $colStatus.MinimumWidth = 58; $colStatus.ReadOnly = $true
+
+    $colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
+
+    $colCustomName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colCustomName.Name = 'CustomName'; $colCustomName.HeaderText = 'Custom Name'; $colCustomName.FillWeight = 105; $colCustomName.MinimumWidth = 104; $colCustomName.ReadOnly = $false
+
+    $colProc = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colProc.Name = 'Process'; $colProc.HeaderText = 'Process'; $colProc.FillWeight = 62; $colProc.MinimumWidth = 60; $colProc.ReadOnly = $true
+
+    $colPid = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colPid.Name = 'PID'; $colPid.HeaderText = 'PID'; $colPid.FillWeight = 50; $colPid.MinimumWidth = 46; $colPid.ReadOnly = $true
+
+    $colLocal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colLocal.Name = 'LocalUrl'; $colLocal.HeaderText = 'Local URL'; $colLocal.FillWeight = 110; $colLocal.ReadOnly = $true
+
+    $colLan = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colLan.Name = 'LanUrls'; $colLan.HeaderText = 'Network URL(s)'; $colLan.FillWeight = 170; $colLan.ReadOnly = $true
+
+    $colPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 162; $colPath.ReadOnly = $true
+
+    $colLog = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65; $colLog.Text = 'View Log'
+    $colLog.UseColumnTextForButtonValue = $true
+    $colLog.ReadOnly = $true
+    $colLog.FlatStyle = 'Flat'
+    $colLog.DefaultCellStyle.ForeColor = $script:Theme.TextDim
+    $colLog.DefaultCellStyle.SelectionForeColor = $script:Theme.TextDim
+    $colLog.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
+
+    $colAction = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.FillWeight = 60
+    $colAction.UseColumnTextForButtonValue = $false
+    $colAction.ReadOnly = $true
+    $colAction.FlatStyle = 'Flat'
+
+    [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
+    $g.Columns.AddRange($gridColumns)
+    $g.AutoSizeColumnsMode = 'Fill'
+    $dgvDoubleBufferProp.SetValue($g, $true, $null)
+    $g.Dock = 'Fill'
+    return $g
+}
+
+$liveGrid = New-PortsGrid
+$historyGrid = New-PortsGrid
+
+$tabControl = New-Object System.Windows.Forms.TabControl
+$tabControl.Anchor = 'Top,Bottom,Left,Right'
+$tabControl.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$tabControl.Padding = New-Object System.Drawing.Point(14, 5)
+
+$tabPageLive = New-Object System.Windows.Forms.TabPage
+$tabPageLive.Text = 'Live'
+$tabPageLive.BackColor = $script:Theme.CardBg
+$tabPageLive.Controls.Add($liveGrid)
+
+$tabPageHistory = New-Object System.Windows.Forms.TabPage
+$tabPageHistory.Text = 'History'
+$tabPageHistory.BackColor = $script:Theme.CardBg
+$tabPageHistory.Controls.Add($historyGrid)
+
+[System.Windows.Forms.TabPage[]]$tabPages = @($tabPageLive, $tabPageHistory)
+$tabControl.TabPages.AddRange($tabPages)
+
+$gridTop = $menuStrip.Height + $topPanel.Height
+$tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
+$tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop))
+
+# Fill/content control added first, then Dock='Top' controls in reverse
+# visual order (later-added = higher z-order = closer to the very top
+# edge) — the standard WinForms pattern for MenuStrip + toolbar + content.
+$form.Controls.Add($tabControl)
 $form.Controls.Add($topPanel)
-$form.Controls.Add($grid)
+$form.Controls.Add($menuStrip)
 Update-GroupsVisibility
 
 function Add-DataRow {
-    param($r)
-    $idx = $grid.Rows.Add($r.Status, $r.Port, $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'View Log', $r.Action)
-    $row = $grid.Rows[$idx]
+    param($Grid, $r)
+    $idx = $Grid.Rows.Add($r.Status, $r.Port, $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'View Log', $r.Action)
+    $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
-        'ON'      { $row.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::ForestGreen }
+        'ON'      { $row.Cells['Status'].Style.ForeColor = $script:Theme.Success }
         'CRASHED' {
-            $row.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::OrangeRed
-            $row.Cells['Status'].Style.Font = New-Object System.Drawing.Font($grid.Font, [System.Drawing.FontStyle]::Bold)
+            $row.Cells['Status'].Style.ForeColor = $script:Theme.Danger
+            $row.Cells['Status'].Style.Font = New-Object System.Drawing.Font($Grid.Font, [System.Drawing.FontStyle]::Bold)
         }
-        default   { $row.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::Gray }
+        default   { $row.Cells['Status'].Style.ForeColor = $script:Theme.TextDim }
+    }
+    $actionCell = $row.Cells['Action']
+    if ($r.Action -eq 'Stop') {
+        $actionCell.Style.ForeColor = $script:Theme.Danger
+        $actionCell.Style.SelectionForeColor = $script:Theme.Danger
+        $actionCell.Style.SelectionBackColor = $script:Theme.DangerTint
+    } else {
+        $actionCell.Style.ForeColor = $script:Theme.Success
+        $actionCell.Style.SelectionForeColor = $script:Theme.Success
+        $actionCell.Style.SelectionBackColor = $script:Theme.SuccessTint
     }
 }
 
 function Add-SeparatorRow {
-    $idx = $grid.Rows.Add('', '', '', '', '', '', '', '', '', '')
-    $row = $grid.Rows[$idx]
+    param($Grid)
+    $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '')
+    $row = $Grid.Rows[$idx]
     $row.Tag = 'separator'
-    $row.Height = 6
+    $row.Height = 10
     $row.ReadOnly = $true
-    $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::SteelBlue
-    $row.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::SteelBlue
+    $row.DefaultCellStyle.BackColor = $script:Theme.PanelBg
+    $row.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
     foreach ($colName in @('Log', 'Action')) {
         $row.Cells[$colName] = New-Object System.Windows.Forms.DataGridViewTextBoxCell
     }
@@ -808,6 +1089,19 @@ function Get-DisplayRows {
     return @($rows | ForEach-Object { [PSCustomObject]@{ Row = $_; Group = $null } })
 }
 
+function Get-DisplayRowsSplit {
+    # Live tab = actually listening right now (Status ON). History tab =
+    # everything else (OFF/CRASHED) — ports LocalhostManager remembers but
+    # nothing is bound to at the moment. See LocalUrl detection in
+    # Build-Rows: ON rows come from the real TCP listener scan, OFF/CRASHED
+    # rows come from history.json.
+    $display = @(Get-DisplayRows)
+    return @{
+        Live    = @($display | Where-Object { $_.Row.Status -eq 'ON' })
+        History = @($display | Where-Object { $_.Row.Status -ne 'ON' })
+    }
+}
+
 function Get-DisplayRowsSignature {
     param($Display)
     return ($Display | ForEach-Object {
@@ -816,20 +1110,26 @@ function Get-DisplayRowsSignature {
 }
 
 function Render-Grid {
-    param($Display)
-    $grid.SuspendLayout()
+    param($Grid, $Display)
+    $Grid.SuspendLayout()
     try {
-        $grid.Rows.Clear()
+        $Grid.Rows.Clear()
         $lastGroup = $null
         foreach ($d in $Display) {
-            if ($null -ne $d.Group -and $null -ne $lastGroup -and $d.Group -ne $lastGroup) { Add-SeparatorRow }
-            Add-DataRow -r $d.Row
+            if ($null -ne $d.Group -and $null -ne $lastGroup -and $d.Group -ne $lastGroup) { Add-SeparatorRow -Grid $Grid }
+            Add-DataRow -Grid $Grid -r $d.Row
             $lastGroup = $d.Group
         }
-        $grid.ClearSelection()
+        $Grid.ClearSelection()
     } finally {
-        $grid.ResumeLayout()
+        $Grid.ResumeLayout()
     }
+}
+
+function Update-TabHeaders {
+    param([int]$LiveCount, [int]$HistoryCount)
+    $tabPageLive.Text = "Live ($LiveCount)"
+    $tabPageHistory.Text = "History ($HistoryCount)"
 }
 
 $script:FlashTimer = New-Object System.Windows.Forms.Timer
@@ -849,41 +1149,71 @@ function Refresh-Grid {
     # Full, forced rebuild — used for direct user actions (Refresh button,
     # toggles, settings/group changes, start/stop) where the grid content
     # is expected to change right away.
-    if ($grid.IsCurrentCellInEditMode) { return }
-    $display = @(Get-DisplayRows)
-    Render-Grid -Display $display
-    $script:LastRowsSignature = Get-DisplayRowsSignature $display
-    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($display.Count) shown"
+    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode) { return }
+    $split = Get-DisplayRowsSplit
+    Render-Grid -Grid $liveGrid -Display $split.Live
+    Render-Grid -Grid $historyGrid -Display $split.History
+    $script:LastLiveSignature = Get-DisplayRowsSignature $split.Live
+    $script:LastHistorySignature = Get-DisplayRowsSignature $split.History
+    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
+    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($split.Live.Count + $split.History.Count) shown"
     Update-TrayIcon
     Flash-StatusLabel
 }
 
 function Invoke-PeriodicRefresh {
-    # Runs every tick, but only repaints the grid when something in it
+    # Runs every tick, but only repaints a grid when something in it
     # actually changed — otherwise the table would visibly flicker/reset
     # selection every few seconds for no reason. The corner status label
     # flashes red on every tick regardless, so it's still obvious the app
-    # is alive and polling.
-    if ($grid.IsCurrentCellInEditMode) { Flash-StatusLabel; return }
-    $display = @(Get-DisplayRows)
-    $sig = Get-DisplayRowsSignature $display
-    if ($sig -ne $script:LastRowsSignature) {
-        Render-Grid -Display $display
-        $script:LastRowsSignature = $sig
+    # is alive and polling. Live and History are tracked/repainted
+    # independently so activity in one tab doesn't reset scroll/selection
+    # in the other.
+    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode) { Flash-StatusLabel; return }
+    $split = Get-DisplayRowsSplit
+    $liveSig = Get-DisplayRowsSignature $split.Live
+    $historySig = Get-DisplayRowsSignature $split.History
+    if ($liveSig -ne $script:LastLiveSignature) {
+        Render-Grid -Grid $liveGrid -Display $split.Live
+        $script:LastLiveSignature = $liveSig
     }
-    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($display.Count) shown"
+    if ($historySig -ne $script:LastHistorySignature) {
+        Render-Grid -Grid $historyGrid -Display $split.History
+        $script:LastHistorySignature = $historySig
+    }
+    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
+    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($split.Live.Count + $split.History.Count) shown"
     Update-TrayIcon
     Flash-StatusLabel
+}
+
+function Get-NpmRunScript {
+    # "start" is the conventional entry point, but not every project defines
+    # one (e.g. workspace packages that only expose "dev" for a vite/webpack
+    # dev server). Falling back blindly to "npm start" makes those crash
+    # with "Missing script: start" even though the project is fine.
+    param([string]$ProjectPath)
+    $pkgPath = Join-Path $ProjectPath 'package.json'
+    if (Test-Path $pkgPath) {
+        try {
+            $scripts = (Get-Content -Path $pkgPath -Raw | ConvertFrom-Json).scripts
+            $names = @($scripts.PSObject.Properties.Name)
+            if ($names -contains 'start') { return 'start' }
+            if ($names -contains 'dev') { return 'dev' }
+        } catch {}
+    }
+    return 'start'
 }
 
 function Start-ProjectAtPath {
     param([string]$ProjectPath)
     try {
         $key = Get-NormalizedPath $ProjectPath
+        $npmScript = Get-NpmRunScript -ProjectPath $ProjectPath
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'cmd.exe'
-        $psi.Arguments = "/c cd /d `"$ProjectPath`" && npm start"
+        $psi.Arguments = "/c cd /d `"$ProjectPath`" && npm run $npmScript"
         $psi.WorkingDirectory = $ProjectPath
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
@@ -899,8 +1229,11 @@ function Start-ProjectAtPath {
             Log           = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
             StoppedByUser = $false
             Crashed       = $false
+            ProjectPath   = $ProjectPath
         }
         $script:ManagedProcesses[$key] = $entry
+        Limit-ProjectLogFile -ProjectPath $ProjectPath
+        Add-ManagedLog -Entry $entry -Text '*** started ***'
 
         # Register-ObjectEvent (not .add_EventName(scriptblock)) is required
         # here: Process events fire on a ThreadPool thread, and hooking a raw
@@ -1143,18 +1476,22 @@ function Show-LogViewer {
     $bottomPanel.Dock = 'Bottom'
     $bottomPanel.Height = 40
 
+    $bottomPanel.BackColor = $script:Theme.PanelBg
+
     $copyButton = New-Object System.Windows.Forms.Button
     $copyButton.Text = 'Copy All'
     $copyButton.Location = New-Object System.Drawing.Point(10, 6)
-    $copyButton.Size = New-Object System.Drawing.Size(90, 26)
+    $copyButton.Size = New-Object System.Drawing.Size(90, 28)
     $copyButton.Add_Click({ if ($textBox.Text) { [System.Windows.Forms.Clipboard]::SetText($textBox.Text) } })
+    Initialize-ModernButton -Button $copyButton
 
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = 'Close'
     $closeButton.Anchor = 'Top,Right'
     $closeButton.Location = New-Object System.Drawing.Point(660, 6)
-    $closeButton.Size = New-Object System.Drawing.Size(80, 26)
+    $closeButton.Size = New-Object System.Drawing.Size(80, 28)
     $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton
 
     [System.Windows.Forms.Control[]]$bottomControls = @($copyButton, $closeButton)
     $bottomPanel.Controls.AddRange($bottomControls)
@@ -1162,15 +1499,29 @@ function Show-LogViewer {
     $dlg.Controls.Add($bottomPanel)
 
     function Update-LogText {
-        if (-not $entry) {
-            $textBox.Text = '(No log captured for this project — it was not started via Localhost Manager, or the app was restarted since.)'
+        if ($entry) {
+            $atBottom = $textBox.SelectionStart -ge ($textBox.TextLength - 2)
+            $textBox.Text = ($entry.Log.ToArray() -join "`r`n")
+            if ($atBottom) {
+                $textBox.SelectionStart = $textBox.TextLength
+                $textBox.ScrollToCaret()
+            }
             return
         }
-        $atBottom = $textBox.SelectionStart -ge ($textBox.TextLength - 2)
-        $textBox.Text = ($entry.Log.ToArray() -join "`r`n")
-        if ($atBottom) {
-            $textBox.SelectionStart = $textBox.TextLength
-            $textBox.ScrollToCaret()
+
+        # No live entry - either never started via this app, or it was
+        # (Localhost Manager restarted, PC slept/resumed and killed the tray
+        # process, etc). Fall back to the on-disk history for this project,
+        # if any was captured across a prior run.
+        $logPath = Get-ProjectLogFilePath -ProjectPath $ProjectPath
+        $historyText = $null
+        if ($logPath -and (Test-Path $logPath)) {
+            try { $historyText = Get-Content -Path $logPath -Raw -ErrorAction Stop } catch {}
+        }
+        if ($historyText) {
+            $textBox.Text = "(Showing saved log history from a previous run. Localhost Manager is not attached to this process right now, so live output will resume once it is stopped/started again from here.)`r`n`r`n$historyText"
+        } else {
+            $textBox.Text = '(No log captured for this project - it was not started via Localhost Manager.)'
         }
     }
     Update-LogText
@@ -1186,53 +1537,120 @@ function Show-LogViewer {
     $dlg.ShowDialog($form) | Out-Null
 }
 
-$grid.Add_CellContentClick({
-    param($s, $e)
-    if ($e.RowIndex -lt 0) { return }
-    $row = $grid.Rows[$e.RowIndex]
-    if ($row.Tag -eq 'separator') { return }
-    $data = $row.Tag
-    if ($e.ColumnIndex -eq $colAction.Index) {
-        Invoke-ToggleAction $data
-    } elseif ($e.ColumnIndex -eq $colLog.Index) {
+function Register-GridEvents {
+    param($Grid)
+
+    $Grid.Add_CellContentClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -eq 'separator') { return }
+        $data = $row.Tag
+        if ($e.ColumnIndex -eq $script:ColIdx.Action) {
+            Invoke-ToggleAction $data
+        } elseif ($e.ColumnIndex -eq $script:ColIdx.Log) {
+            $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
+            Show-LogViewer -ProjectPath $data.ProjectPath -Title $label
+        }
+    })
+
+    $Grid.Add_CellDoubleClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -eq 'separator') { return }
+        if ($e.ColumnIndex -eq $script:ColIdx.Action -or $e.ColumnIndex -eq $script:ColIdx.Log) { return }
+        $data = $row.Tag
+        if (-not $data) { return }
+        if (-not $data.ProjectPath) {
+            [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Open Terminal', 'OK', 'Warning') | Out-Null
+            return
+        }
         $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
-        Show-LogViewer -ProjectPath $data.ProjectPath -Title $label
-    }
-})
+        Show-Terminal -ProjectPath $data.ProjectPath -Title $label
+    })
 
-$grid.Add_CellDoubleClick({
-    param($s, $e)
-    if ($e.RowIndex -lt 0) { return }
-    $row = $grid.Rows[$e.RowIndex]
-    if ($row.Tag -eq 'separator') { return }
-    if ($e.ColumnIndex -eq $colAction.Index -or $e.ColumnIndex -eq $colLog.Index) { return }
-    $data = $row.Tag
-    if (-not $data) { return }
-    if (-not $data.ProjectPath) {
-        [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Open Terminal', 'OK', 'Warning') | Out-Null
-        return
-    }
-    $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
-    Show-Terminal -ProjectPath $data.ProjectPath -Title $label
-})
+    $Grid.Add_CellEndEdit({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne $script:ColIdx.CustomName) { return }
+        $row = $s.Rows[$e.RowIndex]
+        $data = $row.Tag
+        if (-not $data) { return }
 
-$grid.Add_CellEndEdit({
-    param($s, $e)
-    if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne $colCustomName.Index) { return }
-    $row = $grid.Rows[$e.RowIndex]
-    $data = $row.Tag
-    if (-not $data) { return }
+        $newName = [string]$row.Cells[$script:ColIdx.CustomName].Value
+        $nameKey = Get-CustomNameKey -ProjectPath $data.ProjectPath -Port $data.Port
 
-    $newName = [string]$row.Cells[$colCustomName.Index].Value
-    $nameKey = Get-CustomNameKey -ProjectPath $data.ProjectPath -Port $data.Port
+        if ([string]::IsNullOrWhiteSpace($newName)) {
+            if ($script:CustomNames.ContainsKey($nameKey)) { $script:CustomNames.Remove($nameKey) }
+        } else {
+            $script:CustomNames[$nameKey] = $newName
+        }
+        Save-CustomNames $script:CustomNames
+    })
+}
 
-    if ([string]::IsNullOrWhiteSpace($newName)) {
-        if ($script:CustomNames.ContainsKey($nameKey)) { $script:CustomNames.Remove($nameKey) }
-    } else {
-        $script:CustomNames[$nameKey] = $newName
-    }
-    Save-CustomNames $script:CustomNames
-})
+Register-GridEvents -Grid $liveGrid
+Register-GridEvents -Grid $historyGrid
+
+function Show-AboutDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'About Localhost Manager'
+    $dlg.Size = New-Object System.Drawing.Size(380, 300)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.Icon = $script:IconOk
+    $dlg.BackColor = [System.Drawing.Color]::White
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $iconBox = New-Object System.Windows.Forms.PictureBox
+    $iconBox.Image = $script:IconOk.ToBitmap()
+    $iconBox.SizeMode = 'CenterImage'
+    $iconBox.Location = New-Object System.Drawing.Point(20, 24)
+    $iconBox.Size = New-Object System.Drawing.Size(48, 48)
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = 'Localhost Manager'
+    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.ForeColor = $script:Theme.TextPrimary
+    $titleLabel.Location = New-Object System.Drawing.Point(80, 24)
+    $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
+
+    $versionLabel = New-Object System.Windows.Forms.Label
+    $versionLabel.Text = 'Version 1.5.2'
+    $versionLabel.ForeColor = $script:Theme.TextDim
+    $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
+    $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
+
+    $descLabel = New-Object System.Windows.Forms.Label
+    $descLabel.Text = 'Scans your machine for running localhost dev servers, shows their status and LAN URLs, and lets you start/stop them individually or in named groups.'
+    $descLabel.ForeColor = $script:Theme.TextPrimary
+    $descLabel.Location = New-Object System.Drawing.Point(20, 96)
+    $descLabel.Size = New-Object System.Drawing.Size(330, 60)
+
+    $linkLabel = New-Object System.Windows.Forms.LinkLabel
+    $linkLabel.Text = 'github.com/zanopyth/local-host-manager'
+    $linkLabel.LinkColor = $script:Theme.Accent
+    $linkLabel.ActiveLinkColor = $script:Theme.AccentDark
+    $linkLabel.Location = New-Object System.Drawing.Point(20, 162)
+    $linkLabel.Size = New-Object System.Drawing.Size(330, 20)
+    $linkLabel.Add_LinkClicked({
+        try { Start-Process 'https://github.com/zanopyth/local-host-manager' } catch {}
+    })
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = 'Close'
+    $closeButton.Location = New-Object System.Drawing.Point(265, 210)
+    $closeButton.Size = New-Object System.Drawing.Size(85, 28)
+    $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton -Variant Accent
+
+    [System.Windows.Forms.Control[]]$dlgControls = @($iconBox, $titleLabel, $versionLabel, $descLabel, $linkLabel, $closeButton)
+    $dlg.Controls.AddRange($dlgControls)
+    $dlg.AcceptButton = $closeButton
+    $dlg.ShowDialog($form) | Out-Null
+}
 
 function Show-SettingsDialog {
     $dlg = New-Object System.Windows.Forms.Form
@@ -1242,45 +1660,55 @@ function Show-SettingsDialog {
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = 'Only show projects under this root directory:'
     $lbl.Location = New-Object System.Drawing.Point(15, 15)
     $lbl.Size = New-Object System.Drawing.Size(400, 20)
+    $lbl.ForeColor = $script:Theme.TextPrimary
 
     $pathBox = New-Object System.Windows.Forms.TextBox
     $pathBox.Text = $script:RootDir
     $pathBox.Location = New-Object System.Drawing.Point(15, 40)
     $pathBox.Size = New-Object System.Drawing.Size(330, 24)
     $pathBox.ReadOnly = $true
+    $pathBox.BorderStyle = 'FixedSingle'
+    $pathBox.BackColor = [System.Drawing.Color]::White
+    $pathBox.ForeColor = $script:Theme.TextPrimary
 
     $browseButton = New-Object System.Windows.Forms.Button
     $browseButton.Text = 'Browse...'
     $browseButton.Location = New-Object System.Drawing.Point(355, 39)
-    $browseButton.Size = New-Object System.Drawing.Size(95, 24)
+    $browseButton.Size = New-Object System.Drawing.Size(95, 26)
     $browseButton.Add_Click({
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
         if ($pathBox.Text) { $fbd.SelectedPath = $pathBox.Text }
         if ($fbd.ShowDialog() -eq 'OK') { $pathBox.Text = $fbd.SelectedPath }
     })
+    Initialize-ModernButton -Button $browseButton
 
     $clearButton = New-Object System.Windows.Forms.Button
     $clearButton.Text = 'Clear (no restriction)'
     $clearButton.Location = New-Object System.Drawing.Point(15, 75)
-    $clearButton.Size = New-Object System.Drawing.Size(160, 24)
+    $clearButton.Size = New-Object System.Drawing.Size(170, 26)
     $clearButton.Add_Click({ $pathBox.Text = '' })
+    Initialize-ModernButton -Button $clearButton
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'OK'
     $okButton.Location = New-Object System.Drawing.Point(275, 115)
-    $okButton.Size = New-Object System.Drawing.Size(85, 26)
+    $okButton.Size = New-Object System.Drawing.Size(85, 28)
     $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
+    Initialize-ModernButton -Button $okButton -Variant Accent
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Cancel'
     $cancelButton.Location = New-Object System.Drawing.Point(365, 115)
-    $cancelButton.Size = New-Object System.Drawing.Size(85, 26)
+    $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
     $cancelButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $cancelButton
 
     [System.Windows.Forms.Control[]]$dlgControls = @($lbl, $pathBox, $browseButton, $clearButton, $okButton, $cancelButton)
     $dlg.Controls.AddRange($dlgControls)
@@ -1295,8 +1723,6 @@ function Show-SettingsDialog {
         Refresh-Grid
     }
 }
-
-$settingsButton.Add_Click({ Show-SettingsDialog })
 
 function Get-KnownProjects {
     $allRows = @(Build-Rows -OnlyNode $true -RootDir '')
@@ -1324,11 +1750,14 @@ function Show-ManageGroupsDialog {
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $nameLabel = New-Object System.Windows.Forms.Label
     $nameLabel.Text = 'Group name:'
     $nameLabel.Location = New-Object System.Drawing.Point(15, 15)
     $nameLabel.Size = New-Object System.Drawing.Size(100, 20)
+    $nameLabel.ForeColor = $script:Theme.TextPrimary
 
     $nameCombo = New-Object System.Windows.Forms.ComboBox
     $nameCombo.DropDownStyle = 'DropDown'
@@ -1340,11 +1769,13 @@ function Show-ManageGroupsDialog {
     $projLabel.Text = 'Projects in this group:'
     $projLabel.Location = New-Object System.Drawing.Point(15, 70)
     $projLabel.Size = New-Object System.Drawing.Size(200, 20)
+    $projLabel.ForeColor = $script:Theme.TextPrimary
 
     $projList = New-Object System.Windows.Forms.CheckedListBox
     $projList.Location = New-Object System.Drawing.Point(15, 92)
     $projList.Size = New-Object System.Drawing.Size(415, 260)
     $projList.CheckOnClick = $true
+    $projList.BorderStyle = 'FixedSingle'
 
     $knownProjects = @(Get-KnownProjects)
     foreach ($p in $knownProjects) { $projList.Items.Add($p.Label) | Out-Null }
@@ -1365,6 +1796,7 @@ function Show-ManageGroupsDialog {
     $saveButton.Text = 'Save Group'
     $saveButton.Location = New-Object System.Drawing.Point(15, 365)
     $saveButton.Size = New-Object System.Drawing.Size(110, 28)
+    Initialize-ModernButton -Button $saveButton -Variant Success
     $saveButton.Add_Click({
         $name = $nameCombo.Text.Trim()
         if (-not $name) {
@@ -1387,6 +1819,7 @@ function Show-ManageGroupsDialog {
     $deleteButton.Text = 'Delete Group'
     $deleteButton.Location = New-Object System.Drawing.Point(135, 365)
     $deleteButton.Size = New-Object System.Drawing.Size(110, 28)
+    Initialize-ModernButton -Button $deleteButton -Variant Danger
     $deleteButton.Add_Click({
         $name = $nameCombo.Text.Trim()
         if (-not $name -or -not $script:Groups.ContainsKey($name)) { return }
@@ -1411,13 +1844,12 @@ function Show-ManageGroupsDialog {
     $closeButton.Location = New-Object System.Drawing.Point(345, 365)
     $closeButton.Size = New-Object System.Drawing.Size(85, 28)
     $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton
 
     [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $projList, $saveButton, $deleteButton, $closeButton)
     $dlg.Controls.AddRange($dlgControls)
     $dlg.ShowDialog($form) | Out-Null
 }
-
-$manageGroupsButton.Add_Click({ Show-ManageGroupsDialog })
 
 function Start-GroupAll {
     param([string[]]$Names)
@@ -1502,7 +1934,10 @@ $notifyIcon.Add_MouseClick({
 })
 
 function Update-TrayIcon {
-    $allRows = @(Limit-ToGroupedRows (Build-Rows -OnlyNode $true -RootDir ''))
+    # Same data the main window's grid is built from — Node/npm-only,
+    # root-dir scope, and Use Groups/selected groups all apply here too, so
+    # the tray icon/text always matches what's actually on screen.
+    $allRows = @((Get-DisplayRows) | ForEach-Object { $_.Row })
     $onCount = @($allRows | Where-Object { $_.Status -eq 'ON' }).Count
     $crashedCount = @($allRows | Where-Object { $_.Status -eq 'CRASHED' }).Count
     $totalCount = $allRows.Count
@@ -1529,9 +1964,9 @@ function Build-TrayMenuItems {
     $trayMenu.Items.Add($openItem) | Out-Null
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
-    $allRows = @(Limit-ToGroupedRows (Build-Rows -OnlyNode $true -RootDir ''))
+    $allRows = @((Get-DisplayRows) | ForEach-Object { $_.Row })
     if ($allRows.Count -eq 0) {
-        $emptyText = 'No known npm projects yet'
+        $emptyText = 'No projects in current scope'
         $noneItem = New-Object System.Windows.Forms.ToolStripMenuItem $emptyText
         $noneItem.Enabled = $false
         $trayMenu.Items.Add($noneItem) | Out-Null
@@ -1607,11 +2042,13 @@ $refreshButton.Add_Click({ Refresh-Grid })
 Set-ToggleOnChange -Switch $nodeOnlySwitch -Handler {
     $script:Settings.OnlyNode = Get-ToggleChecked $nodeOnlySwitch
     Save-Settings $script:Settings
+    $menuSettingsNodeOnly.Checked = Get-ToggleChecked $nodeOnlySwitch
     Refresh-Grid
 }
 Set-ToggleOnChange -Switch $useGroupsSwitch -Handler {
     $script:Settings.ShowGroups = Get-ToggleChecked $useGroupsSwitch
     Save-Settings $script:Settings
+    $menuSettingsUseGroups.Checked = Get-ToggleChecked $useGroupsSwitch
     Update-GroupsVisibility
     Refresh-Grid
 }
