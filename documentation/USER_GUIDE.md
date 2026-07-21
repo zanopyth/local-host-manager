@@ -10,7 +10,7 @@
 | Process | The OS process name holding the port (usually `node`) |
 | PID | Process ID (blank when OFF) |
 | Local URL | `http://localhost:<port>` |
-| Network URL(s) | Every LAN/VPN address others on your network could use to reach it (blank if the server only binds to `127.0.0.1`) |
+| Network URL(s) | Every LAN/VPN address others on your network could use to reach it (blank if the server only binds to `127.0.0.1`); see the row Detail popup below to see each one labeled by adapter |
 | Project Path | The real folder the dev server is running from |
 | (button) | **Stop** for running rows, **Start** for known-but-stopped rows |
 
@@ -42,13 +42,38 @@ remove the name. Names are tied to the project's folder path, so they
 survive the project running on a different port later. They also show up
 in the tray menu and the group editor in place of the raw folder name.
 
-## Node/npm projects only
+## Dev Servers Only
 
 Checked by default. The scanner sees *every* listening port on your
 machine, including background apps (Steam, Discord, browsers, etc.) —
 this checkbox filters the list down to things that look like actual
-Node/npm projects (a `package.json` was found in the recovered working
+Node/npm dev servers (a `package.json` was found in the recovered working
 directory). Uncheck it if you want the unfiltered view.
+
+Note: when **Use Groups** is on *and* you have a group selected, its
+selection overrides this toggle entirely (and the root-directory scope,
+too) — a project you've manually put in a group stays visible even if it
+wouldn't otherwise pass the Dev Servers Only filter.
+
+## Row detail (right-click)
+
+Right-click any row (Live or History) for a **Detail...** menu. It opens a
+small, compact popup right at your click point — a "sticky note" summary of
+that row, with every column's full value (handy since the grid itself
+truncates long paths/URLs) and a small copy-icon button next to each one.
+Nothing in the popup is a text field to accidentally click into or edit —
+values are display-only; the icon button is the only clickable thing per
+row, plus a **Copy All** button at the bottom that copies every field at
+once.
+
+Network URLs get one row each instead of being bunched into a single
+comma-separated value, labeled by the actual network adapter they came from
+— `Ethernet`, `Wi-Fi`, `Tailscale`, `VMware`, `Hyper-V`, etc. — with the
+real/useful ones (Ethernet, Wi-Fi, Tailscale) listed first. Any address
+coming from a **virtual, VM-only adapter** (VMware, Hyper-V, VirtualBox,
+Docker) has its whole row tinted purple, since that address is only
+reachable from virtual machines on this PC, never from another real device
+on your network.
 
 ## Settings — root directory scope
 

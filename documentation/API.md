@@ -28,7 +28,20 @@ happen off the UI thread in `$script:BackgroundPollScript`.
 No parameters. Returns the background poller's most recent list of
 non-loopback, non-APIPA IPv4 addresses bound to this machine (LAN,
 VPN/Tailscale, virtual adapters — anything), read from
-`$script:LiveCache.LanIps`. Used to build the "Network URL(s)" column.
+`$script:LiveCache.LanIps`. Each entry is a `[PSCustomObject]@{ IPAddress;
+InterfaceAlias }` — classification into a display label happens later, in
+`Build-Rows`, via `Get-NetworkInterfaceLabel` (the background runspace has
+no access to functions defined in the main script scope). Used to build the
+"Network URL(s)" column and the per-adapter rows in the row Detail popup.
+
+### `Get-NetworkInterfaceLabel -InterfaceAlias <string>`
+Classifies an adapter name into `[PSCustomObject]@{ Label; IsVirtual;
+SortRank }` — e.g. `Ethernet`/`Wi-Fi` (SortRank 0, real), `Tailscale`
+(SortRank 1, real but VPN), or `VMware`/`Hyper-V`/`VirtualBox`/`Docker`
+(SortRank 2, `IsVirtual = $true`). Falls back to the raw `InterfaceAlias`
+text for anything unrecognized. Used by `Build-Rows` to label, sort, and
+flag each Network URL entry, and by `Show-RowDetail` to purple-tint rows
+for virtual/VM-only adapters.
 
 ### `Stop-BackgroundPoller`
 No parameters, no return value. Signals the background poller runspace to
@@ -47,7 +60,11 @@ with a known restart path. Applies the `OnlyNode` and `RootDir` (via
 `Get-CustomNameKey`, and persists any newly-seen npm project back to
 `history.json`. Returns an array of `[PSCustomObject]` with:
 `Status, Port, CustomName, ProcessName, ProcId, LocalUrl, LanUrls,
-ProjectPath, Action`, sorted by port number.
+LanEntries, ProjectPath, Action`, sorted by port number. `LanEntries` is the
+structured, per-adapter form behind `LanUrls` (see `Get-NetworkInterfaceLabel`
+above) — an array of `[PSCustomObject]@{ Label; Url; IsVirtual; SortRank }`,
+already sorted real-adapters-first; empty for History (`OFF`/`CRASHED`) rows
+and for rows whose listener only binds to `127.0.0.1`.
 
 Called with different arguments by different parts of the UI — see
 `DEVELOPER_GUIDE.md` → "The scanning pipeline".
@@ -129,3 +146,13 @@ prompt per process. Both call `Refresh-Grid` and show a single summary
 - `Get-KnownProjects` — every distinct project the app has ever seen,
   for populating the Manage Groups checklist.
 - `Show-SettingsDialog` / `Show-ManageGroupsDialog` — modal dialogs.
+- `Show-RowDetail -Data <row object> -ScreenPoint <Point>` — the compact
+  "sticky note" popup opened via right-click → **Detail...** on a grid row.
+  Renders each field as a row (Label + read-only `Label`, not a `TextBox` —
+  nothing in the body is editable/focusable) with its own copy-icon button;
+  expands `LanEntries` into one row per network address and tints a row's
+  background purple when `IsVirtual` is set. Opens at `ScreenPoint` (real
+  screen coordinates, not grid-relative — see the `CellMouseDown` handler in
+  `Register-GridEvents`, which uses `[Cursor]::Position` rather than the
+  event's own `e.X`/`e.Y` since those are cell-relative), clamped to stay
+  within the current screen's working area.

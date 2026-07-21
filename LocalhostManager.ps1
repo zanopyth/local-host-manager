@@ -298,12 +298,23 @@ $script:BackgroundPollScript = {
                 }
             }
 
-            $lanIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
-                Select-Object -ExpandProperty IPAddress -Unique)
+            # Keep the InterfaceAlias alongside each IP (not just the flat
+            # address) so the main script can label/sort/flag entries by
+            # adapter type (Ethernet vs Tailscale vs a VMware/virtual
+            # adapter) - this runspace has no access to functions defined in
+            # the main script scope, so that classification happens later,
+            # in Build-Rows.
+            $lanEntries = @()
+            $seenLanIp = @{}
+            foreach ($ipInfo in (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' })) {
+                if ($seenLanIp.ContainsKey($ipInfo.IPAddress)) { continue }
+                $seenLanIp[$ipInfo.IPAddress] = $true
+                $lanEntries += [PSCustomObject]@{ IPAddress = $ipInfo.IPAddress; InterfaceAlias = $ipInfo.InterfaceAlias }
+            }
 
             $Cache.Listeners = $result
-            $Cache.LanIps    = $lanIps
+            $Cache.LanIps    = $lanEntries
             $Cache.Ready     = $true
         } catch {
             # Transient polling failure - keep serving the last good snapshot.
@@ -340,6 +351,28 @@ function Get-LiveListeners {
     return $script:LiveCache.Listeners
 }
 
+function Get-NetworkInterfaceLabel {
+    # Classifies an adapter by its InterfaceAlias so Network URL rows can
+    # show which "layer" an address actually belongs to, be ordered with
+    # the useful ones first, and flag anything that's only reachable from
+    # this machine itself (a hypervisor's NAT/host-only adapter) rather
+    # than a real LAN/Tailnet address.
+    param([string]$InterfaceAlias)
+    if (-not $InterfaceAlias) {
+        return [PSCustomObject]@{ Label = 'Network'; IsVirtual = $false; SortRank = 1 }
+    }
+    switch -Regex ($InterfaceAlias) {
+        'Tailscale'          { return [PSCustomObject]@{ Label = 'Tailscale';   IsVirtual = $false; SortRank = 1 } }
+        'Wi-?Fi|Wireless'    { return [PSCustomObject]@{ Label = 'Wi-Fi';       IsVirtual = $false; SortRank = 0 } }
+        'Ethernet'           { return [PSCustomObject]@{ Label = 'Ethernet';    IsVirtual = $false; SortRank = 0 } }
+        'VMware'             { return [PSCustomObject]@{ Label = 'VMware';     IsVirtual = $true;  SortRank = 2 } }
+        'Hyper-V|vEthernet'  { return [PSCustomObject]@{ Label = 'Hyper-V';    IsVirtual = $true;  SortRank = 2 } }
+        'VirtualBox'         { return [PSCustomObject]@{ Label = 'VirtualBox';IsVirtual = $true;  SortRank = 2 } }
+        'Docker'             { return [PSCustomObject]@{ Label = 'Docker';    IsVirtual = $true;  SortRank = 2 } }
+        default              { return [PSCustomObject]@{ Label = $InterfaceAlias; IsVirtual = $false; SortRank = 1 } }
+    }
+}
+
 function Build-Rows {
     param([bool]$OnlyNode, [string]$RootDir)
 
@@ -365,8 +398,18 @@ function Build-Rows {
         $seen[$key] = $true
 
         $lanUrls = ''
+        $lanEntries = @()
         if ($e.LocalAddr -eq '0.0.0.0' -or $e.LocalAddr -eq '::') {
-            $lanUrls = ($lanIps | ForEach-Object { "http://$($_):$key" }) -join ', '
+            $lanEntries = @($lanIps | ForEach-Object {
+                $info = Get-NetworkInterfaceLabel -InterfaceAlias $_.InterfaceAlias
+                [PSCustomObject]@{
+                    Label     = $info.Label
+                    Url       = "http://$($_.IPAddress):$key"
+                    IsVirtual = $info.IsVirtual
+                    SortRank  = $info.SortRank
+                }
+            } | Sort-Object SortRank, Label)
+            $lanUrls = ($lanEntries | ForEach-Object { $_.Url }) -join ', '
         } else {
             $lanUrls = '(localhost only)'
         }
@@ -384,6 +427,7 @@ function Build-Rows {
             ProcId      = $e.ProcId
             LocalUrl    = "http://localhost:$key"
             LanUrls     = $lanUrls
+            LanEntries  = $lanEntries
             ProjectPath = $e.ProjectPath
             Action      = 'Stop'
             HasLog      = [bool]$managed
@@ -410,6 +454,7 @@ function Build-Rows {
             ProcId      = $null
             LocalUrl    = "http://localhost:$key"
             LanUrls     = ''
+            LanEntries  = @()
             ProjectPath = $h.ProjectPath
             Action      = 'Start'
             HasLog      = [bool]$managed
@@ -709,7 +754,7 @@ $menuSettingsPrefs = New-Object System.Windows.Forms.ToolStripMenuItem('Preferen
 $menuSettingsPrefs.Add_Click({ Show-SettingsDialog })
 $menuSettingsGroups = New-Object System.Windows.Forms.ToolStripMenuItem('Manage Groups...')
 $menuSettingsGroups.Add_Click({ Show-ManageGroupsDialog })
-$menuSettingsNodeOnly = New-Object System.Windows.Forms.ToolStripMenuItem('Node/npm projects only')
+$menuSettingsNodeOnly = New-Object System.Windows.Forms.ToolStripMenuItem('Dev Servers Only')
 $menuSettingsNodeOnly.Checked = $script:Settings.OnlyNode
 $menuSettingsNodeOnly.Add_Click({
     Invoke-ToggleClick -Switch $nodeOnlySwitch
@@ -769,7 +814,7 @@ $nodeOnlySwitch = New-ToggleSwitch -Checked $script:Settings.OnlyNode
 $nodeOnlySwitch.Location = New-Object System.Drawing.Point(128, 16)
 
 $nodeOnlyLabel = New-Object System.Windows.Forms.Label
-$nodeOnlyLabel.Text = 'Node/npm projects only'
+$nodeOnlyLabel.Text = 'Dev Servers Only'
 $nodeOnlyLabel.Location = New-Object System.Drawing.Point(174, 15)
 $nodeOnlyLabel.Size = New-Object System.Drawing.Size(152, 22)
 $nodeOnlyLabel.TextAlign = 'MiddleLeft'
@@ -981,7 +1026,7 @@ function New-PortsGrid {
     $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 162; $colPath.ReadOnly = $true
 
     $colLog = New-Object System.Windows.Forms.DataGridViewButtonColumn
-    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65; $colLog.Text = 'View Log'
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65; $colLog.Text = 'Restart'
     $colLog.UseColumnTextForButtonValue = $true
     $colLog.ReadOnly = $true
     $colLog.FlatStyle = 'Flat'
@@ -1038,7 +1083,7 @@ Update-GroupsVisibility
 
 function Add-DataRow {
     param($Grid, $r)
-    $idx = $Grid.Rows.Add($r.Status, $r.Port, $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'View Log', $r.Action)
+    $idx = $Grid.Rows.Add($r.Status, $r.Port, $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
     $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
@@ -1077,7 +1122,7 @@ function Add-SeparatorRow {
 
 function Get-DisplayRows {
     # Use Groups active: the selected group(s) define exactly what's shown,
-    # and they always stay visible even if Node/npm-only or the root-dir
+    # and they always stay visible even if Dev-Servers-Only or the root-dir
     # scope would otherwise have hidden them. Each entry is tagged with its
     # Group (or $null when ungrouped) so the grid can draw separators.
     $useGroups = (Get-ToggleChecked $useGroupsSwitch) -and $script:SelectedGroups.Count -gt 0
@@ -1307,125 +1352,6 @@ function Stop-ProjectById {
     }
 }
 
-function Show-Terminal {
-    param([string]$ProjectPath, [string]$Title)
-
-    $dlg = New-Object System.Windows.Forms.Form
-    $dlg.Text = "Terminal - $Title"
-    $dlg.Size = New-Object System.Drawing.Size(780, 520)
-    $dlg.StartPosition = 'CenterParent'
-    $dlg.MinimumSize = New-Object System.Drawing.Size(420, 260)
-    $dlg.Icon = $script:IconOk
-
-    $outputBox = New-Object System.Windows.Forms.TextBox
-    $outputBox.Multiline = $true
-    $outputBox.ReadOnly = $true
-    $outputBox.ScrollBars = 'Vertical'
-    $outputBox.WordWrap = $false
-    $outputBox.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $outputBox.Dock = 'Fill'
-    $outputBox.BackColor = [System.Drawing.Color]::Black
-    $outputBox.ForeColor = [System.Drawing.Color]::Gainsboro
-
-    $inputPanel = New-Object System.Windows.Forms.Panel
-    $inputPanel.Dock = 'Bottom'
-    $inputPanel.Height = 32
-
-    $promptLabel = New-Object System.Windows.Forms.Label
-    $promptLabel.Text = '>'
-    $promptLabel.Location = New-Object System.Drawing.Point(6, 8)
-    $promptLabel.Size = New-Object System.Drawing.Size(14, 20)
-    $promptLabel.ForeColor = [System.Drawing.Color]::Gainsboro
-
-    $inputBox = New-Object System.Windows.Forms.TextBox
-    $inputBox.Location = New-Object System.Drawing.Point(22, 4)
-    $inputBox.Anchor = 'Top,Left,Right'
-    $inputBox.Size = New-Object System.Drawing.Size(740, 24)
-    $inputBox.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $inputBox.BackColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
-    $inputBox.ForeColor = [System.Drawing.Color]::White
-
-    $inputPanel.Controls.Add($promptLabel)
-    $inputPanel.Controls.Add($inputBox)
-    $dlg.Controls.Add($outputBox)
-    $dlg.Controls.Add($inputPanel)
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'cmd.exe'
-    $psi.Arguments = '/k'
-    $psi.WorkingDirectory = $ProjectPath
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    $proc.EnableRaisingEvents = $true
-
-    $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    $subPrefix = "LHMT_$([guid]::NewGuid().ToString('N'))"
-    $eventData = @{ Queue = $outputQueue }
-
-    Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -SourceIdentifier "$subPrefix`_out" -MessageData $eventData -Action {
-        if ($null -ne $Event.SourceEventArgs.Data) { $Event.MessageData.Queue.Enqueue($Event.SourceEventArgs.Data) }
-    } | Out-Null
-    Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -SourceIdentifier "$subPrefix`_err" -MessageData $eventData -Action {
-        if ($null -ne $Event.SourceEventArgs.Data) { $Event.MessageData.Queue.Enqueue($Event.SourceEventArgs.Data) }
-    } | Out-Null
-
-    try {
-        [void]$proc.Start()
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
-    } catch {
-        [System.Windows.Forms.MessageBox]::Show("Could not start a terminal: $_", 'Error', 'OK', 'Error') | Out-Null
-        return
-    }
-
-    $outputBox.AppendText("[Terminal open at: $ProjectPath]`r`n")
-
-    $pumpTimer = New-Object System.Windows.Forms.Timer
-    $pumpTimer.Interval = 150
-    $pumpTimer.Add_Tick({
-        $line = $null
-        $appended = $false
-        while ($outputQueue.TryDequeue([ref]$line)) {
-            $outputBox.AppendText("$line`r`n")
-            $appended = $true
-        }
-        if ($appended) {
-            $outputBox.SelectionStart = $outputBox.TextLength
-            $outputBox.ScrollToCaret()
-        }
-    })
-    $pumpTimer.Start()
-
-    $inputBox.Add_KeyDown({
-        param($s2, $e2)
-        if ($e2.KeyCode -ne [System.Windows.Forms.Keys]::Enter) { return }
-        $e2.SuppressKeyPress = $true
-        $cmd = $inputBox.Text
-        $inputBox.Clear()
-        if ($proc.HasExited) { return }
-        $outputBox.AppendText("> $cmd`r`n")
-        try { $proc.StandardInput.WriteLine($cmd) } catch {}
-    })
-
-    $dlg.Add_Shown({ $inputBox.Focus() })
-    $dlg.Add_FormClosing({
-        $pumpTimer.Stop()
-        Unregister-Event -SourceIdentifier "$subPrefix`_out" -ErrorAction SilentlyContinue
-        Unregister-Event -SourceIdentifier "$subPrefix`_err" -ErrorAction SilentlyContinue
-        if (-not $proc.HasExited) {
-            try { Start-Process -FilePath 'taskkill.exe' -ArgumentList "/PID $($proc.Id) /T /F" -WindowStyle Hidden -Wait | Out-Null } catch {}
-        }
-    })
-
-    $dlg.ShowDialog($form) | Out-Null
-}
-
 function Invoke-ToggleAction {
     param($data)
 
@@ -1445,6 +1371,33 @@ function Invoke-ToggleAction {
         if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath)) {
             [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
         }
+    }
+    Start-Sleep -Milliseconds 800
+    Refresh-Grid
+}
+
+function Invoke-Restart {
+    param($data)
+
+    if (-not $data.ProjectPath) {
+        [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Restart', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    if ($data.Status -eq 'ON') {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Restart $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
+            'Confirm Restart', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { return }
+        if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
+            [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+            return
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath)) {
+        [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
     }
     Start-Sleep -Milliseconds 800
     Refresh-Grid
@@ -1537,6 +1490,128 @@ function Show-LogViewer {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+function Show-RowDetail {
+    # Sticky-note style: compact, appears right at the click point, and
+    # nothing in the body is a clickable/editable control except the copy
+    # icon buttons - values are plain Labels (not TextBoxes) so there's
+    # nothing to accidentally focus/select/edit. Each Network URL gets its
+    # own row labeled by adapter ("Ethernet", "Tailscale", "VMware", ...);
+    # rows for a virtual (VM-only) adapter are tinted purple so it reads
+    # clearly as "not a real LAN/Tailnet address."
+    param($Data, [System.Drawing.Point]$ScreenPoint)
+
+    $label = if ($Data.CustomName) { $Data.CustomName } elseif ($Data.ProjectPath) { Split-Path -Leaf $Data.ProjectPath } else { "Port $($Data.Port)" }
+
+    $fields = @(
+        @{ Label = 'Status';      Value = [string]$Data.Status;      IsVirtual = $false }
+        @{ Label = 'Port';        Value = [string]$Data.Port;        IsVirtual = $false }
+        @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
+        @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
+        @{ Label = 'PID';         Value = [string]$Data.ProcId;      IsVirtual = $false }
+        @{ Label = 'Local URL';   Value = [string]$Data.LocalUrl;    IsVirtual = $false }
+    )
+
+    # One row per network URL (already labeled/sorted by adapter type in
+    # Build-Rows), so each address gets its own copy button and its own
+    # "layer" label instead of a generic "Network URL N".
+    if ($Data.LanEntries -and @($Data.LanEntries).Count -gt 0) {
+        foreach ($entry in $Data.LanEntries) {
+            $fields += @{ Label = $entry.Label; Value = $entry.Url; IsVirtual = [bool]$entry.IsVirtual }
+        }
+    } else {
+        $fallback = if ($Data.LanUrls) { [string]$Data.LanUrls } else { '(localhost only)' }
+        $fields += @{ Label = 'Network URL'; Value = $fallback; IsVirtual = $false }
+    }
+
+    $fields += @{ Label = 'Project Path'; Value = [string]$Data.ProjectPath; IsVirtual = $false }
+
+    $rowHeight = 28
+    $topMargin = 8
+    $dlgWidth = 420
+    $clientHeight = $topMargin + ($fields.Count * $rowHeight) + 38
+    $purpleBg = [System.Drawing.Color]::FromArgb(0xEA, 0xDD, 0xF7)
+    $purpleAccent = [System.Drawing.Color]::FromArgb(0x6A, 0x1B, 0x9A)
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Details - $label"
+    $dlg.ClientSize = New-Object System.Drawing.Size($dlgWidth, $clientHeight)
+    $dlg.StartPosition = 'Manual'
+    $dlg.FormBorderStyle = 'FixedToolWindow'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $screenArea = [System.Windows.Forms.Screen]::FromPoint($ScreenPoint).WorkingArea
+    $px = [Math]::Max($screenArea.Left, [Math]::Min($ScreenPoint.X, $screenArea.Right - $dlg.Width))
+    $py = [Math]::Max($screenArea.Top, [Math]::Min($ScreenPoint.Y, $screenArea.Bottom - $dlg.Height))
+    $dlg.Location = New-Object System.Drawing.Point($px, $py)
+
+    $rowY = $topMargin
+    $allValuesText = New-Object System.Text.StringBuilder
+    [System.Windows.Forms.Control[]]$rowPanels = @()
+
+    foreach ($f in $fields) {
+        $rowPanel = New-Object System.Windows.Forms.Panel
+        $rowPanel.Location = New-Object System.Drawing.Point(0, $rowY)
+        $rowPanel.Size = New-Object System.Drawing.Size($dlgWidth, $rowHeight)
+        $rowPanel.BackColor = if ($f.IsVirtual) { $purpleBg } else { $script:Theme.WindowBg }
+
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = "$($f.Label):"
+        $lbl.Location = New-Object System.Drawing.Point(10, 6)
+        $lbl.Size = New-Object System.Drawing.Size(88, 16)
+        $lbl.ForeColor = if ($f.IsVirtual) { $purpleAccent } else { $script:Theme.TextDim }
+        $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+        $lbl.BackColor = [System.Drawing.Color]::Transparent
+
+        $valueLbl = New-Object System.Windows.Forms.Label
+        $valueLbl.Text = $f.Value
+        $valueLbl.AutoEllipsis = $true
+        $valueLbl.Location = New-Object System.Drawing.Point(100, 6)
+        $valueLbl.Size = New-Object System.Drawing.Size(($dlgWidth - 100 - 42), 16)
+        $valueLbl.ForeColor = $script:Theme.TextPrimary
+        $valueLbl.BackColor = [System.Drawing.Color]::Transparent
+
+        $copyBtn = New-Object System.Windows.Forms.Button
+        $copyBtn.Location = New-Object System.Drawing.Point(($dlgWidth - 34), 0)
+        $copyBtn.Size = New-Object System.Drawing.Size(26, 26)
+        $capturedValue = $f.Value
+        $copyBtn.Add_Click({ if ($capturedValue) { [System.Windows.Forms.Clipboard]::SetText($capturedValue) } }.GetNewClosure())
+        Initialize-ModernButton -Button $copyBtn -Radius 6
+        $copyBtn.Text = [string][char]0xE8C8
+        $copyBtn.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 10)
+
+        [System.Windows.Forms.Control[]]$rowChildren = @($lbl, $valueLbl, $copyBtn)
+        $rowPanel.Controls.AddRange($rowChildren)
+        $rowPanels += $rowPanel
+
+        [void]$allValuesText.AppendLine("$($f.Label): $($f.Value)")
+        $rowY += $rowHeight
+    }
+
+    $dlg.Controls.AddRange($rowPanels)
+
+    $bottomPanel = New-Object System.Windows.Forms.Panel
+    $bottomPanel.Dock = 'Bottom'
+    $bottomPanel.Height = 34
+    $bottomPanel.BackColor = $script:Theme.PanelBg
+
+    $copyAllButton = New-Object System.Windows.Forms.Button
+    $copyAllButton.Text = 'Copy All'
+    $copyAllButton.Location = New-Object System.Drawing.Point(8, 3)
+    $copyAllButton.Size = New-Object System.Drawing.Size(78, 26)
+    $allText = $allValuesText.ToString()
+    $copyAllButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($allText) }.GetNewClosure())
+    Initialize-ModernButton -Button $copyAllButton
+
+    [System.Windows.Forms.Control[]]$bottomControls = @($copyAllButton)
+    $bottomPanel.Controls.AddRange($bottomControls)
+    $dlg.Controls.Add($bottomPanel)
+
+    $dlg.ShowDialog($form) | Out-Null
+}
+
 function Register-GridEvents {
     param($Grid)
 
@@ -1549,8 +1624,7 @@ function Register-GridEvents {
         if ($e.ColumnIndex -eq $script:ColIdx.Action) {
             Invoke-ToggleAction $data
         } elseif ($e.ColumnIndex -eq $script:ColIdx.Log) {
-            $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
-            Show-LogViewer -ProjectPath $data.ProjectPath -Title $label
+            Invoke-Restart $data
         }
     })
 
@@ -1562,12 +1636,33 @@ function Register-GridEvents {
         if ($e.ColumnIndex -eq $script:ColIdx.Action -or $e.ColumnIndex -eq $script:ColIdx.Log) { return }
         $data = $row.Tag
         if (-not $data) { return }
-        if (-not $data.ProjectPath) {
-            [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Open Terminal', 'OK', 'Warning') | Out-Null
-            return
-        }
         $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
-        Show-Terminal -ProjectPath $data.ProjectPath -Title $label
+        Show-LogViewer -ProjectPath $data.ProjectPath -Title $label
+    })
+
+    $Grid.Add_CellMouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Right) { return }
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -eq 'separator') { return }
+        $data = $row.Tag
+        if (-not $data) { return }
+        $s.ClearSelection()
+        $row.Selected = $true
+        # e.X/e.Y on a DataGridView CellMouseDown are cell-relative, not
+        # grid-relative - using them directly put the menu near the grid's
+        # origin regardless of actual click position. Cursor.Position is the
+        # true screen position, which we then convert back to grid-client
+        # space just for Show(), which expects control-relative coords.
+        $screenPoint = [System.Windows.Forms.Cursor]::Position
+        $clientPoint = $s.PointToClient($screenPoint)
+
+        $menu = New-Object System.Windows.Forms.ContextMenuStrip
+        $detailItem = New-Object System.Windows.Forms.ToolStripMenuItem('Detail...')
+        $detailItem.Add_Click({ Show-RowDetail -Data $data -ScreenPoint $screenPoint }.GetNewClosure())
+        [void]$menu.Items.Add($detailItem)
+        $menu.Show($s, $clientPoint)
     })
 
     $Grid.Add_CellEndEdit({
@@ -1934,7 +2029,7 @@ $notifyIcon.Add_MouseClick({
 })
 
 function Update-TrayIcon {
-    # Same data the main window's grid is built from — Node/npm-only,
+    # Same data the main window's grid is built from — Dev-Servers-Only,
     # root-dir scope, and Use Groups/selected groups all apply here too, so
     # the tray icon/text always matches what's actually on screen.
     $allRows = @((Get-DisplayRows) | ForEach-Object { $_.Row })

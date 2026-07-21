@@ -15,6 +15,10 @@ Grab the latest `LocalhostManager.exe` from the
   project's real working directory even when the command line alone
   doesn't show it (e.g. `npm start`)
 - Shows local + LAN URLs so you can share a dev server on your network
+- Right-click any row for a compact **Detail** popup — every column's full
+  value with a one-click copy button, network addresses broken out one per
+  adapter (`Ethernet`, `Tailscale`, `VMware`, ...) and virtual/VM-only
+  adapters flagged in purple so you don't mistake one for a real LAN address
 - Start/Stop from the grid, the tray icon's right-click menu, or in bulk
   via named **groups** (e.g. "frontend + backend + db")
 - Custom names, root-directory scoping, and a tray icon that turns red

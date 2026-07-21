@@ -28,6 +28,7 @@ them.
 | Groups | Bundle related projects and start/stop them together |
 | Show Groups toggle | Collapse the view to just your curated, grouped projects |
 | Root directory scope | Restrict the whole app to one folder tree |
+| Row detail popup | Right-click a row for every column's full value, each with a copy button; Network URLs split one-per-adapter and labeled (Ethernet/Tailscale/VMware/...), with virtual adapters flagged purple |
 | System tray | Lives in the tray; closing the window just hides it |
 | Status icon | Tray icon turns red when anything tracked is down |
 
