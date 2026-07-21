@@ -470,6 +470,18 @@ function Build-Rows {
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
+# Single-instance guard. A named Mutex is process-independent (unlike a
+# lock file), so it can't be left stale by a crash — Windows releases it
+# automatically when the owning process exits.
+# ---------------------------------------------------------------------------
+$script:SingleInstanceCreatedNew = $false
+$script:SingleInstanceMutex = New-Object System.Threading.Mutex($true, 'LocalhostManager_SingleInstance_Mutex', [ref]$script:SingleInstanceCreatedNew)
+if (-not $script:SingleInstanceCreatedNew) {
+    [System.Windows.Forms.MessageBox]::Show('Localhost Manager is already running. Check your system tray.', 'Localhost Manager', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    exit
+}
+
+# ---------------------------------------------------------------------------
 # Theme — flat, light, GNOME/Adwaita-inspired palette. Swapped in for the
 # default WinForms 3D-bevel gray look: flat bordered buttons with rounded
 # corners, a real background/foreground color system, and a white grid
