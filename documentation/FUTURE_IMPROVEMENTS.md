@@ -5,18 +5,24 @@ roughly ordered by how much value they'd add relative to effort.
 
 ## High value
 
-- **Inline log capture.** Pipe each project's stdout/stderr into the app
-  (a per-row "View Log" panel) instead of a separate `cmd` window. Would
-  also enable...
-- **Crash detection.** Right now a crashed process and an intentionally
-  stopped one look identical (`OFF`). Capturing the child process's exit
-  and distinguishing "stopped by user" from "exited unexpectedly" would
-  make the tray's red-icon alert much more trustworthy to leave running
-  unattended. Natural follow-on: optional auto-restart on crash.
+- **Auto-restart on crash.** Crash *detection* already exists (a `CRASHED`
+  status distinct from `OFF`, driven by the child process's exit vs.
+  `StoppedByUser` — see `Start-ProjectAtPath`'s `Exited` handler in
+  `LocalhostManager.ps1`); what's still missing is actually doing
+  something about it. An opt-in auto-restart (with a capped
+  backoff/give-up, same pattern already prototyped in the separate
+  Launcher-local exploration's `Invoke-ProjectExitHandler`) would make the
+  tray's red-icon alert much more trustworthy to leave running unattended.
 - **Per-project custom start command.** Currently everything runs
   `npm start`, hardcoded. Supporting `yarn dev`, `pnpm run dev`, or an
   arbitrary command per project (stored alongside the custom name) would
   remove the biggest "this doesn't work for my setup" friction point.
+- **Custom local domains** (Herd/Valet-style, e.g. `myproject.test`
+  instead of `localhost:3005`). The pieces already exist in prototype
+  form from the Launcher-local exploration (Caddy reverse proxy + local-CA
+  HTTPS, trust-once model) and could be ported back in as an opt-in
+  per-project toggle — the one feature that would meaningfully
+  differentiate this from process managers like PM2 that don't offer it.
 
 ## Medium value
 
@@ -31,6 +37,10 @@ roughly ordered by how much value they'd add relative to effort.
 - **Search/filter box** in the grid, for machines with many tracked
   projects where scrolling gets old.
 - **Column sorting** by clicking headers (currently fixed sort by port).
+- **Log viewing in the web dashboard.** The native app already has a
+  per-project log viewer (`Show-LogViewer`); the v1.6 web dashboard
+  doesn't expose logs at all yet, which is the natural next step now that
+  remote viewing/control exists.
 
 ## Lower priority / nice-to-have
 
