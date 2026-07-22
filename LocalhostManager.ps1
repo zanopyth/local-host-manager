@@ -81,17 +81,24 @@ function Save-History($history) {
 $script:SettingsPath = Join-Path $script:HistoryDir 'settings.json'
 
 function Load-Settings {
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @() }
+    # DashboardEnabled defaults to $false: the web dashboard is opt-in,
+    # never auto-started on a fresh install. The end user turns it on (and
+    # picks a port) themselves via the Dashboard menu.
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
         $showGroups = if ($raw.PSObject.Properties.Name -contains 'ShowGroups') { [bool]$raw.ShowGroups } else { $true }
         $selectedGroups = if ($raw.PSObject.Properties.Name -contains 'SelectedGroups') { @($raw.SelectedGroups) } else { @() }
+        $webPort = if ($raw.PSObject.Properties.Name -contains 'WebPort' -and [int]$raw.WebPort -gt 0) { [int]$raw.WebPort } else { 3199 }
+        $dashboardEnabled = if ($raw.PSObject.Properties.Name -contains 'DashboardEnabled') { [bool]$raw.DashboardEnabled } else { $false }
         return @{
-            OnlyNode       = [bool]$raw.OnlyNode
-            RootDir        = [string]$raw.RootDir
-            ShowGroups     = $showGroups
-            SelectedGroups = $selectedGroups
+            OnlyNode         = [bool]$raw.OnlyNode
+            RootDir          = [string]$raw.RootDir
+            ShowGroups       = $showGroups
+            SelectedGroups   = $selectedGroups
+            WebPort          = $webPort
+            DashboardEnabled = $dashboardEnabled
         }
     } catch { return $defaults }
 }
@@ -224,6 +231,29 @@ $script:LiveCache = [hashtable]::Synchronized(@{
     LanIps        = @()
     Ready         = $false
     StopRequested = $false
+})
+
+# ---------------------------------------------------------------------------
+# Web dashboard cache. Shared with the HttpListener background runspace
+# (see "Web Dashboard" section near the bottom): the UI thread publishes a
+# JSON row snapshot into it on every refresh, and the listener thread only
+# ever reads from it. Stop/restart requests flow the other way through the
+# Actions queue + Results map so the listener thread never has to call back
+# into UI-thread-owned functions/state directly across the runspace
+# boundary. Initialized here (not lazily) so early startup calls to
+# Refresh-Grid, before the listener itself has started, have somewhere
+# safe to publish into.
+# ---------------------------------------------------------------------------
+$script:DashboardCache = [hashtable]::Synchronized(@{
+    RowsJson      = '[]'
+    Actions       = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+    Results       = [hashtable]::Synchronized(@{})
+    StopRequested = $false
+    Port          = 0
+    Addresses     = @()
+    BoundWildcard = $false
+    Listening     = $false
+    ListenError   = ''
 })
 
 $script:BackgroundPollScript = {
@@ -727,6 +757,101 @@ function Connect-ToggleLabel {
     $Label.Add_Click({ Invoke-ToggleClick -Switch $Switch }.GetNewClosure())
 }
 
+# ---------------------------------------------------------------------------
+# Web dashboard status pill — reuses the same rounded-path owner-draw
+# technique as Initialize-ModernButton, but fully rounded (pill, not
+# rounded-rect) and colored with the same Success/dim tokens the grid's own
+# Status column already uses, so "is the dashboard on" reads with the exact
+# color vocabulary the rest of the app already taught the user.
+# ---------------------------------------------------------------------------
+function New-DashboardPill {
+    $pill = New-Object System.Windows.Forms.Panel
+    $pill.Size = New-Object System.Drawing.Size(150, 26)
+    $pill.Tag = [PSCustomObject]@{ On = $false; Text = 'Dashboard off'; Url = $null }
+
+    $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+    $dbProp.SetValue($pill, $true, $null)
+
+    $pill.Add_Paint({
+        param($s, $e)
+        $t = $s.Tag
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { [System.Drawing.Color]::White }
+        $g.Clear($parentColor)
+
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+        $d = $rect.Height
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
+        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
+        $path.CloseFigure()
+
+        $fillColor = if ($t.On) { $script:Theme.SuccessTint } else { $script:Theme.PanelBg }
+        $textColor = if ($t.On) { $script:Theme.Success } else { $script:Theme.TextDim }
+        $dotColor = if ($t.On) { $script:Theme.Success } else { [System.Drawing.Color]::FromArgb(0xB0, 0xB0, 0xB0) }
+
+        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+        $g.FillPath($fillBrush, $path)
+        $fillBrush.Dispose()
+
+        $borderPen = New-Object System.Drawing.Pen($script:Theme.Border, 1)
+        $g.DrawPath($borderPen, $path)
+        $borderPen.Dispose()
+
+        $dotSize = 7
+        $dotY = [int](($s.Height - $dotSize) / 2)
+        $dotBrush = New-Object System.Drawing.SolidBrush($dotColor)
+        $g.FillEllipse($dotBrush, 11, $dotY, $dotSize, $dotSize)
+        $dotBrush.Dispose()
+
+        $textRect = New-Object System.Drawing.Rectangle(25, 0, ($s.Width - 29), $s.Height)
+        $flags = [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $t.Text, $s.Font, $textRect, $textColor, $flags)
+
+        $path.Dispose()
+    })
+
+    $pill.Add_Click({
+        param($s, $e)
+        if ($s.Tag.On -and $s.Tag.Url) { try { Start-Process $s.Tag.Url } catch {} }
+    })
+
+    return $pill
+}
+
+function Update-DashboardPill {
+    if (-not $script:DashboardPill) { return }
+    $t = $script:DashboardPill.Tag
+    if ($script:Settings.DashboardEnabled -and $script:DashboardCache.Listening) {
+        $t.On = $true
+        $t.Text = "Dashboard - $($script:DashboardCache.Port)"
+        $t.Url = "http://localhost:$($script:DashboardCache.Port)"
+        $addrText = (@($script:DashboardCache.Addresses) | ForEach-Object { "$($_.Label): $($_.Url)" }) -join "`n"
+        $script:DashboardTip.SetToolTip($script:DashboardPill, "Running - click to open`n$addrText")
+        $script:DashboardPill.Cursor = [System.Windows.Forms.Cursors]::Hand
+    } elseif ($script:Settings.DashboardEnabled -and $script:DashboardCache.ListenError) {
+        $t.On = $false
+        $t.Text = 'Dashboard: failed'
+        $t.Url = $null
+        $script:DashboardTip.SetToolTip($script:DashboardPill, "Failed to start: $($script:DashboardCache.ListenError)")
+        $script:DashboardPill.Cursor = [System.Windows.Forms.Cursors]::Default
+    } elseif ($script:Settings.DashboardEnabled) {
+        $t.On = $false
+        $t.Text = 'Dashboard starting...'
+        $t.Url = $null
+        $script:DashboardTip.SetToolTip($script:DashboardPill, 'Web dashboard is starting...')
+        $script:DashboardPill.Cursor = [System.Windows.Forms.Cursors]::Default
+    } else {
+        $t.On = $false
+        $t.Text = 'Dashboard off'
+        $t.Url = $null
+        $script:DashboardTip.SetToolTip($script:DashboardPill, 'Off. Enable it from the Dashboard menu.')
+        $script:DashboardPill.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+    $script:DashboardPill.Invalidate()
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Localhost Manager'
 $form.Size = New-Object System.Drawing.Size(960, 580)
@@ -781,10 +906,13 @@ $menuSettingsUseGroups.Add_Click({
 [System.Windows.Forms.ToolStripItem[]]$menuSettingsItems = @($menuSettingsPrefs, $menuSettingsGroups, (New-Object System.Windows.Forms.ToolStripSeparator), $menuSettingsNodeOnly, $menuSettingsUseGroups)
 $menuSettings.DropDownItems.AddRange($menuSettingsItems)
 
+$menuDashboard = New-Object System.Windows.Forms.ToolStripMenuItem('Dashboard')
+$menuDashboard.Add_Click({ Show-DashboardDialog })
+
 $menuAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
 $menuAbout.Add_Click({ Show-AboutDialog })
 
-[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuAbout)
+[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuAbout)
 $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
 
@@ -792,6 +920,17 @@ $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = 'Top'
 $topPanel.Height = 90
 $topPanel.BackColor = $script:Theme.PanelBg
+# Set explicitly (matching Dock='Top''s eventual real width) before any
+# Right-anchored children are added below. WinForms bakes each anchored
+# child's margin from whatever width the parent reports at the moment
+# Controls.Add/AddRange runs -- if that's still the Panel's un-docked
+# default (~200px, since Dock doesn't take effect until parented to
+# $form later), every Top,Right-only control ends up positioned using a
+# margin computed against 200px and lands far off-screen once the panel
+# actually grows to its real size. Left+Right-anchored controls
+# (scopeLabel) don't show this because they stretch instead of
+# translate, so the bug doesn't visibly break them.
+$topPanel.Width = $form.ClientSize.Width
 
 $topPanelDivider = New-Object System.Windows.Forms.Panel
 $topPanelDivider.Dock = 'Bottom'
@@ -844,22 +983,49 @@ $useGroupsLabel.ForeColor = $script:Theme.TextPrimary
 
 $divider2 = New-VerticalDivider -X 474
 
+# Lives in row 1 (not row 2's Group/Start All/Stop All cluster) because row
+# 2 collapses entirely (topPanel.Height drops to 46) when "Use Groups" is
+# off — the dashboard indicator has to survive that regardless of the
+# groups setting, so row 1 is the only spot that's always on screen.
+$script:DashboardTip = New-Object System.Windows.Forms.ToolTip
+# Defaults are InitialDelay=500 / AutoPopDelay=5000 — the 5s pop delay is
+# what made it feel "stuck" lingering on screen after a hover. Trimmed to
+# a snappier show/stay time.
+$script:DashboardTip.InitialDelay = 300
+$script:DashboardTip.ReshowDelay = 100
+$script:DashboardTip.AutoPopDelay = 2000
+$script:DashboardPill = New-DashboardPill
+$script:DashboardPill.Location = New-Object System.Drawing.Point(490, 12)
+
 $scopeLabel = New-Object System.Windows.Forms.Label
 $scopeLabel.Text = ''
-$scopeLabel.Location = New-Object System.Drawing.Point(490, 15)
-$scopeLabel.Size = New-Object System.Drawing.Size(224, 22)
+$scopeLabel.Location = New-Object System.Drawing.Point(656, 15)
+$scopeLabel.Size = New-Object System.Drawing.Size(282, 22)
 $scopeLabel.TextAlign = 'MiddleLeft'
 $scopeLabel.ForeColor = $script:Theme.Accent
 $scopeLabel.AutoEllipsis = $true
-$scopeLabel.Anchor = 'Top,Left,Right'
+$scopeLabel.Anchor = 'Top,Right'
+
+# Footer clock — just the time, not "Last refreshed: ... | N shown"; the
+# count moved to the tab headers (Live (N) / History (N)) already, so
+# repeating it here was redundant.
+$script:BottomBarDivider = New-Object System.Windows.Forms.Panel
+$script:BottomBarDivider.Dock = 'Top'
+$script:BottomBarDivider.Height = 1
+$script:BottomBarDivider.BackColor = $script:Theme.Border
+
+$script:BottomBar = New-Object System.Windows.Forms.Panel
+$script:BottomBar.Dock = 'Bottom'
+$script:BottomBar.Height = 26
+$script:BottomBar.BackColor = $script:Theme.PanelBg
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = ''
-$statusLabel.Location = New-Object System.Drawing.Point(730, 15)
-$statusLabel.Size = New-Object System.Drawing.Size(210, 22)
+$statusLabel.Location = New-Object System.Drawing.Point(12, 4)
+$statusLabel.Size = New-Object System.Drawing.Size(90, 18)
 $statusLabel.ForeColor = $script:Theme.TextDim
-$statusLabel.TextAlign = 'MiddleRight'
-$statusLabel.Anchor = 'Top,Right'
+$statusLabel.TextAlign = 'MiddleLeft'
+$script:BottomBar.Controls.AddRange(@($statusLabel, $script:BottomBarDivider))
 
 $groupLabel = New-Object System.Windows.Forms.Label
 $groupLabel.Text = 'Group:'
@@ -911,7 +1077,7 @@ Initialize-ModernButton -Button $groupsButton
 Initialize-ModernButton -Button $startAllButton -Variant Success
 Initialize-ModernButton -Button $stopAllButton -Variant Danger
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $divider1, $nodeOnlySwitch, $nodeOnlyLabel, $useGroupsSwitch, $useGroupsLabel, $divider2, $scopeLabel, $statusLabel, $groupLabel, $groupsButton, $startAllButton, $stopAllButton, $topPanelDivider)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $divider1, $nodeOnlySwitch, $nodeOnlyLabel, $useGroupsSwitch, $useGroupsLabel, $divider2, $script:DashboardPill, $scopeLabel, $groupLabel, $groupsButton, $startAllButton, $stopAllButton, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -926,7 +1092,7 @@ function Update-GroupsVisibility {
     if ($tabControl) {
         $gridTop = $menuStrip.Height + $topPanel.Height
         $tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
-        $tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop))
+        $tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop - $script:BottomBar.Height))
     }
 }
 
@@ -1083,12 +1249,13 @@ $tabControl.TabPages.AddRange($tabPages)
 
 $gridTop = $menuStrip.Height + $topPanel.Height
 $tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
-$tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop))
+$tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop - $script:BottomBar.Height))
 
-# Fill/content control added first, then Dock='Top' controls in reverse
-# visual order (later-added = higher z-order = closer to the very top
+# Fill/content control added first, then Dock='Top'/'Bottom' controls in
+# reverse visual order (later-added = higher z-order = closer to its dock
 # edge) — the standard WinForms pattern for MenuStrip + toolbar + content.
 $form.Controls.Add($tabControl)
+$form.Controls.Add($script:BottomBar)
 $form.Controls.Add($topPanel)
 $form.Controls.Add($menuStrip)
 Update-GroupsVisibility
@@ -1153,6 +1320,7 @@ function Get-DisplayRowsSplit {
     # Build-Rows: ON rows come from the real TCP listener scan, OFF/CRASHED
     # rows come from history.json.
     $display = @(Get-DisplayRows)
+    Publish-DashboardRows -Display $display
     return @{
         Live    = @($display | Where-Object { $_.Row.Status -eq 'ON' })
         History = @($display | Where-Object { $_.Row.Status -ne 'ON' })
@@ -1213,7 +1381,7 @@ function Refresh-Grid {
     $script:LastLiveSignature = Get-DisplayRowsSignature $split.Live
     $script:LastHistorySignature = Get-DisplayRowsSignature $split.History
     Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
-    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($split.Live.Count + $split.History.Count) shown"
+    $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
 }
@@ -1239,7 +1407,7 @@ function Invoke-PeriodicRefresh {
         $script:LastHistorySignature = $historySig
     }
     Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
-    $statusLabel.Text = "Last refreshed: $(Get-Date -Format 'HH:mm:ss')  |  $($split.Live.Count + $split.History.Count) shown"
+    $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
 }
@@ -1725,7 +1893,7 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.5.2'
+    $versionLabel.Text = 'Version 1.6.0'
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
@@ -1828,6 +1996,115 @@ function Show-SettingsDialog {
         Save-Settings $script:Settings
         Update-ScopeLabel
         Refresh-Grid
+    }
+}
+
+function Show-DashboardDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Dashboard'
+    $dlg.Size = New-Object System.Drawing.Size(480, 300)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $introLbl = New-Object System.Windows.Forms.Label
+    $introLbl.Text = 'View the current table and stop/restart projects from a browser, on this PC or (once you set up reachability) your LAN/Tailnet.'
+    $introLbl.Location = New-Object System.Drawing.Point(15, 15)
+    $introLbl.Size = New-Object System.Drawing.Size(435, 34)
+    $introLbl.ForeColor = $script:Theme.TextDim
+
+    $enableSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.DashboardEnabled)
+    $enableSwitch.Location = New-Object System.Drawing.Point(15, 58)
+
+    $enableLbl = New-Object System.Windows.Forms.Label
+    $enableLbl.Text = 'Enable web dashboard'
+    $enableLbl.Location = New-Object System.Drawing.Point(60, 58)
+    $enableLbl.Size = New-Object System.Drawing.Size(250, 20)
+    $enableLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $enableSwitch -Label $enableLbl
+
+    $offByDefaultLbl = New-Object System.Windows.Forms.Label
+    $offByDefaultLbl.Text = 'Off by default. Nothing listens on any port until you enable it here.'
+    $offByDefaultLbl.Location = New-Object System.Drawing.Point(15, 84)
+    $offByDefaultLbl.Size = New-Object System.Drawing.Size(435, 18)
+    $offByDefaultLbl.ForeColor = $script:Theme.TextDim
+    $offByDefaultLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+
+    $portLbl = New-Object System.Windows.Forms.Label
+    $portLbl.Text = 'Port:'
+    $portLbl.Location = New-Object System.Drawing.Point(15, 118)
+    $portLbl.Size = New-Object System.Drawing.Size(40, 24)
+    $portLbl.ForeColor = $script:Theme.TextPrimary
+    $portLbl.TextAlign = 'MiddleLeft'
+
+    $portBox = New-Object System.Windows.Forms.NumericUpDown
+    $portBox.Location = New-Object System.Drawing.Point(60, 116)
+    $portBox.Size = New-Object System.Drawing.Size(90, 24)
+    $portBox.Minimum = 1024
+    $portBox.Maximum = 65535
+    $portBox.Value = [Math]::Max(1024, [Math]::Min(65535, [int]$script:Settings.WebPort))
+    $portBox.Enabled = [bool]$script:Settings.DashboardEnabled
+
+    Set-ToggleOnChange -Switch $enableSwitch -Handler {
+        $portBox.Enabled = Get-ToggleChecked $enableSwitch
+    }.GetNewClosure()
+
+    $statusLbl = New-Object System.Windows.Forms.Label
+    $statusLbl.Location = New-Object System.Drawing.Point(15, 150)
+    $statusLbl.Size = New-Object System.Drawing.Size(435, 60)
+    $statusLbl.ForeColor = $script:Theme.TextDim
+    $statusLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    if ($script:Settings.DashboardEnabled -and $script:DashboardCache.Listening) {
+        $addrText = (@($script:DashboardCache.Addresses) | ForEach-Object { "$($_.Label): $($_.Url)" }) -join "`n"
+        $statusLbl.Text = "Currently running.`n$addrText"
+    } elseif ($script:Settings.DashboardEnabled -and $script:DashboardCache.ListenError) {
+        $statusLbl.Text = "Enabled but failed to start: $($script:DashboardCache.ListenError)"
+    } elseif ($script:Settings.DashboardEnabled) {
+        $statusLbl.Text = 'Enabled, starting...'
+    } else {
+        $statusLbl.Text = 'Not running.'
+    }
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = 'OK'
+    $okButton.Location = New-Object System.Drawing.Point(275, 225)
+    $okButton.Size = New-Object System.Drawing.Size(85, 28)
+    $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
+    Initialize-ModernButton -Button $okButton -Variant Accent
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Cancel'
+    $cancelButton.Location = New-Object System.Drawing.Point(365, 225)
+    $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
+    $cancelButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $cancelButton
+
+    [System.Windows.Forms.Control[]]$dlgControls = @($introLbl, $enableSwitch, $enableLbl, $offByDefaultLbl, $portLbl, $portBox, $statusLbl, $okButton, $cancelButton)
+    $dlg.Controls.AddRange($dlgControls)
+    $dlg.AcceptButton = $okButton
+    $dlg.ShowDialog($form) | Out-Null
+
+    if ($dlg.Tag -eq 'OK') {
+        $newEnabled = Get-ToggleChecked $enableSwitch
+        $newPort = [int]$portBox.Value
+        $wasEnabled = [bool]$script:Settings.DashboardEnabled
+        $portChanged = $newPort -ne [int]$script:Settings.WebPort
+
+        $script:Settings.DashboardEnabled = $newEnabled
+        $script:Settings.WebPort = $newPort
+        Save-Settings $script:Settings
+
+        if ($newEnabled -and -not $wasEnabled) {
+            Start-WebDashboard -Port $newPort
+        } elseif (-not $newEnabled -and $wasEnabled) {
+            Stop-WebDashboard
+        } elseif ($newEnabled -and $wasEnabled -and $portChanged) {
+            Restart-WebDashboard -Port $newPort
+        }
+        Update-DashboardPill
     }
 }
 
@@ -2142,6 +2419,7 @@ $form.Add_FormClosing({
     } else {
         $notifyIcon.Visible = $false
         Stop-BackgroundPoller
+        Stop-WebDashboard
     }
 })
 
@@ -2160,6 +2438,476 @@ Set-ToggleOnChange -Switch $useGroupsSwitch -Handler {
     Refresh-Grid
 }
 
+# ---------------------------------------------------------------------------
+# Web Dashboard — a read/control view of the current table at
+# http://localhost:<port> (default 3199, configurable in Settings). Runs an
+# HttpListener on its own background runspace (same pattern as the TCP
+# poller above). It never touches UI-thread state directly: row data flows
+# UI-thread -> DashboardCache.RowsJson (published on every Get-DisplayRowsSplit
+# call, so it's always in sync with what's on screen); stop/start/restart
+# requests flow listener-thread -> DashboardCache.Actions queue ->
+# $script:DashboardActionTimer (UI thread, drains the queue and calls the
+# same Stop-ProjectById/Start-ProjectAtPath used by the grid) ->
+# DashboardCache.Results, which the listener thread polls for up to 8s
+# before responding to the browser.
+# ---------------------------------------------------------------------------
+function Get-DashboardAddresses {
+    param([int]$Port)
+    $list = New-Object System.Collections.Generic.List[object]
+    $list.Add([PSCustomObject]@{ Label = 'This PC'; Url = "http://localhost:$Port" })
+    $seen = @{}
+    foreach ($ipInfo in @(Get-LanIPv4Addresses)) {
+        if ($seen.ContainsKey($ipInfo.IPAddress)) { continue }
+        $seen[$ipInfo.IPAddress] = $true
+        $info = Get-NetworkInterfaceLabel -InterfaceAlias $ipInfo.InterfaceAlias
+        if ($info.IsVirtual) { continue }
+        $list.Add([PSCustomObject]@{ Label = $info.Label; Url = "http://$($ipInfo.IPAddress):$Port" })
+    }
+    return @($list.ToArray() | Sort-Object { if ($_.Label -eq 'Tailscale') { 0 } elseif ($_.Label -eq 'This PC') { -1 } else { 1 } })
+}
+
+function Publish-DashboardRows {
+    param($Display)
+    if (-not $script:DashboardCache) { return }
+    [object[]]$dashRows = @($Display | ForEach-Object {
+        [PSCustomObject]@{
+            Status      = $_.Row.Status
+            Port        = $_.Row.Port
+            CustomName  = $_.Row.CustomName
+            ProcessName = $_.Row.ProcessName
+            ProcId      = $_.Row.ProcId
+            LocalUrl    = $_.Row.LocalUrl
+            LanUrls     = $_.Row.LanUrls
+            LanEntries  = @($_.Row.LanEntries | ForEach-Object { [PSCustomObject]@{ Label = $_.Label; Url = $_.Url } })
+            ProjectPath = $_.Row.ProjectPath
+            HasLog      = [bool]$_.Row.HasLog
+        }
+    })
+    # -InputObject (not the pipeline) is required so a single-row result
+    # still serializes as a one-element JSON array instead of Windows
+    # PowerShell 5.1's ConvertTo-Json unwrapping it to a bare object.
+    $script:DashboardCache.RowsJson = ConvertTo-Json -InputObject $dashRows -Depth 6
+}
+
+function Invoke-DashboardAction {
+    param($Action)
+    $result = @{ Ok = $false; Message = '' }
+    try {
+        switch ($Action.Type) {
+            'stop' {
+                if (Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath) {
+                    $result.Ok = $true; $result.Message = 'Stopped.'
+                } else {
+                    $result.Message = 'Could not stop process.'
+                }
+            }
+            'start' {
+                if (-not $Action.ProjectPath) {
+                    $result.Message = 'No known project path for this port.'
+                } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath) {
+                    $result.Ok = $true; $result.Message = 'Started.'
+                } else {
+                    $result.Message = 'Could not start project.'
+                }
+            }
+            'restart' {
+                if (-not $Action.ProjectPath) {
+                    $result.Message = 'No known project path for this port.'
+                } else {
+                    $ok = $true
+                    if ($Action.Status -eq 'ON') {
+                        $ok = Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath
+                        if ($ok) { Start-Sleep -Milliseconds 800 }
+                    }
+                    if (-not $ok) {
+                        $result.Message = 'Could not stop process.'
+                    } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath) {
+                        $result.Ok = $true; $result.Message = 'Restarted.'
+                    } else {
+                        $result.Message = 'Could not start project.'
+                    }
+                }
+            }
+            default { $result.Message = 'Unknown action.' }
+        }
+    } catch {
+        $result.Message = $_.Exception.Message
+    }
+    Refresh-Grid
+    return $result
+}
+
+function Get-DashboardHtml {
+    param([int]$Port)
+    $netshCmd = "netsh http add urlacl url=http://+:$Port/ user=Everyone"
+    $faviconDataUri = ''
+    try {
+        $iconPath = Join-Path $script:AppDir 'LocalhostManager.ico'
+        if (Test-Path $iconPath) {
+            $iconBytes = [System.IO.File]::ReadAllBytes($iconPath)
+            $faviconDataUri = 'data:image/x-icon;base64,' + [Convert]::ToBase64String($iconBytes)
+        }
+    } catch {}
+    $html = @'
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Localhost Manager</title>
+<link rel="icon" type="image/x-icon" href="__FAVICON_DATA_URI__">
+<style>
+  :root {
+    --bg: #FAFAFA; --panel: #F2F1F0; --card: #FFFFFF; --border: #D1D1D1;
+    --text: #2E3436; --dim: #77767B; --accent: #3584E4; --accent-dark: #1C71D8;
+    --success: #26A269; --success-tint: #E3F6EC; --danger: #C01C28; --danger-tint: #FBE6E7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 20px 24px 12px; }
+  h1 { font-size: 20px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h1 img { width: 24px; height: 24px; }
+  .sub { color: var(--dim); font-size: 13px; }
+  .addrs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .addr { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; }
+  .addr b { color: var(--accent-dark); }
+  main { padding: 0 24px 24px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  th { background: var(--panel); font-weight: 600; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  tr:last-child td { border-bottom: none; }
+  .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .status.ON { background: var(--success-tint); color: var(--success); }
+  .status.OFF { background: var(--panel); color: var(--dim); }
+  .status.CRASHED { background: var(--danger-tint); color: var(--danger); }
+  .actions { white-space: nowrap; }
+  button { font-family: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; margin-right: 4px; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent-dark); }
+  button.danger { background: var(--danger); color: white; border-color: #8f1520; }
+  button:disabled { opacity: .5; cursor: default; }
+  .confirm { display: inline-flex; gap: 4px; align-items: center; }
+  .empty { padding: 30px; text-align: center; color: var(--dim); }
+  details { margin-top: 18px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 12px; }
+  summary { cursor: pointer; font-weight: 600; color: var(--dim); }
+  code { background: var(--panel); padding: 2px 5px; border-radius: 4px; }
+  a { color: var(--accent-dark); }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1E1E20; --panel:#2A2A2D; --card:#232326; --border:#3A3A3D; --text:#E7E7E9; --dim:#9A9A9F; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><img src="__FAVICON_DATA_URI__" alt=""> Localhost Manager</h1>
+  <div class="sub" id="statusLine">Loading...</div>
+  <div class="addrs" id="addrList"></div>
+  <div class="sub" id="bindWarning" style="display:none;color:var(--danger);margin-top:6px;">Currently reachable from this PC only &mdash; see remote access tips below to open it up.</div>
+</header>
+<main>
+  <table>
+    <thead><tr><th>Status</th><th>Port</th><th>Name</th><th>Process</th><th>Local URL</th><th>LAN</th><th class="actions">Action</th></tr></thead>
+    <tbody id="rows"><tr><td class="empty" colspan="7">Loading...</td></tr></tbody>
+  </table>
+  <details>
+    <summary>Remote access tips</summary>
+    <p>This page is bound to this machine only by default. To reach it from other devices:</p>
+    <p><b>Same Wi-Fi/LAN:</b> run this once as Administrator, then use one of the LAN addresses above:</p>
+    <p><code>__NETSH_CMD__</code></p>
+    <p><b>Remote / different network:</b> install <a href="https://tailscale.com/kb/1017/install" target="_blank">Tailscale</a> on this machine and any device that needs access, or advertise this machine's LAN as a subnet route so tailnet devices can reach it without installing Tailscale themselves &mdash; see <a href="https://tailscale.com/kb/1019/subnets" target="_blank">Tailscale's subnet routes docs</a>.</p>
+  </details>
+</main>
+<script>
+async function refresh() {
+  try {
+    const [rowsRes, metaRes] = await Promise.all([fetch('/api/rows'), fetch('/api/meta')]);
+    const rows = await rowsRes.json();
+    const meta = await metaRes.json();
+    renderAddrs(meta);
+    renderRows(rows);
+    document.getElementById('statusLine').textContent = 'Live — last updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('statusLine').textContent = 'Connection lost, retrying...';
+  }
+}
+
+function renderAddrs(meta) {
+  const el = document.getElementById('addrList');
+  el.innerHTML = (meta.Addresses || []).map(a =>
+    '<span class="addr"><b>' + esc(a.Label) + ':</b> ' + esc(a.Url) + '</span>'
+  ).join('');
+  document.getElementById('bindWarning').style.display = meta.BoundWildcard ? 'none' : 'block';
+}
+
+function renderRows(rows) {
+  const tbody = document.getElementById('rows');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td class="empty" colspan="7">Nothing tracked yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const key = r.Port + '_' + (r.ProcId || 0);
+    const canAct = !!r.ProjectPath;
+    let actionCell = '';
+    if (canAct) {
+      actionCell = r.Status === 'ON'
+        ? btn(key, 'stop', 'danger', 'Stop', r) + btn(key, 'restart', '', 'Restart', r)
+        : btn(key, 'start', 'primary', 'Start', r);
+    }
+    return '<tr>' +
+      '<td><span class="status ' + r.Status + '">' + r.Status + '</span></td>' +
+      '<td>' + r.Port + '</td>' +
+      '<td>' + esc(r.CustomName || '') + '</td>' +
+      '<td>' + esc(r.ProcessName || '') + '</td>' +
+      '<td>' + (r.Status === 'ON' ? '<a href="' + esc(r.LocalUrl) + '" target="_blank">' + esc(r.LocalUrl) + '</a>' : '') + '</td>' +
+      '<td>' + renderLan(r) + '</td>' +
+      '<td class="actions" id="act-' + key + '">' + actionCell + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+function renderLan(r) {
+  if (r.LanEntries && r.LanEntries.length) {
+    return r.LanEntries.map(function(e) {
+      return '<a href="' + esc(e.Url) + '" target="_blank" title="' + esc(e.Label) + '">' + esc(e.Url) + '</a>';
+    }).join(', ');
+  }
+  return esc(r.LanUrls || '');
+}
+
+function btn(key, type, cls, label, row) {
+  return '<button class="' + cls + '" data-key="' + key + '" data-type="' + type + '" ' +
+    'data-procid="' + (row.ProcId || 0) + '" data-status="' + esc(row.Status) + '" ' +
+    'data-path="' + esc(row.ProjectPath || '') + '">' + label + '</button>';
+}
+
+document.getElementById('rows').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-type]');
+  if (!b) return;
+  const cell = b.closest('td');
+  const row = { ProcId: Number(b.dataset.procid), ProjectPath: b.dataset.path, Status: b.dataset.status };
+  confirmAction(cell, b.dataset.type, row);
+});
+
+function confirmAction(cell, type, row) {
+  const prevHtml = cell.innerHTML;
+  cell.innerHTML = '<span class="confirm">' + type + '? ' +
+    '<button class="danger yesBtn">Yes</button>' +
+    '<button class="noBtn">No</button></span>';
+  cell.querySelector('.noBtn').onclick = () => { cell.innerHTML = prevHtml; };
+  cell.querySelector('.yesBtn').onclick = () => runAction(cell, type, row);
+}
+
+async function runAction(cell, type, row) {
+  cell.innerHTML = '<button disabled>Working...</button>';
+  try {
+    const res = await fetch('/api/' + type, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ProcId: row.ProcId, ProjectPath: row.ProjectPath, Status: row.Status })
+    });
+    const result = await res.json();
+    if (!result.Ok) { alert(result.Message || 'Action failed.'); }
+  } catch (e) {
+    alert('Request failed: ' + e);
+  }
+  refresh();
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
+'@
+    return $html.Replace('__NETSH_CMD__', $netshCmd).Replace('__FAVICON_DATA_URI__', $faviconDataUri)
+}
+
+$script:DashboardListenScript = {
+    param($Cache, $Html)
+
+    $listener = New-Object System.Net.HttpListener
+    $boundOk = $false
+    try {
+        $listener.Prefixes.Add("http://+:$($Cache.Port)/")
+        $listener.Start()
+        $boundOk = $true
+        $Cache.BoundWildcard = $true
+    } catch {
+        try { $listener.Close() } catch {}
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://localhost:$($Cache.Port)/")
+        $listener.Prefixes.Add("http://127.0.0.1:$($Cache.Port)/")
+        try {
+            $listener.Start()
+            $boundOk = $true
+            $Cache.BoundWildcard = $false
+        } catch {
+            $Cache.ListenError = $_.Exception.Message
+            $boundOk = $false
+        }
+    }
+    $Cache.Listening = $boundOk
+    if (-not $boundOk) { return }
+
+    while (-not $Cache.StopRequested) {
+        $context = $null
+        try {
+            $asyncResult = $listener.BeginGetContext($null, $null)
+            while (-not $asyncResult.AsyncWaitHandle.WaitOne(500)) {
+                if ($Cache.StopRequested) { try { $listener.Stop() } catch {}; return }
+            }
+            $context = $listener.EndGetContext($asyncResult)
+        } catch {
+            if ($Cache.StopRequested) { return }
+            continue
+        }
+        if (-not $context) { continue }
+
+        $req = $context.Request
+        $res = $context.Response
+        try {
+            $path = $req.Url.AbsolutePath
+            if ($req.HttpMethod -eq 'GET' -and $path -eq '/') {
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
+                $res.ContentType = 'text/html; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+            elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/rows') {
+                $json = $Cache.RowsJson
+                if (-not $json) { $json = '[]' }
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+            elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/meta') {
+                $meta = ConvertTo-Json -InputObject @{ Addresses = $Cache.Addresses; Port = $Cache.Port; BoundWildcard = $Cache.BoundWildcard } -Depth 4
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($meta)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+            elseif ($req.HttpMethod -eq 'POST' -and ($path -eq '/api/stop' -or $path -eq '/api/restart' -or $path -eq '/api/start')) {
+                $enc = if ($req.ContentEncoding) { $req.ContentEncoding } else { [System.Text.Encoding]::UTF8 }
+                $reader = New-Object System.IO.StreamReader($req.InputStream, $enc)
+                $bodyText = $reader.ReadToEnd()
+                $reader.Close()
+                $body = $null
+                try { $body = $bodyText | ConvertFrom-Json } catch {}
+
+                $type = 'start'
+                if ($path -eq '/api/stop') { $type = 'stop' } elseif ($path -eq '/api/restart') { $type = 'restart' }
+                $id = [guid]::NewGuid().ToString()
+                $action = @{
+                    Id          = $id
+                    Type        = $type
+                    ProcId      = if ($body.ProcId) { [int]$body.ProcId } else { 0 }
+                    ProjectPath = [string]$body.ProjectPath
+                    Status      = [string]$body.Status
+                }
+                $Cache.Actions.Enqueue($action)
+
+                $waited = 0
+                $result = $null
+                while ($waited -lt 8000) {
+                    if ($Cache.Results.ContainsKey($id)) {
+                        $result = $Cache.Results[$id]
+                        [void]$Cache.Results.Remove($id)
+                        break
+                    }
+                    Start-Sleep -Milliseconds 150
+                    $waited += 150
+                }
+                if (-not $result) { $result = @{ Ok = $false; Message = 'Timed out waiting for the app to process the action.' } }
+
+                $json = ConvertTo-Json -InputObject $result -Depth 3
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $res.ContentType = 'application/json; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+            else {
+                $res.StatusCode = 404
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes('Not found')
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+        } catch {
+            try { $res.StatusCode = 500 } catch {}
+        } finally {
+            try { $res.OutputStream.Close() } catch {}
+        }
+    }
+    try { $listener.Stop() } catch {}
+    try { $listener.Close() } catch {}
+}
+
+function Start-WebDashboard {
+    param([int]$Port)
+    $script:DashboardCache.StopRequested = $false
+    $script:DashboardCache.Port = $Port
+    $script:DashboardCache.Addresses = @(Get-DashboardAddresses -Port $Port)
+    $script:DashboardCache.Listening = $false
+    $script:DashboardCache.ListenError = ''
+    $script:DashboardNotifiedFailure = $false
+
+    $html = Get-DashboardHtml -Port $Port
+
+    $script:DashboardRunspace = [runspacefactory]::CreateRunspace()
+    $script:DashboardRunspace.ApartmentState = 'MTA'
+    $script:DashboardRunspace.ThreadOptions = 'ReuseThread'
+    $script:DashboardRunspace.Open()
+
+    $script:DashboardShell = [powershell]::Create()
+    $script:DashboardShell.Runspace = $script:DashboardRunspace
+    [void]$script:DashboardShell.AddScript($script:DashboardListenScript).
+        AddArgument($script:DashboardCache).
+        AddArgument($html)
+    $script:DashboardHandle = $script:DashboardShell.BeginInvoke()
+}
+
+function Stop-WebDashboard {
+    if (-not $script:DashboardShell) { return }
+    $script:DashboardCache.StopRequested = $true
+    try { $script:DashboardShell.Stop() } catch {}
+    try { $script:DashboardShell.Dispose() } catch {}
+    try { $script:DashboardRunspace.Close() } catch {}
+    $script:DashboardShell = $null
+    $script:DashboardRunspace = $null
+}
+
+function Restart-WebDashboard {
+    param([int]$Port)
+    Stop-WebDashboard
+    Start-WebDashboard -Port $Port
+}
+
+$script:DashboardNotifiedFailure = $false
+$script:DashboardActionTimer = New-Object System.Windows.Forms.Timer
+$script:DashboardActionTimer.Interval = 300
+$script:DashboardActionTimer.Add_Tick({
+    while ($script:DashboardCache.Actions.Count -gt 0) {
+        $action = $script:DashboardCache.Actions.Dequeue()
+        $result = Invoke-DashboardAction -Action $action
+        $script:DashboardCache.Results[$action.Id] = $result
+    }
+    if ($script:DashboardCache.Listening) {
+        $script:DashboardCache.Addresses = @(Get-DashboardAddresses -Port $script:DashboardCache.Port)
+    } elseif ($script:DashboardCache.ListenError -and -not $script:DashboardNotifiedFailure) {
+        $script:DashboardNotifiedFailure = $true
+        try {
+            $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "Web dashboard failed to start on port $($script:DashboardCache.Port): $($script:DashboardCache.ListenError)", [System.Windows.Forms.ToolTipIcon]::Warning)
+        } catch {}
+    }
+    Update-DashboardPill
+})
+$script:DashboardActionTimer.Start()
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 4000
 $timer.Add_Tick({ Invoke-PeriodicRefresh })
@@ -2171,6 +2919,10 @@ try {
         Start-Sleep -Milliseconds 50
     }
     Refresh-Grid
+    if ($script:Settings.DashboardEnabled) {
+        Start-WebDashboard -Port ([int]$script:Settings.WebPort)
+    }
+    Update-DashboardPill
 } catch {
     [System.Windows.Forms.MessageBox]::Show("Startup error: $_", 'Error') | Out-Null
 }

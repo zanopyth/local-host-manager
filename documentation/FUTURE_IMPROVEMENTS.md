@@ -34,9 +34,6 @@ roughly ordered by how much value they'd add relative to effort.
 
 ## Lower priority / nice-to-have
 
-- **Multiple LAN/VPN network labels** — currently all non-loopback IPs
-  are listed together; labeling which is "LAN" vs "Tailscale" vs "VMware"
-  would reduce ambiguity in the Network URL(s) column.
 - **Confirm-before-Start** as an opt-in setting, for anyone who wants
   symmetrical friction with Stop's confirmation.
 - **Dark mode** for the grid/dialogs (currently only the tray icons and
