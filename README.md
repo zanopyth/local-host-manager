@@ -1,5 +1,8 @@
 # Localhost Manager
 
+[![Release](https://img.shields.io/github/v/release/zanopyth/local-host-manager)](../../releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A small Windows tray app that scans your machine for running `localhost` dev
 servers (npm/node projects), shows their status, LAN URLs, and lets you
 start/stop them individually or in named groups — all without a config file.
@@ -79,3 +82,12 @@ compiled `.exe` — they're loaded at runtime for the window/tray icons.
 32-bit build cannot read the memory of 64-bit processes like `node.exe`.
 Without `-x64`, every Node/npm dev server silently fails working-directory
 detection and gets filtered out by the "Node/npm projects only" checkbox.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history, or the
+[Releases](../../releases) page for downloadable builds.
+
+## License
+
+[MIT](LICENSE)
