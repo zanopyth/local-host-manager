@@ -20,7 +20,10 @@ Grab the latest `LocalhostManager.exe` from the
   adapter (`Ethernet`, `Tailscale`, `VMware`, ...) and virtual/VM-only
   adapters flagged in purple so you don't mistake one for a real LAN address
 - Start/Stop from the grid, the tray icon's right-click menu, or in bulk
-  via named **groups** (e.g. "frontend + backend + db")
+  via named **groups** (e.g. "frontend + backend + db"). Group membership
+  defaults to Node/dev-server ports; a "Show all listening ports" checkbox
+  in **Manage Groups** reveals every open port (Python, Docker, etc.) so
+  non-Node processes can be grouped too
 - Custom names, root-directory scoping, and a tray icon that turns red
   when something in your tracked set goes down
 - Runs from the tray — closing the window just hides it

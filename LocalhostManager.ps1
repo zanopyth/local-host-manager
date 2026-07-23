@@ -570,6 +570,7 @@ function Initialize-ModernButton {
     $Button.Add_MouseLeave({ param($s, $e) $s.Tag.State = 'Normal'; $s.Invalidate() })
     $Button.Add_MouseDown({ param($s, $e) $s.Tag.State = 'Pressed'; $s.Invalidate() })
     $Button.Add_MouseUp({ param($s, $e) $s.Tag.State = 'Hover'; $s.Invalidate() })
+    $Button.Add_EnabledChanged({ param($s, $e) $s.Tag.State = 'Normal'; $s.Invalidate() })
 
     $Button.Add_Paint({
         param($s, $e)
@@ -588,8 +589,18 @@ function Initialize-ModernButton {
         $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
         $path.CloseFigure()
 
-        $fillColor = if ($t.State -eq 'Normal') { [System.Drawing.Color]::White } else { $t.FillActive }
-        $borderColor = if ($t.State -eq 'Normal') { $t.BorderNormal } else { $t.BorderActive }
+        if (-not $s.Enabled) {
+            $fillColor = $parentColor
+            $borderColor = $script:Theme.Border
+            $textColor = $script:Theme.TextDim
+        } else {
+            $fillColor = if ($t.State -eq 'Normal') { [System.Drawing.Color]::White } else { $t.FillActive }
+            $borderColor = if ($t.State -eq 'Normal') { $t.BorderNormal } else { $t.BorderActive }
+            $textColor = $t.Fg
+        }
+        if ($null -eq $fillColor) { $fillColor = [System.Drawing.Color]::White }
+        if ($null -eq $borderColor) { $borderColor = [System.Drawing.Color]::FromArgb(0xD1, 0xD1, 0xD1) }
+        if ($null -eq $textColor) { $textColor = [System.Drawing.Color]::Black }
 
         $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
         $g.FillPath($fillBrush, $path)
@@ -600,10 +611,44 @@ function Initialize-ModernButton {
         $borderPen.Dispose()
 
         $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $t.Fg, $flags)
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $textColor, $flags)
 
         $path.Dispose()
     })
+}
+
+# ---------------------------------------------------------------------------
+# Rounds any dropdown/context-menu popup (ToolStripDropDown, the auto-created
+# ToolStripDropDownMenu behind a top-level menu item, or a ContextMenuStrip —
+# all derive from ToolStripDropDown) by clipping it to a rounded-rect Region
+# on every paint, since AutoSize means the final Size isn't known until
+# layout, then stroking a matching border so the corners don't look bare.
+# ---------------------------------------------------------------------------
+function Enable-RoundedPopup {
+    param($Popup, [int]$Radius = 8)
+    $Popup.BackColor = [System.Drawing.Color]::White
+    $paintHandler = {
+        param($s, $e)
+        if ($s.Width -le 0 -or $s.Height -le 0) { return }
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.Height)
+        $d = [Math]::Min($Radius * 2, [Math]::Min($rect.Width, $rect.Height))
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
+        $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
+        $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
+        $path.CloseFigure()
+        $s.Region = New-Object System.Drawing.Region($path)
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $borderColor = $script:Theme.Border
+        if ($null -ne $borderColor) {
+            $borderPen = New-Object System.Drawing.Pen($borderColor, 1)
+            $e.Graphics.DrawPath($borderPen, $path)
+            $borderPen.Dispose()
+        }
+        $path.Dispose()
+    }.GetNewClosure()
+    $Popup.Add_Paint($paintHandler)
 }
 
 $script:Settings = Load-Settings
@@ -758,15 +803,15 @@ function Connect-ToggleLabel {
 }
 
 # ---------------------------------------------------------------------------
-# Web dashboard status pill — reuses the same rounded-path owner-draw
-# technique as Initialize-ModernButton, but fully rounded (pill, not
-# rounded-rect) and colored with the same Success/dim tokens the grid's own
-# Status column already uses, so "is the dashboard on" reads with the exact
-# color vocabulary the rest of the app already taught the user.
+# Web dashboard status indicator — a small circular badge (not a labeled
+# pill) so it reads as a quiet status dot rather than another toolbar
+# button. Green/red tint + ring + center dot, using the same Success/Danger
+# tokens the grid's own Status column already uses. Details (port, URL,
+# error) live in the tooltip instead of on-face text.
 # ---------------------------------------------------------------------------
 function New-DashboardPill {
     $pill = New-Object System.Windows.Forms.Panel
-    $pill.Size = New-Object System.Drawing.Size(150, 26)
+    $pill.Size = New-Object System.Drawing.Size(20, 20)
     $pill.Tag = [PSCustomObject]@{ On = $false; Text = 'Dashboard off'; Url = $null }
 
     $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
@@ -787,27 +832,28 @@ function New-DashboardPill {
         $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
         $path.CloseFigure()
 
-        $fillColor = if ($t.On) { $script:Theme.SuccessTint } else { $script:Theme.PanelBg }
-        $textColor = if ($t.On) { $script:Theme.Success } else { $script:Theme.TextDim }
-        $dotColor = if ($t.On) { $script:Theme.Success } else { [System.Drawing.Color]::FromArgb(0xB0, 0xB0, 0xB0) }
+        $fillColor = if ($t.On) { $script:Theme.SuccessTint } else { $script:Theme.DangerTint }
+        $ringColor = if ($t.On) { $script:Theme.Success } else { $script:Theme.Danger }
 
         $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
         $g.FillPath($fillBrush, $path)
         $fillBrush.Dispose()
 
-        $borderPen = New-Object System.Drawing.Pen($script:Theme.Border, 1)
+        $borderPen = New-Object System.Drawing.Pen($ringColor, 1)
         $g.DrawPath($borderPen, $path)
         $borderPen.Dispose()
 
-        $dotSize = 7
-        $dotY = [int](($s.Height - $dotSize) / 2)
-        $dotBrush = New-Object System.Drawing.SolidBrush($dotColor)
-        $g.FillEllipse($dotBrush, 11, $dotY, $dotSize, $dotSize)
+        # Centered on the ring's own bounding box (0,0 .. Width-1,Height-1),
+        # not the control's full Width/Height, and in float space so it
+        # lands dead-center instead of getting truncated a pixel off by
+        # integer division.
+        $dotSize = 8.0
+        $cx = $rect.X + ($rect.Width / 2.0)
+        $cy = $rect.Y + ($rect.Height / 2.0)
+        $dotRect = New-Object System.Drawing.RectangleF(($cx - $dotSize / 2.0), ($cy - $dotSize / 2.0), $dotSize, $dotSize)
+        $dotBrush = New-Object System.Drawing.SolidBrush($ringColor)
+        $g.FillEllipse($dotBrush, $dotRect)
         $dotBrush.Dispose()
-
-        $textRect = New-Object System.Drawing.Rectangle(25, 0, ($s.Width - 29), $s.Height)
-        $flags = [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $t.Text, $s.Font, $textRect, $textColor, $flags)
 
         $path.Dispose()
     })
@@ -915,10 +961,12 @@ $menuAbout.Add_Click({ Show-AboutDialog })
 [System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuAbout)
 $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
+Enable-RoundedPopup -Popup $menuFile.DropDown -Radius 8
+Enable-RoundedPopup -Popup $menuSettings.DropDown -Radius 8
 
 $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = 'Top'
-$topPanel.Height = 90
+$topPanel.Height = 88
 $topPanel.BackColor = $script:Theme.PanelBg
 # Set explicitly (matching Dock='Top''s eventual real width) before any
 # Right-anchored children are added below. WinForms bakes each anchored
@@ -927,9 +975,8 @@ $topPanel.BackColor = $script:Theme.PanelBg
 # default (~200px, since Dock doesn't take effect until parented to
 # $form later), every Top,Right-only control ends up positioned using a
 # margin computed against 200px and lands far off-screen once the panel
-# actually grows to its real size. Left+Right-anchored controls
-# (scopeLabel) don't show this because they stretch instead of
-# translate, so the bug doesn't visibly break them.
+# actually grows to its real size. (Same fix applied to BottomBar below,
+# for the same reason -- scopeLabel lives there now.)
 $topPanel.Width = $form.ClientSize.Width
 
 $topPanelDivider = New-Object System.Windows.Forms.Panel
@@ -938,55 +985,42 @@ $topPanelDivider.Height = 1
 $topPanelDivider.BackColor = $script:Theme.Border
 
 function New-VerticalDivider {
-    param([int]$X)
+    param([int]$X, [int]$Y = 12, [int]$Height = 28)
     $div = New-Object System.Windows.Forms.Panel
-    $div.Location = New-Object System.Drawing.Point($X, 12)
-    $div.Size = New-Object System.Drawing.Size(1, 28)
+    $div.Location = New-Object System.Drawing.Point($X, $Y)
+    $div.Size = New-Object System.Drawing.Size(1, $Height)
     $div.BackColor = $script:Theme.Border
     return $div
 }
 
 # ---------------------------------------------------------------------------
-# Toolbar layout. Everything sits on a shared grid: 16px outer margin, 12px
-# between neighbors in the same cluster, 16px around dividers, and every
-# control on a row is vertically centered on the same line (buttons are
-# 28px tall at y=12, so 20-22px controls sit at y=15/16). Row 2's buttons
-# line up with row 1's columns (Start All starts where the group dropdown
-# ends + 12; Stop All's right edge meets the scope divider).
+# Toolbar layout. Row 1: Refresh, then the Group picker (its own text
+# already reads "Group: X" — no separate "Group:" label alongside it).
+# Row 2, directly below: Start All / Stop All. To the right, at a fixed
+# column (not edge-anchored), the two toggles stack in the same two rows
+# (Use Groups next to row 1, Dev Servers Only next to row 2). The
+# dashboard status dot sits on its own, pinned to the far right edge.
 # ---------------------------------------------------------------------------
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = 'Refresh'
 $refreshButton.Location = New-Object System.Drawing.Point(16, 12)
 $refreshButton.Size = New-Object System.Drawing.Size(84, 28)
 
-$divider1 = New-VerticalDivider -X 112
+$startAllButton = New-Object System.Windows.Forms.Button
+$startAllButton.Text = 'Start All'
+$startAllButton.Location = New-Object System.Drawing.Point(16, 48)
+$startAllButton.Size = New-Object System.Drawing.Size(84, 28)
 
-$nodeOnlySwitch = New-ToggleSwitch -Checked $script:Settings.OnlyNode
-$nodeOnlySwitch.Location = New-Object System.Drawing.Point(128, 16)
+$stopAllButton = New-Object System.Windows.Forms.Button
+$stopAllButton.Text = 'Stop All'
+$stopAllButton.Location = New-Object System.Drawing.Point(112, 48)
+$stopAllButton.Size = New-Object System.Drawing.Size(84, 28)
 
-$nodeOnlyLabel = New-Object System.Windows.Forms.Label
-$nodeOnlyLabel.Text = 'Dev Servers Only'
-$nodeOnlyLabel.Location = New-Object System.Drawing.Point(174, 15)
-$nodeOnlyLabel.Size = New-Object System.Drawing.Size(152, 22)
-$nodeOnlyLabel.TextAlign = 'MiddleLeft'
-$nodeOnlyLabel.ForeColor = $script:Theme.TextPrimary
+$divider1 = New-VerticalDivider -X 278 -Y 8 -Height 72
 
-$useGroupsSwitch = New-ToggleSwitch -Checked $script:Settings.ShowGroups
-$useGroupsSwitch.Location = New-Object System.Drawing.Point(338, 16)
-
-$useGroupsLabel = New-Object System.Windows.Forms.Label
-$useGroupsLabel.Text = 'Use Groups'
-$useGroupsLabel.Location = New-Object System.Drawing.Point(384, 15)
-$useGroupsLabel.Size = New-Object System.Drawing.Size(76, 22)
-$useGroupsLabel.TextAlign = 'MiddleLeft'
-$useGroupsLabel.ForeColor = $script:Theme.TextPrimary
-
-$divider2 = New-VerticalDivider -X 474
-
-# Lives in row 1 (not row 2's Group/Start All/Stop All cluster) because row
-# 2 collapses entirely (topPanel.Height drops to 46) when "Use Groups" is
-# off — the dashboard indicator has to survive that regardless of the
-# groups setting, so row 1 is the only spot that's always on screen.
+# Always visible regardless of the "Use Groups" setting — Dev Servers Only
+# is an independent toggle, so both toggle rows (and the dashboard dot)
+# stay put even when the Group/Start All/Stop All cluster is hidden.
 $script:DashboardTip = New-Object System.Windows.Forms.ToolTip
 # Defaults are InitialDelay=500 / AutoPopDelay=5000 — the 5s pop delay is
 # what made it feel "stuck" lingering on screen after a hover. Trimmed to
@@ -995,20 +1029,33 @@ $script:DashboardTip.InitialDelay = 300
 $script:DashboardTip.ReshowDelay = 100
 $script:DashboardTip.AutoPopDelay = 2000
 $script:DashboardPill = New-DashboardPill
-$script:DashboardPill.Location = New-Object System.Drawing.Point(490, 12)
+$script:DashboardPill.Location = New-Object System.Drawing.Point(908, 16)
+$script:DashboardPill.Anchor = 'Top,Right'
 
-$scopeLabel = New-Object System.Windows.Forms.Label
-$scopeLabel.Text = ''
-$scopeLabel.Location = New-Object System.Drawing.Point(656, 15)
-$scopeLabel.Size = New-Object System.Drawing.Size(282, 22)
-$scopeLabel.TextAlign = 'MiddleLeft'
-$scopeLabel.ForeColor = $script:Theme.Accent
-$scopeLabel.AutoEllipsis = $true
-$scopeLabel.Anchor = 'Top,Right'
+$useGroupsSwitch = New-ToggleSwitch -Checked $script:Settings.ShowGroups
+$useGroupsSwitch.Location = New-Object System.Drawing.Point(310, 16)
+
+$useGroupsLabel = New-Object System.Windows.Forms.Label
+$useGroupsLabel.Text = 'Use Groups'
+$useGroupsLabel.Location = New-Object System.Drawing.Point(356, 15)
+$useGroupsLabel.Size = New-Object System.Drawing.Size(76, 22)
+$useGroupsLabel.TextAlign = 'MiddleLeft'
+$useGroupsLabel.ForeColor = $script:Theme.TextPrimary
+
+$nodeOnlySwitch = New-ToggleSwitch -Checked $script:Settings.OnlyNode
+$nodeOnlySwitch.Location = New-Object System.Drawing.Point(310, 52)
+
+$nodeOnlyLabel = New-Object System.Windows.Forms.Label
+$nodeOnlyLabel.Text = 'Dev Servers Only'
+$nodeOnlyLabel.Location = New-Object System.Drawing.Point(356, 51)
+$nodeOnlyLabel.Size = New-Object System.Drawing.Size(152, 22)
+$nodeOnlyLabel.TextAlign = 'MiddleLeft'
+$nodeOnlyLabel.ForeColor = $script:Theme.TextPrimary
 
 # Footer clock — just the time, not "Last refreshed: ... | N shown"; the
 # count moved to the tab headers (Live (N) / History (N)) already, so
-# repeating it here was redundant.
+# repeating it here was redundant. Scope sits on the same line, right-
+# aligned, since it no longer fits the (now button-only) toolbar row.
 $script:BottomBarDivider = New-Object System.Windows.Forms.Panel
 $script:BottomBarDivider.Dock = 'Top'
 $script:BottomBarDivider.Height = 1
@@ -1018,6 +1065,11 @@ $script:BottomBar = New-Object System.Windows.Forms.Panel
 $script:BottomBar.Dock = 'Bottom'
 $script:BottomBar.Height = 26
 $script:BottomBar.BackColor = $script:Theme.PanelBg
+# Same fix as topPanel above: set Width before adding Right-anchored
+# children, or their initial margin gets computed against the ~200px
+# un-docked default and they land off-screen once the bar reaches its
+# real width.
+$script:BottomBar.Width = $form.ClientSize.Width
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = ''
@@ -1025,21 +1077,24 @@ $statusLabel.Location = New-Object System.Drawing.Point(12, 4)
 $statusLabel.Size = New-Object System.Drawing.Size(90, 18)
 $statusLabel.ForeColor = $script:Theme.TextDim
 $statusLabel.TextAlign = 'MiddleLeft'
-$script:BottomBar.Controls.AddRange(@($statusLabel, $script:BottomBarDivider))
 
-$groupLabel = New-Object System.Windows.Forms.Label
-$groupLabel.Text = 'Group:'
-$groupLabel.Location = New-Object System.Drawing.Point(16, 53)
-$groupLabel.Size = New-Object System.Drawing.Size(46, 22)
-$groupLabel.TextAlign = 'MiddleLeft'
-$groupLabel.ForeColor = $script:Theme.TextPrimary
+$scopeLabel = New-Object System.Windows.Forms.Label
+$scopeLabel.Text = ''
+$scopeLabel.Location = New-Object System.Drawing.Point(628, 4)
+$scopeLabel.Size = New-Object System.Drawing.Size(304, 18)
+$scopeLabel.TextAlign = 'MiddleLeft'
+$scopeLabel.ForeColor = $script:Theme.Accent
+$scopeLabel.AutoEllipsis = $true
+$scopeLabel.Anchor = 'Top,Right'
+
+$script:BottomBar.Controls.AddRange(@($statusLabel, $scopeLabel, $script:BottomBarDivider))
 
 $groupsButton = New-Object System.Windows.Forms.Button
 $groupsButton.Text = 'Groups: none selected'
 $groupsButton.TextAlign = 'MiddleLeft'
 $groupsButton.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
-$groupsButton.Location = New-Object System.Drawing.Point(66, 50)
-$groupsButton.Size = New-Object System.Drawing.Size(200, 28)
+$groupsButton.Location = New-Object System.Drawing.Point(112, 12)
+$groupsButton.Size = New-Object System.Drawing.Size(150, 28)
 
 # Multi-select "dropdown": a plain Button that pops open a checked-list so
 # 2+ groups can be active in the table at once (a normal ComboBox only
@@ -1047,7 +1102,7 @@ $groupsButton.Size = New-Object System.Drawing.Size(200, 28)
 $groupsPopup = New-Object System.Windows.Forms.ToolStripDropDown
 $groupsPopup.AutoClose = $true
 $groupsPopup.Padding = New-Object System.Windows.Forms.Padding(2)
-$groupsPopup.BackColor = [System.Drawing.Color]::White
+Enable-RoundedPopup -Popup $groupsPopup -Radius 10
 
 $groupsCheckedList = New-Object System.Windows.Forms.CheckedListBox
 $groupsCheckedList.CheckOnClick = $true
@@ -1062,38 +1117,23 @@ $groupsListHost.Size = $groupsCheckedList.Size
 $groupsListHost.Margin = New-Object System.Windows.Forms.Padding(0)
 $groupsPopup.Items.Add($groupsListHost) | Out-Null
 
-$startAllButton = New-Object System.Windows.Forms.Button
-$startAllButton.Text = 'Start All'
-$startAllButton.Location = New-Object System.Drawing.Point(278, 50)
-$startAllButton.Size = New-Object System.Drawing.Size(84, 28)
-
-$stopAllButton = New-Object System.Windows.Forms.Button
-$stopAllButton.Text = 'Stop All'
-$stopAllButton.Location = New-Object System.Drawing.Point(374, 50)
-$stopAllButton.Size = New-Object System.Drawing.Size(84, 28)
-
 Initialize-ModernButton -Button $refreshButton
 Initialize-ModernButton -Button $groupsButton
 Initialize-ModernButton -Button $startAllButton -Variant Success
 Initialize-ModernButton -Button $stopAllButton -Variant Danger
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $divider1, $nodeOnlySwitch, $nodeOnlyLabel, $useGroupsSwitch, $useGroupsLabel, $divider2, $script:DashboardPill, $scopeLabel, $groupLabel, $groupsButton, $startAllButton, $stopAllButton, $topPanelDivider)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $startAllButton, $stopAllButton, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
 
 function Update-GroupsVisibility {
+    # Grayed out (not hidden) when off, so the toolbar layout never shifts
+    # and it's still obvious the controls exist, just inactive.
     $show = Get-ToggleChecked $useGroupsSwitch
-    $groupLabel.Visible = $show
-    $groupsButton.Visible = $show
-    $startAllButton.Visible = $show
-    $stopAllButton.Visible = $show
-    $topPanel.Height = if ($show) { 90 } else { 46 }
-    if ($tabControl) {
-        $gridTop = $menuStrip.Height + $topPanel.Height
-        $tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
-        $tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop - $script:BottomBar.Height))
-    }
+    $groupsButton.Enabled = $show
+    $startAllButton.Enabled = $show
+    $stopAllButton.Enabled = $show
 }
 
 function Update-GroupsButtonText {
@@ -1159,7 +1199,12 @@ function New-PortsGrid {
     $g.EditMode = 'EditOnKeystrokeOrF2'
     $g.BackgroundColor = $script:Theme.CardBg
     $g.BorderStyle = 'None'
-    $g.CellBorderStyle = 'SingleHorizontal'
+    # CellBorderStyle 'SingleHorizontal' still leaks vertical column-divider
+    # lines under the Windows 11 visual style enabled via EnableVisualStyles
+    # further up — a known DataGridView theming quirk. Disabling native cell
+    # borders entirely and hand-drawing just a bottom line per row (below)
+    # sidesteps it and guarantees no vertical lines regardless of OS theme.
+    $g.CellBorderStyle = 'None'
     $g.GridColor = $script:Theme.Border
     $g.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $g.EnableHeadersVisualStyles = $false
@@ -1223,6 +1268,21 @@ function New-PortsGrid {
     $g.AutoSizeColumnsMode = 'Fill'
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
     $g.Dock = 'Fill'
+
+    # Replaces the native CellBorderStyle border this column used to draw
+    # (removed above) — a single flat line under each real row, no verticals.
+    $g.Add_RowPostPaint({
+        param($s, $e)
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -eq 'separator') { return }
+        $borderColor = $script:Theme.Border
+        if ($null -eq $borderColor) { return }
+        $y = $e.RowBounds.Bottom - 1
+        $pen = New-Object System.Drawing.Pen($borderColor, 1)
+        $e.Graphics.DrawLine($pen, $e.RowBounds.Left, $y, $e.RowBounds.Right, $y)
+        $pen.Dispose()
+    })
+
     return $g
 }
 
@@ -1842,6 +1902,7 @@ function Register-GridEvents {
         $detailItem = New-Object System.Windows.Forms.ToolStripMenuItem('Detail...')
         $detailItem.Add_Click({ Show-RowDetail -Data $data -ScreenPoint $screenPoint }.GetNewClosure())
         [void]$menu.Items.Add($detailItem)
+        Enable-RoundedPopup -Popup $menu -Radius 8
         $menu.Show($s, $clientPoint)
     })
 
@@ -1893,7 +1954,7 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.6.0'
+    $versionLabel.Text = 'Version 1.6.1'
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
@@ -2109,7 +2170,8 @@ function Show-DashboardDialog {
 }
 
 function Get-KnownProjects {
-    $allRows = @(Build-Rows -OnlyNode $true -RootDir '')
+    param([bool]$OnlyNode = $true)
+    $allRows = @(Build-Rows -OnlyNode $OnlyNode -RootDir '')
     $seen = @{}
     $projects = @()
     foreach ($r in $allRows) {
@@ -2155,26 +2217,41 @@ function Show-ManageGroupsDialog {
     $projLabel.Size = New-Object System.Drawing.Size(200, 20)
     $projLabel.ForeColor = $script:Theme.TextPrimary
 
+    $showAllCheck = New-Object System.Windows.Forms.CheckBox
+    $showAllCheck.Text = 'Show all listening ports (not just Node/dev servers)'
+    $showAllCheck.Location = New-Object System.Drawing.Point(15, 92)
+    $showAllCheck.Size = New-Object System.Drawing.Size(415, 20)
+    $showAllCheck.ForeColor = $script:Theme.TextPrimary
+
     $projList = New-Object System.Windows.Forms.CheckedListBox
-    $projList.Location = New-Object System.Drawing.Point(15, 92)
-    $projList.Size = New-Object System.Drawing.Size(415, 260)
+    $projList.Location = New-Object System.Drawing.Point(15, 116)
+    $projList.Size = New-Object System.Drawing.Size(415, 236)
     $projList.CheckOnClick = $true
     $projList.BorderStyle = 'FixedSingle'
 
-    $knownProjects = @(Get-KnownProjects)
-    foreach ($p in $knownProjects) { $projList.Items.Add($p.Label) | Out-Null }
+    # Boxed in a hashtable so event handlers (each running in their own
+    # PowerShell scope) can update it in place without needing $script: scope.
+    $state = @{ KnownProjects = @(Get-KnownProjects -OnlyNode $true) }
+    foreach ($p in $state.KnownProjects) { $projList.Items.Add($p.Label) | Out-Null }
 
     function Set-CheckedFromGroup {
         param([string]$GroupName)
         for ($i = 0; $i -lt $projList.Items.Count; $i++) { $projList.SetItemChecked($i, $false) }
         if (-not $GroupName -or -not $script:Groups.ContainsKey($GroupName)) { return }
         $paths = @($script:Groups[$GroupName] | ForEach-Object { Get-NormalizedPath $_ })
-        for ($i = 0; $i -lt $knownProjects.Count; $i++) {
-            if ($paths -contains (Get-NormalizedPath $knownProjects[$i].ProjectPath)) { $projList.SetItemChecked($i, $true) }
+        for ($i = 0; $i -lt $state.KnownProjects.Count; $i++) {
+            if ($paths -contains (Get-NormalizedPath $state.KnownProjects[$i].ProjectPath)) { $projList.SetItemChecked($i, $true) }
         }
     }
 
     $nameCombo.Add_SelectedIndexChanged({ Set-CheckedFromGroup -GroupName $nameCombo.Text })
+
+    $showAllCheck.Add_CheckedChanged({
+        $state.KnownProjects = @(Get-KnownProjects -OnlyNode (-not $showAllCheck.Checked))
+        $projList.Items.Clear()
+        foreach ($p in $state.KnownProjects) { $projList.Items.Add($p.Label) | Out-Null }
+        Set-CheckedFromGroup -GroupName $nameCombo.Text
+    })
 
     $saveButton = New-Object System.Windows.Forms.Button
     $saveButton.Text = 'Save Group'
@@ -2188,8 +2265,8 @@ function Show-ManageGroupsDialog {
             return
         }
         $paths = @()
-        for ($i = 0; $i -lt $knownProjects.Count; $i++) {
-            if ($projList.GetItemChecked($i)) { $paths += $knownProjects[$i].ProjectPath }
+        for ($i = 0; $i -lt $state.KnownProjects.Count; $i++) {
+            if ($projList.GetItemChecked($i)) { $paths += $state.KnownProjects[$i].ProjectPath }
         }
         $script:Groups[$name] = $paths
         Save-Groups $script:Groups
@@ -2230,7 +2307,7 @@ function Show-ManageGroupsDialog {
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $projList, $saveButton, $deleteButton, $closeButton)
+    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $showAllCheck, $projList, $saveButton, $deleteButton, $closeButton)
     $dlg.Controls.AddRange($dlgControls)
     $dlg.ShowDialog($form) | Out-Null
 }
@@ -2246,7 +2323,7 @@ function Start-GroupAll {
     $label = $Names -join ', '
     $paths = New-Object System.Collections.Generic.HashSet[string]
     foreach ($n in $Names) { foreach ($p in $script:Groups[$n]) { [void]$paths.Add((Get-NormalizedPath $p)) } }
-    $allRows = @(Build-Rows -OnlyNode $true -RootDir '')
+    $allRows = @(Build-Rows -OnlyNode $false -RootDir '')
     $toStart = @($allRows | Where-Object { $_.Status -eq 'OFF' -and $_.ProjectPath -and $paths.Contains((Get-NormalizedPath $_.ProjectPath)) })
 
     if ($toStart.Count -eq 0) {
@@ -2273,7 +2350,7 @@ function Stop-GroupAll {
     $label = $Names -join ', '
     $paths = New-Object System.Collections.Generic.HashSet[string]
     foreach ($n in $Names) { foreach ($p in $script:Groups[$n]) { [void]$paths.Add((Get-NormalizedPath $p)) } }
-    $allRows = @(Build-Rows -OnlyNode $true -RootDir '')
+    $allRows = @(Build-Rows -OnlyNode $false -RootDir '')
     $toStop = @($allRows | Where-Object { $_.Status -eq 'ON' -and $_.ProjectPath -and $paths.Contains((Get-NormalizedPath $_.ProjectPath)) })
 
     if ($toStop.Count -eq 0) {
@@ -2299,6 +2376,7 @@ $stopAllButton.Add_Click({ Stop-GroupAll -Names $script:SelectedGroups })
 # System tray
 # ---------------------------------------------------------------------------
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+Enable-RoundedPopup -Popup $trayMenu -Radius 8
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = $script:IconOk
