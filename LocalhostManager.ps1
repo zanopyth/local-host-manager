@@ -67,6 +67,8 @@ function Load-History {
             $h[$prop.Name] = @{
                 ProjectPath = $prop.Value.ProjectPath
                 ProcessName = $prop.Value.ProcessName
+                Pinned      = if ($prop.Value.PSObject.Properties.Name -contains 'Pinned') { [bool]$prop.Value.Pinned } else { $false }
+                CommandLine = if ($prop.Value.PSObject.Properties.Name -contains 'CommandLine') { [string]$prop.Value.CommandLine } else { $null }
             }
         }
         return $h
@@ -84,7 +86,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -92,6 +94,7 @@ function Load-Settings {
         $selectedGroups = if ($raw.PSObject.Properties.Name -contains 'SelectedGroups') { @($raw.SelectedGroups) } else { @() }
         $webPort = if ($raw.PSObject.Properties.Name -contains 'WebPort' -and [int]$raw.WebPort -gt 0) { [int]$raw.WebPort } else { 3199 }
         $dashboardEnabled = if ($raw.PSObject.Properties.Name -contains 'DashboardEnabled') { [bool]$raw.DashboardEnabled } else { $false }
+        $showSystemPorts = if ($raw.PSObject.Properties.Name -contains 'ShowSystemPorts') { [bool]$raw.ShowSystemPorts } else { $false }
         return @{
             OnlyNode         = [bool]$raw.OnlyNode
             RootDir          = [string]$raw.RootDir
@@ -99,6 +102,7 @@ function Load-Settings {
             SelectedGroups   = $selectedGroups
             WebPort          = $webPort
             DashboardEnabled = $dashboardEnabled
+            ShowSystemPorts  = $showSystemPorts
         }
     } catch { return $defaults }
 }
@@ -210,6 +214,11 @@ function Test-PathUnderRoot {
     return ($p -eq $r) -or $p.StartsWith("$r\")
 }
 
+# Also doubles as the "system-owned" classification for the System tab
+# (see IsSystem below) - these names never show as manageable dev-server
+# rows on Live/History, but a port bound by one of them (e.g. the kernel
+# http.sys listener behind .NET's HttpListener, which reports as PID 4
+# "System") can still be surfaced read-only there.
 $script:ExcludedProcessNames = @(
     'svchost','System','Idle','Registry','lsass','services','wininit','csrss',
     'smss','spoolsv','dllhost','MsMpEng','SearchIndexer','dashost','fontdrvhost',
@@ -289,6 +298,43 @@ $script:BackgroundPollScript = {
         }
     }
 
+    function Get-ProcessCommandLine {
+        # Same PEB walk as Get-ProcessWorkingDirectory above (same process
+        # handle, same RTL_USER_PROCESS_PARAMETERS struct) but reads the
+        # CommandLine UNICODE_STRING at offset 0x70 instead of
+        # CurrentDirectory's DosPath at 0x38 - the exact argv the process is
+        # actually running with (e.g. "python -m http.server 8792"), which
+        # Start/Restart can replay later for anything that isn't an npm
+        # project and so has no "npm run <script>" to fall back to.
+        param([int]$ProcId)
+        try {
+            $p = [System.Diagnostics.Process]::GetProcessById($ProcId)
+            $hProcess = $p.Handle
+
+            $pbi = New-Object LocalhostManager.ProcCwd+PROCESS_BASIC_INFORMATION
+            $size = 0
+            $status = [LocalhostManager.ProcCwd]::NtQueryInformationProcess($hProcess, 0, [ref]$pbi, [System.Runtime.InteropServices.Marshal]::SizeOf($pbi), [ref]$size)
+            if ($status -ne 0) { return $null }
+
+            $ptrBuf = New-Object byte[] 8
+            $read = 0
+            [void][LocalhostManager.ProcCwd]::ReadProcessMemory($hProcess, [IntPtr]::Add($pbi.PebBaseAddress, 0x20), $ptrBuf, 8, [ref]$read)
+            $processParams = [IntPtr][BitConverter]::ToInt64($ptrBuf, 0)
+
+            $usBuf = New-Object byte[] 16
+            [void][LocalhostManager.ProcCwd]::ReadProcessMemory($hProcess, [IntPtr]::Add($processParams, 0x70), $usBuf, 16, [ref]$read)
+            $length = [BitConverter]::ToUInt16($usBuf, 0)
+            $bufferPtr = [IntPtr][BitConverter]::ToInt64($usBuf, 8)
+            if ($length -le 0 -or $length -gt 65536) { return $null }
+
+            $strBuf = New-Object byte[] $length
+            [void][LocalhostManager.ProcCwd]::ReadProcessMemory($hProcess, $bufferPtr, $strBuf, $length, [ref]$read)
+            return [System.Text.Encoding]::Unicode.GetString($strBuf, 0, $read).Trim()
+        } catch {
+            return $null
+        }
+    }
+
     while (-not $Cache.StopRequested) {
         try {
             $conns = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
@@ -312,11 +358,20 @@ $script:BackgroundPollScript = {
                 $procName = $null
                 try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch {}
                 if (-not $procName) { continue }
-                if ($ExcludedNames -contains $procName) { continue }
 
-                $cwd = Get-ProcessWorkingDirectory -ProcId $procId
+                # System-owned processes (System/svchost/lsass/...) never get a
+                # cwd/package.json probe - it's wasted work (they have no
+                # meaningful project cwd) and, for protected processes, a
+                # ReadProcessMemory attempt that can only fail anyway.
+                $isSystem = $ExcludedNames -contains $procName
+                $cwd = $null
                 $isNode = $false
-                if ($cwd) { $isNode = Test-Path (Join-Path $cwd 'package.json') -ErrorAction SilentlyContinue }
+                $commandLine = $null
+                if (-not $isSystem) {
+                    $cwd = Get-ProcessWorkingDirectory -ProcId $procId
+                    if ($cwd) { $isNode = Test-Path (Join-Path $cwd 'package.json') -ErrorAction SilentlyContinue }
+                    $commandLine = Get-ProcessCommandLine -ProcId $procId
+                }
 
                 $result[$key] = @{
                     Port        = $key
@@ -325,6 +380,8 @@ $script:BackgroundPollScript = {
                     LocalAddr   = $c.LocalAddress
                     ProjectPath = $cwd
                     IsNode      = [bool]$isNode
+                    IsSystem    = $isSystem
+                    CommandLine = $commandLine
                 }
             }
 
@@ -410,10 +467,17 @@ function Build-Rows {
     $history = Load-History
     $lanIps = @(Get-LanIPv4Addresses)
 
+    # A pinned port is remembered here regardless of IsNode - that's the
+    # whole point of pinning: keep tracking something (even a non-npm
+    # process) through a shutdown so History can offer it back later. A
+    # plain (unpinned) entry is still only tracked while it's a recognized
+    # Node project, same as before.
     foreach ($key in $live.Keys) {
         $e = $live[$key]
-        if ($e.IsNode) {
-            $history[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName }
+        if ($e.IsSystem) { continue }
+        $pinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
+        if ($e.IsNode -or $pinned) {
+            $history[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName; Pinned = $pinned; CommandLine = $e.CommandLine }
         }
     }
     Save-History $history
@@ -423,7 +487,11 @@ function Build-Rows {
 
     foreach ($key in ($live.Keys | Sort-Object { [int]$_ })) {
         $e = $live[$key]
-        if ($OnlyNode -and -not $e.IsNode) { continue }
+        if ($e.IsSystem) { continue }
+        $pinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
+        # Pinning bypasses Dev-Servers-Only too - same "stays visible
+        # regardless of the filter" idea Use Groups already gets.
+        if ($OnlyNode -and -not $e.IsNode -and -not $pinned) { continue }
         if (-not (Test-PathUnderRoot -Path $e.ProjectPath -Root $RootDir)) { continue }
         $seen[$key] = $true
 
@@ -461,6 +529,8 @@ function Build-Rows {
             ProjectPath = $e.ProjectPath
             Action      = 'Stop'
             HasLog      = [bool]$managed
+            Pinned      = $pinned
+            CommandLine = $e.CommandLine
         }
     }
 
@@ -488,6 +558,61 @@ function Build-Rows {
             ProjectPath = $h.ProjectPath
             Action      = 'Start'
             HasLog      = [bool]$managed
+            Pinned      = [bool]$h.Pinned
+            CommandLine = $h.CommandLine
+        }
+    }
+
+    return $rows | Sort-Object { [int]$_.Port }
+}
+
+function Build-SystemRows {
+    # Read-only counterpart to Build-Rows for the System tab: ports owned by
+    # OS-level processes (System/svchost/lsass/...), most commonly a kernel
+    # http.sys listener behind .NET's HttpListener (shows as PID 4 "System")
+    # rather than the app that actually registered it. No OnlyNode/RootDir
+    # scoping - these have no project path to scope by - and never feed
+    # history.json (that only ever tracks IsNode entries, see Build-Rows).
+    $live = Get-LiveListeners
+    $lanIps = @(Get-LanIPv4Addresses)
+    $rows = @()
+
+    foreach ($key in ($live.Keys | Sort-Object { [int]$_ })) {
+        $e = $live[$key]
+        if (-not $e.IsSystem) { continue }
+
+        $lanUrls = ''
+        $lanEntries = @()
+        if ($e.LocalAddr -eq '0.0.0.0' -or $e.LocalAddr -eq '::') {
+            $lanEntries = @($lanIps | ForEach-Object {
+                $info = Get-NetworkInterfaceLabel -InterfaceAlias $_.InterfaceAlias
+                [PSCustomObject]@{
+                    Label     = $info.Label
+                    Url       = "http://$($_.IPAddress):$key"
+                    IsVirtual = $info.IsVirtual
+                    SortRank  = $info.SortRank
+                }
+            } | Sort-Object SortRank, Label)
+            $lanUrls = ($lanEntries | ForEach-Object { $_.Url }) -join ', '
+        } else {
+            $lanUrls = '(localhost only)'
+        }
+
+        $nameKey = Get-CustomNameKey -ProjectPath '' -Port $key
+        $customName = if ($script:CustomNames.ContainsKey($nameKey)) { $script:CustomNames[$nameKey] } else { '' }
+
+        $rows += [PSCustomObject]@{
+            Status      = 'ON'
+            Port        = $key
+            CustomName  = $customName
+            ProcessName = $e.ProcessName
+            ProcId      = $e.ProcId
+            LocalUrl    = "http://localhost:$key"
+            LanUrls     = $lanUrls
+            LanEntries  = $lanEntries
+            ProjectPath = ''
+            Action      = ''
+            HasLog      = $false
         }
     }
 
@@ -1127,6 +1252,16 @@ $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
 
+function Update-SystemTabState {
+    # Grayed out (not hidden) when off, same idiom as Update-GroupsVisibility
+    # below - the tab stays visible/discoverable, its content just goes
+    # inert and swaps in an explanatory placeholder instead of an empty grid.
+    $show = [bool]$script:Settings.ShowSystemPorts
+    $tabPageSystem.Enabled = $show
+    $systemGrid.Visible = $show
+    $systemPlaceholderLabel.Visible = -not $show
+}
+
 function Update-GroupsVisibility {
     # Grayed out (not hidden) when off, so the toolbar layout never shifts
     # and it's still obvious the controls exist, just inactive.
@@ -1183,7 +1318,7 @@ Update-ScopeLabel
 # Column layout is identical for the Live and History grids (same order,
 # same indices), so event handlers can address cells by a single shared
 # index map instead of per-grid column objects.
-$script:ColIdx = @{ Status = 0; Port = 1; CustomName = 2; Process = 3; PID = 4; LocalUrl = 5; LanUrls = 6; ProjectPath = 7; Log = 8; Action = 9 }
+$script:ColIdx = @{ Status = 0; Port = 1; Pin = 2; CustomName = 3; Process = 4; PID = 5; LocalUrl = 6; LanUrls = 7; ProjectPath = 8; Log = 9; Action = 10 }
 $dgvDoubleBufferProp = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
 
 function New-PortsGrid {
@@ -1230,6 +1365,19 @@ function New-PortsGrid {
     $colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
 
+    # Icon-only toggle button - always the same glyph, colored per row (see
+    # Add-DataRow) rather than swapped between a "pin"/"unpin" glyph pair,
+    # so clicking it can't cause a visible layout jump.
+    $colPin = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    $colPin.Name = 'Pin'; $colPin.HeaderText = ''; $colPin.FillWeight = 34; $colPin.MinimumWidth = 32
+    $colPin.Text = [string][char]0xE718
+    $colPin.UseColumnTextForButtonValue = $true
+    $colPin.ReadOnly = $true
+    $colPin.FlatStyle = 'Flat'
+    $colPin.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 9.5)
+    $colPin.DefaultCellStyle.Alignment = 'MiddleCenter'
+    $colPin.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
+
     $colCustomName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colCustomName.Name = 'CustomName'; $colCustomName.HeaderText = 'Custom Name'; $colCustomName.FillWeight = 105; $colCustomName.MinimumWidth = 104; $colCustomName.ReadOnly = $false
 
@@ -1263,7 +1411,7 @@ function New-PortsGrid {
     $colAction.ReadOnly = $true
     $colAction.FlatStyle = 'Flat'
 
-    [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
+    [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colPin, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
     $g.Columns.AddRange($gridColumns)
     $g.AutoSizeColumnsMode = 'Fill'
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
@@ -1288,6 +1436,14 @@ function New-PortsGrid {
 
 $liveGrid = New-PortsGrid
 $historyGrid = New-PortsGrid
+$systemGrid = New-PortsGrid
+# System rows are never Start/Stop/Restart-able (several are protected OS
+# processes - PID 4 "System", lsass, csrss - where a kill attempt would be
+# actively dangerous), so those columns don't apply here at all. Pinning is
+# meaningless too - there's no project to bring back after a shutdown.
+$systemGrid.Columns['Log'].Visible = $false
+$systemGrid.Columns['Action'].Visible = $false
+$systemGrid.Columns['Pin'].Visible = $false
 
 $tabControl = New-Object System.Windows.Forms.TabControl
 $tabControl.Anchor = 'Top,Bottom,Left,Right'
@@ -1304,7 +1460,21 @@ $tabPageHistory.Text = 'History'
 $tabPageHistory.BackColor = $script:Theme.CardBg
 $tabPageHistory.Controls.Add($historyGrid)
 
-[System.Windows.Forms.TabPage[]]$tabPages = @($tabPageLive, $tabPageHistory)
+$systemPlaceholderLabel = New-Object System.Windows.Forms.Label
+$systemPlaceholderLabel.Text = "System-owned ports are hidden.`r`nEnable `"Show system-owned ports`" in Settings > Preferences to view them here."
+$systemPlaceholderLabel.Dock = 'Fill'
+$systemPlaceholderLabel.TextAlign = 'MiddleCenter'
+$systemPlaceholderLabel.ForeColor = $script:Theme.TextDim
+$systemPlaceholderLabel.BackColor = $script:Theme.CardBg
+$systemPlaceholderLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+
+$tabPageSystem = New-Object System.Windows.Forms.TabPage
+$tabPageSystem.Text = 'System'
+$tabPageSystem.BackColor = $script:Theme.CardBg
+$tabPageSystem.Controls.Add($systemGrid)
+$tabPageSystem.Controls.Add($systemPlaceholderLabel)
+
+[System.Windows.Forms.TabPage[]]$tabPages = @($tabPageLive, $tabPageHistory, $tabPageSystem)
 $tabControl.TabPages.AddRange($tabPages)
 
 $gridTop = $menuStrip.Height + $topPanel.Height
@@ -1319,10 +1489,11 @@ $form.Controls.Add($script:BottomBar)
 $form.Controls.Add($topPanel)
 $form.Controls.Add($menuStrip)
 Update-GroupsVisibility
+Update-SystemTabState
 
 function Add-DataRow {
     param($Grid, $r)
-    $idx = $Grid.Rows.Add($r.Status, $r.Port, $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
+    $idx = $Grid.Rows.Add($r.Status, $r.Port, '', $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
     $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
@@ -1332,6 +1503,20 @@ function Add-DataRow {
             $row.Cells['Status'].Style.Font = New-Object System.Drawing.Font($Grid.Font, [System.Drawing.FontStyle]::Bold)
         }
         default   { $row.Cells['Status'].Style.ForeColor = $script:Theme.TextDim }
+    }
+    if ($Grid.Columns['Pin'].Visible) {
+        $pinCell = $row.Cells['Pin']
+        if ($r.Pinned) {
+            $pinCell.Style.ForeColor = $script:Theme.Accent
+            $pinCell.Style.SelectionForeColor = $script:Theme.Accent
+            $pinCell.Style.SelectionBackColor = $script:Theme.AccentTint
+            $pinCell.ToolTipText = 'Pinned - stays listed and restartable after it stops. Click to unpin.'
+        } else {
+            $pinCell.Style.ForeColor = $script:Theme.Border
+            $pinCell.Style.SelectionForeColor = $script:Theme.Border
+            $pinCell.Style.SelectionBackColor = $script:Theme.PanelBg
+            $pinCell.ToolTipText = 'Pin - keep this port listed (and restartable) even after it stops.'
+        }
     }
     $actionCell = $row.Cells['Action']
     if ($r.Action -eq 'Stop') {
@@ -1347,14 +1532,14 @@ function Add-DataRow {
 
 function Add-SeparatorRow {
     param($Grid)
-    $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '')
+    $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '', '')
     $row = $Grid.Rows[$idx]
     $row.Tag = 'separator'
     $row.Height = 10
     $row.ReadOnly = $true
     $row.DefaultCellStyle.BackColor = $script:Theme.PanelBg
     $row.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
-    foreach ($colName in @('Log', 'Action')) {
+    foreach ($colName in @('Pin', 'Log', 'Action')) {
         $row.Cells[$colName] = New-Object System.Windows.Forms.DataGridViewTextBoxCell
     }
 }
@@ -1378,19 +1563,23 @@ function Get-DisplayRowsSplit {
     # everything else (OFF/CRASHED) — ports LocalhostManager remembers but
     # nothing is bound to at the moment. See LocalUrl detection in
     # Build-Rows: ON rows come from the real TCP listener scan, OFF/CRASHED
-    # rows come from history.json.
+    # rows come from history.json. System tab = OS-owned listeners, built
+    # only when the Preferences toggle is on (Build-SystemRows scans the
+    # live cache regardless, so this is purely a display-time gate).
     $display = @(Get-DisplayRows)
     Publish-DashboardRows -Display $display
+    $systemRows = if ([bool]$script:Settings.ShowSystemPorts) { @(Build-SystemRows) } else { @() }
     return @{
         Live    = @($display | Where-Object { $_.Row.Status -eq 'ON' })
         History = @($display | Where-Object { $_.Row.Status -ne 'ON' })
+        System  = @($systemRows | ForEach-Object { [PSCustomObject]@{ Row = $_; Group = $null } })
     }
 }
 
 function Get-DisplayRowsSignature {
     param($Display)
     return ($Display | ForEach-Object {
-        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)"
+        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)|$([bool]$_.Row.Pinned)"
     }) -join "`n"
 }
 
@@ -1412,9 +1601,10 @@ function Render-Grid {
 }
 
 function Update-TabHeaders {
-    param([int]$LiveCount, [int]$HistoryCount)
+    param([int]$LiveCount, [int]$HistoryCount, [int]$SystemCount)
     $tabPageLive.Text = "Live ($LiveCount)"
     $tabPageHistory.Text = "History ($HistoryCount)"
+    $tabPageSystem.Text = if ([bool]$script:Settings.ShowSystemPorts) { "System ($SystemCount)" } else { 'System' }
 }
 
 $script:FlashTimer = New-Object System.Windows.Forms.Timer
@@ -1434,13 +1624,15 @@ function Refresh-Grid {
     # Full, forced rebuild — used for direct user actions (Refresh button,
     # toggles, settings/group changes, start/stop) where the grid content
     # is expected to change right away.
-    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode) { return }
+    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode -or $systemGrid.IsCurrentCellInEditMode) { return }
     $split = Get-DisplayRowsSplit
     Render-Grid -Grid $liveGrid -Display $split.Live
     Render-Grid -Grid $historyGrid -Display $split.History
+    Render-Grid -Grid $systemGrid -Display $split.System
     $script:LastLiveSignature = Get-DisplayRowsSignature $split.Live
     $script:LastHistorySignature = Get-DisplayRowsSignature $split.History
-    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
+    $script:LastSystemSignature = Get-DisplayRowsSignature $split.System
+    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count -SystemCount $split.System.Count
     $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
@@ -1451,13 +1643,14 @@ function Invoke-PeriodicRefresh {
     # actually changed — otherwise the table would visibly flicker/reset
     # selection every few seconds for no reason. The corner status label
     # flashes red on every tick regardless, so it's still obvious the app
-    # is alive and polling. Live and History are tracked/repainted
+    # is alive and polling. Live, History and System are tracked/repainted
     # independently so activity in one tab doesn't reset scroll/selection
-    # in the other.
-    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode) { Flash-StatusLabel; return }
+    # in the others.
+    if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode -or $systemGrid.IsCurrentCellInEditMode) { Flash-StatusLabel; return }
     $split = Get-DisplayRowsSplit
     $liveSig = Get-DisplayRowsSignature $split.Live
     $historySig = Get-DisplayRowsSignature $split.History
+    $systemSig = Get-DisplayRowsSignature $split.System
     if ($liveSig -ne $script:LastLiveSignature) {
         Render-Grid -Grid $liveGrid -Display $split.Live
         $script:LastLiveSignature = $liveSig
@@ -1466,7 +1659,11 @@ function Invoke-PeriodicRefresh {
         Render-Grid -Grid $historyGrid -Display $split.History
         $script:LastHistorySignature = $historySig
     }
-    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count
+    if ($systemSig -ne $script:LastSystemSignature) {
+        Render-Grid -Grid $systemGrid -Display $split.System
+        $script:LastSystemSignature = $systemSig
+    }
+    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count -SystemCount $split.System.Count
     $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
@@ -1491,14 +1688,32 @@ function Get-NpmRunScript {
 }
 
 function Start-ProjectAtPath {
-    param([string]$ProjectPath)
+    # Node projects always go through npm run <script> - unchanged, and
+    # still the most predictable option when a package.json is present.
+    # Anything else (a plain "python -m http.server", a .bat-launched
+    # static server, ...) has no npm script to guess, so it falls back to
+    # $CommandLine - the literal argv LocalhostManager captured from the
+    # process while it was actually running (see Get-ProcessCommandLine in
+    # the background poller), persisted onto its history.json entry.
+    param([string]$ProjectPath, [string]$CommandLine)
     try {
         $key = Get-NormalizedPath $ProjectPath
-        $npmScript = Get-NpmRunScript -ProjectPath $ProjectPath
+        $hasPackageJson = Test-Path (Join-Path $ProjectPath 'package.json')
+        # No package.json AND nothing captured yet - there is genuinely no
+        # known way to start this. Bail out instead of falling back to
+        # "npm run start", which would just fail with ENOENT (no
+        # package.json to run against) and look like a crash rather than
+        # the "we don't know how to start this yet" it actually is.
+        if (-not $hasPackageJson -and -not $CommandLine) { return $false }
+        $runCommand = if ($hasPackageJson) {
+            "npm run $(Get-NpmRunScript -ProjectPath $ProjectPath)"
+        } else {
+            $CommandLine
+        }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'cmd.exe'
-        $psi.Arguments = "/c cd /d `"$ProjectPath`" && npm run $npmScript"
+        $psi.Arguments = "/c cd /d `"$ProjectPath`" && $runCommand"
         $psi.WorkingDirectory = $ProjectPath
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
@@ -1592,6 +1807,43 @@ function Stop-ProjectById {
     }
 }
 
+function Invoke-TogglePin {
+    # Pinning writes straight to history.json (keyed by port, same as the
+    # rest of history) rather than touching $script:ManagedProcesses or any
+    # in-memory row state - Build-Rows re-derives Pinned from that file on
+    # every refresh, so this is the single source of truth for it.
+    param($data)
+    $key = [string]$data.Port
+    $history = Load-History
+    $isPinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
+
+    if ($isPinned) {
+        $history[$key].Pinned = $false
+    } else {
+        $history[$key] = @{
+            ProjectPath = $data.ProjectPath
+            ProcessName = $data.ProcessName
+            Pinned      = $true
+            CommandLine = $data.CommandLine
+        }
+    }
+    Save-History $history
+    Refresh-Grid
+}
+
+function Test-ProjectStartable {
+    # Mirrors the check Start-ProjectAtPath makes internally, so the UI can
+    # give a specific, accurate reason up front instead of "Could not start
+    # project" after already trying and failing - most commonly a
+    # first-ever Start on something pinned/recorded before command-line
+    # capture existed, or before it was ever seen running long enough to be
+    # captured at all.
+    param([string]$ProjectPath, [string]$CommandLine)
+    if (-not $ProjectPath) { return $false }
+    if (Test-Path (Join-Path $ProjectPath 'package.json')) { return $true }
+    return [bool]$CommandLine
+}
+
 function Invoke-ToggleAction {
     param($data)
 
@@ -1608,7 +1860,11 @@ function Invoke-ToggleAction {
             [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Start', 'OK', 'Warning') | Out-Null
             return
         }
-        if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath)) {
+        if (-not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
+            [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
+            return
+        }
+        if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
             [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
         }
     }
@@ -1621,6 +1877,10 @@ function Invoke-Restart {
 
     if (-not $data.ProjectPath) {
         [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Restart', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if ($data.Status -ne 'ON' -and -not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
+        [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
         return
     }
 
@@ -1636,7 +1896,7 @@ function Invoke-Restart {
         Start-Sleep -Milliseconds 800
     }
 
-    if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath)) {
+    if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
         [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
     }
     Start-Sleep -Milliseconds 800
@@ -1745,6 +2005,7 @@ function Show-RowDetail {
     $fields = @(
         @{ Label = 'Status';      Value = [string]$Data.Status;      IsVirtual = $false }
         @{ Label = 'Port';        Value = [string]$Data.Port;        IsVirtual = $false }
+        @{ Label = 'Pinned';      Value = if ($Data.Pinned) { 'Yes' } else { 'No' }; IsVirtual = $false }
         @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
         @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
         @{ Label = 'PID';         Value = [string]$Data.ProcId;      IsVirtual = $false }
@@ -1764,6 +2025,9 @@ function Show-RowDetail {
     }
 
     $fields += @{ Label = 'Project Path'; Value = [string]$Data.ProjectPath; IsVirtual = $false }
+    if ($Data.CommandLine) {
+        $fields += @{ Label = 'Command'; Value = [string]$Data.CommandLine; IsVirtual = $false }
+    }
 
     $rowHeight = 28
     $topMargin = 8
@@ -1865,6 +2129,8 @@ function Register-GridEvents {
             Invoke-ToggleAction $data
         } elseif ($e.ColumnIndex -eq $script:ColIdx.Log) {
             Invoke-Restart $data
+        } elseif ($e.ColumnIndex -eq $script:ColIdx.Pin) {
+            Invoke-TogglePin $data
         }
     })
 
@@ -1873,7 +2139,7 @@ function Register-GridEvents {
         if ($e.RowIndex -lt 0) { return }
         $row = $s.Rows[$e.RowIndex]
         if ($row.Tag -eq 'separator') { return }
-        if ($e.ColumnIndex -eq $script:ColIdx.Action -or $e.ColumnIndex -eq $script:ColIdx.Log) { return }
+        if ($e.ColumnIndex -eq $script:ColIdx.Action -or $e.ColumnIndex -eq $script:ColIdx.Log -or $e.ColumnIndex -eq $script:ColIdx.Pin) { return }
         $data = $row.Tag
         if (-not $data) { return }
         $label = if ($data.CustomName) { $data.CustomName } elseif ($data.ProjectPath) { Split-Path -Leaf $data.ProjectPath } else { "Port $($data.Port)" }
@@ -1890,20 +2156,63 @@ function Register-GridEvents {
         if (-not $data) { return }
         $s.ClearSelection()
         $row.Selected = $true
-        # e.X/e.Y on a DataGridView CellMouseDown are cell-relative, not
-        # grid-relative - using them directly put the menu near the grid's
-        # origin regardless of actual click position. Cursor.Position is the
-        # true screen position, which we then convert back to grid-client
-        # space just for Show(), which expects control-relative coords.
+        # Used to be a right-click context menu with a single "Detail..."
+        # item - a one-entry dropdown always looks broken (empty icon
+        # gutter, menu wider than the text needs) and it was just an extra
+        # click to the only thing it could ever do. Right-click opens the
+        # detail popup directly now, positioned at the actual cursor
+        # (Cursor.Position, not e.X/e.Y, which are cell-relative not
+        # screen-relative).
         $screenPoint = [System.Windows.Forms.Cursor]::Position
-        $clientPoint = $s.PointToClient($screenPoint)
+        Show-RowDetail -Data $data -ScreenPoint $screenPoint
+    })
 
-        $menu = New-Object System.Windows.Forms.ContextMenuStrip
-        $detailItem = New-Object System.Windows.Forms.ToolStripMenuItem('Detail...')
-        $detailItem.Add_Click({ Show-RowDetail -Data $data -ScreenPoint $screenPoint }.GetNewClosure())
-        [void]$menu.Items.Add($detailItem)
-        Enable-RoundedPopup -Popup $menu -Radius 8
-        $menu.Show($s, $clientPoint)
+    $Grid.Add_CellEndEdit({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.ColumnIndex -ne $script:ColIdx.CustomName) { return }
+        $row = $s.Rows[$e.RowIndex]
+        $data = $row.Tag
+        if (-not $data) { return }
+
+        $newName = [string]$row.Cells[$script:ColIdx.CustomName].Value
+        $nameKey = Get-CustomNameKey -ProjectPath $data.ProjectPath -Port $data.Port
+
+        if ([string]::IsNullOrWhiteSpace($newName)) {
+            if ($script:CustomNames.ContainsKey($nameKey)) { $script:CustomNames.Remove($nameKey) }
+        } else {
+            $script:CustomNames[$nameKey] = $newName
+        }
+        Save-CustomNames $script:CustomNames
+    })
+}
+
+function Register-SystemGridEvents {
+    # Deliberately a smaller event set than Register-GridEvents: no
+    # Action/Log wiring at all (those columns are hidden on this grid, but
+    # this is belt-and-suspenders - Invoke-ToggleAction/Invoke-Restart must
+    # never be reachable for a row whose PID can be a protected OS process),
+    # and no double-click log viewer since these rows have no project/log to
+    # show. Right-click "Detail..." and the Custom Name column still work,
+    # same as Live/History.
+    param($Grid)
+
+    $Grid.Add_CellMouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Right) { return }
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -eq 'separator') { return }
+        $data = $row.Tag
+        if (-not $data) { return }
+        $s.ClearSelection()
+        $row.Selected = $true
+        # Used to be a right-click context menu with a single "Detail..."
+        # item - a one-entry dropdown always looks broken (empty icon
+        # gutter, menu wider than the text needs) and it was just an extra
+        # click to the only thing it could ever do. Right-click opens the
+        # detail popup directly now.
+        $screenPoint = [System.Windows.Forms.Cursor]::Position
+        Show-RowDetail -Data $data -ScreenPoint $screenPoint
     })
 
     $Grid.Add_CellEndEdit({
@@ -1927,6 +2236,7 @@ function Register-GridEvents {
 
 Register-GridEvents -Grid $liveGrid
 Register-GridEvents -Grid $historyGrid
+Register-SystemGridEvents -Grid $systemGrid
 
 function Show-AboutDialog {
     $dlg = New-Object System.Windows.Forms.Form
@@ -1954,7 +2264,7 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.6.1'
+    $versionLabel.Text = 'Version 1.7.0'
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
@@ -1991,7 +2301,7 @@ function Show-AboutDialog {
 function Show-SettingsDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Settings'
-    $dlg.Size = New-Object System.Drawing.Size(480, 190)
+    $dlg.Size = New-Object System.Drawing.Size(480, 270)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
@@ -2032,21 +2342,38 @@ function Show-SettingsDialog {
     $clearButton.Add_Click({ $pathBox.Text = '' })
     Initialize-ModernButton -Button $clearButton
 
+    $systemPortsSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.ShowSystemPorts)
+    $systemPortsSwitch.Location = New-Object System.Drawing.Point(15, 116)
+
+    $systemPortsLbl = New-Object System.Windows.Forms.Label
+    $systemPortsLbl.Text = 'Show system-owned ports'
+    $systemPortsLbl.Location = New-Object System.Drawing.Point(60, 116)
+    $systemPortsLbl.Size = New-Object System.Drawing.Size(250, 20)
+    $systemPortsLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $systemPortsSwitch -Label $systemPortsLbl
+
+    $systemPortsHintLbl = New-Object System.Windows.Forms.Label
+    $systemPortsHintLbl.Text = "Adds a System tab for ports owned by OS processes (System, svchost, lsass, ...) - e.g. a kernel http.sys listener shadowing a port you meant to use yourself. Read-only: nothing here can be stopped or restarted."
+    $systemPortsHintLbl.Location = New-Object System.Drawing.Point(15, 142)
+    $systemPortsHintLbl.Size = New-Object System.Drawing.Size(435, 48)
+    $systemPortsHintLbl.ForeColor = $script:Theme.TextDim
+    $systemPortsHintLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'OK'
-    $okButton.Location = New-Object System.Drawing.Point(275, 115)
+    $okButton.Location = New-Object System.Drawing.Point(275, 195)
     $okButton.Size = New-Object System.Drawing.Size(85, 28)
     $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
     Initialize-ModernButton -Button $okButton -Variant Accent
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Cancel'
-    $cancelButton.Location = New-Object System.Drawing.Point(365, 115)
+    $cancelButton.Location = New-Object System.Drawing.Point(365, 195)
     $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
     $cancelButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $cancelButton
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($lbl, $pathBox, $browseButton, $clearButton, $okButton, $cancelButton)
+    [System.Windows.Forms.Control[]]$dlgControls = @($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl, $okButton, $cancelButton)
     $dlg.Controls.AddRange($dlgControls)
     $dlg.AcceptButton = $okButton
     $dlg.ShowDialog($form) | Out-Null
@@ -2054,8 +2381,10 @@ function Show-SettingsDialog {
     if ($dlg.Tag -eq 'OK') {
         $script:RootDir = $pathBox.Text
         $script:Settings.RootDir = $script:RootDir
+        $script:Settings.ShowSystemPorts = Get-ToggleChecked $systemPortsSwitch
         Save-Settings $script:Settings
         Update-ScopeLabel
+        Update-SystemTabState
         Refresh-Grid
     }
 }
@@ -2188,10 +2517,34 @@ function Get-KnownProjects {
     return $projects | Sort-Object Label
 }
 
+function Set-GroupPortsPinned {
+    # One-shot bulk pin, not a persisted per-group setting: applied to
+    # whatever ports are on record (live or historical) for these project
+    # paths at the moment you hit Save Group. History is keyed by port, not
+    # project path, and a project can have more than one port on record
+    # (e.g. it ran on a different port once before) - every matching entry
+    # gets pinned, not just the most recent.
+    param([string[]]$ProjectPaths)
+    $targets = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($p in $ProjectPaths) { [void]$targets.Add((Get-NormalizedPath $p)) }
+
+    $history = Load-History
+    $pinnedCount = 0
+    foreach ($key in @($history.Keys)) {
+        $h = $history[$key]
+        if ($h.ProjectPath -and $targets.Contains((Get-NormalizedPath $h.ProjectPath))) {
+            if (-not [bool]$h.Pinned) { $pinnedCount++ }
+            $h.Pinned = $true
+        }
+    }
+    Save-History $history
+    return $pinnedCount
+}
+
 function Show-ManageGroupsDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Manage Groups'
-    $dlg.Size = New-Object System.Drawing.Size(460, 460)
+    $dlg.Size = New-Object System.Drawing.Size(460, 486)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
@@ -2223,8 +2576,14 @@ function Show-ManageGroupsDialog {
     $showAllCheck.Size = New-Object System.Drawing.Size(415, 20)
     $showAllCheck.ForeColor = $script:Theme.TextPrimary
 
+    $pinGroupCheck = New-Object System.Windows.Forms.CheckBox
+    $pinGroupCheck.Text = 'Pin all ports in this group (keeps them listed even after they stop)'
+    $pinGroupCheck.Location = New-Object System.Drawing.Point(15, 114)
+    $pinGroupCheck.Size = New-Object System.Drawing.Size(415, 20)
+    $pinGroupCheck.ForeColor = $script:Theme.TextPrimary
+
     $projList = New-Object System.Windows.Forms.CheckedListBox
-    $projList.Location = New-Object System.Drawing.Point(15, 116)
+    $projList.Location = New-Object System.Drawing.Point(15, 140)
     $projList.Size = New-Object System.Drawing.Size(415, 236)
     $projList.CheckOnClick = $true
     $projList.BorderStyle = 'FixedSingle'
@@ -2255,7 +2614,7 @@ function Show-ManageGroupsDialog {
 
     $saveButton = New-Object System.Windows.Forms.Button
     $saveButton.Text = 'Save Group'
-    $saveButton.Location = New-Object System.Drawing.Point(15, 365)
+    $saveButton.Location = New-Object System.Drawing.Point(15, 391)
     $saveButton.Size = New-Object System.Drawing.Size(110, 28)
     Initialize-ModernButton -Button $saveButton -Variant Success
     $saveButton.Add_Click({
@@ -2272,13 +2631,19 @@ function Show-ManageGroupsDialog {
         Save-Groups $script:Groups
         if (-not $nameCombo.Items.Contains($name)) { $nameCombo.Items.Add($name) | Out-Null }
         Update-GroupsButtonText
+
+        $pinnedNote = ''
+        if ($pinGroupCheck.Checked -and $paths.Count -gt 0) {
+            $pinnedCount = Set-GroupPortsPinned -ProjectPaths $paths
+            $pinnedNote = " Pinned $pinnedCount port(s) on record for this group."
+        }
         Refresh-Grid
-        [System.Windows.Forms.MessageBox]::Show("Saved group '$name' with $($paths.Count) project(s).", 'Saved', 'OK', 'Information') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Saved group '$name' with $($paths.Count) project(s).$pinnedNote", 'Saved', 'OK', 'Information') | Out-Null
     })
 
     $deleteButton = New-Object System.Windows.Forms.Button
     $deleteButton.Text = 'Delete Group'
-    $deleteButton.Location = New-Object System.Drawing.Point(135, 365)
+    $deleteButton.Location = New-Object System.Drawing.Point(135, 391)
     $deleteButton.Size = New-Object System.Drawing.Size(110, 28)
     Initialize-ModernButton -Button $deleteButton -Variant Danger
     $deleteButton.Add_Click({
@@ -2302,12 +2667,12 @@ function Show-ManageGroupsDialog {
 
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = 'Close'
-    $closeButton.Location = New-Object System.Drawing.Point(345, 365)
+    $closeButton.Location = New-Object System.Drawing.Point(345, 391)
     $closeButton.Size = New-Object System.Drawing.Size(85, 28)
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $showAllCheck, $projList, $saveButton, $deleteButton, $closeButton)
+    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $showAllCheck, $pinGroupCheck, $projList, $saveButton, $deleteButton, $closeButton)
     $dlg.Controls.AddRange($dlgControls)
     $dlg.ShowDialog($form) | Out-Null
 }
@@ -2332,7 +2697,7 @@ function Start-GroupAll {
     }
     $started = 0
     foreach ($row in $toStart) {
-        if (Start-ProjectAtPath -ProjectPath $row.ProjectPath) { $started++ }
+        if (Start-ProjectAtPath -ProjectPath $row.ProjectPath -CommandLine $row.CommandLine) { $started++ }
     }
     Start-Sleep -Milliseconds 1000
     Refresh-Grid
@@ -2559,6 +2924,7 @@ function Publish-DashboardRows {
             LanEntries  = @($_.Row.LanEntries | ForEach-Object { [PSCustomObject]@{ Label = $_.Label; Url = $_.Url } })
             ProjectPath = $_.Row.ProjectPath
             HasLog      = [bool]$_.Row.HasLog
+            CommandLine = $_.Row.CommandLine
         }
     })
     # -InputObject (not the pipeline) is required so a single-row result
@@ -2582,7 +2948,7 @@ function Invoke-DashboardAction {
             'start' {
                 if (-not $Action.ProjectPath) {
                     $result.Message = 'No known project path for this port.'
-                } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath) {
+                } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine $Action.CommandLine) {
                     $result.Ok = $true; $result.Message = 'Started.'
                 } else {
                     $result.Message = 'Could not start project.'
@@ -2599,7 +2965,7 @@ function Invoke-DashboardAction {
                     }
                     if (-not $ok) {
                         $result.Message = 'Could not stop process.'
-                    } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath) {
+                    } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine $Action.CommandLine) {
                         $result.Ok = $true; $result.Message = 'Restarted.'
                     } else {
                         $result.Message = 'Could not start project.'
@@ -2781,7 +3147,7 @@ async function runAction(cell, type, row) {
     const res = await fetch('/api/' + type, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ProcId: row.ProcId, ProjectPath: row.ProjectPath, Status: row.Status })
+      body: JSON.stringify({ ProcId: row.ProcId, ProjectPath: row.ProjectPath, Status: row.Status, CommandLine: row.CommandLine })
     });
     const result = await res.json();
     if (!result.Ok) { alert(result.Message || 'Action failed.'); }
@@ -2887,6 +3253,7 @@ $script:DashboardListenScript = {
                     ProcId      = if ($body.ProcId) { [int]$body.ProcId } else { 0 }
                     ProjectPath = [string]$body.ProjectPath
                     Status      = [string]$body.Status
+                    CommandLine = [string]$body.CommandLine
                 }
                 $Cache.Actions.Enqueue($action)
 

@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-07-23
+
+### Added
+- **System tab** (Settings ▸ Preferences ▸ "Show system-owned ports"):
+  read-only view of ports owned by OS processes (System, svchost, lsass,
+  ...) — most commonly the kernel http.sys listener behind a .NET
+  HttpListener, which reports as PID 4 "System" rather than the app that
+  actually registered it. This is how the app's own web dashboard port
+  could look silently "taken" with no visible owner. Grayed out until
+  enabled; never Start/Stop/Restart-able
+- **Pin**: a per-row pin toggle on Live/History keeps a port's entry
+  listed (and restartable) after it stops, including non-Node processes,
+  which previously were never remembered once they exited. A pinned port
+  also stays visible through the Dev Servers Only filter
+- Manage Groups: "Pin all ports in this group" checkbox bulk-pins every
+  port on record for the group's projects when you hit Save Group
+- Start/Restart can now bring back non-npm processes: the background
+  poller captures the exact command line a process was launched with
+  (e.g. `python -m http.server 8792`) straight out of its own memory, and
+  replays it when there's no `package.json` to run against instead of
+  always guessing npm
+- Row Detail popup now shows Pinned status and the captured Command (when
+  known)
+
+### Changed
+- Right-click "Detail..." now opens the detail popup directly instead of
+  going through a single-item context menu (which always looked broken —
+  empty icon gutter, box wider than the text needed)
+
+### Fixed
+- Start/Restart no longer silently falls back to `npm run start` (and
+  crashing with an ENOENT) when a port has no `package.json` and no known
+  launch command — shows a clear "No Known Start Command" message instead
+
 ## [1.6.1] - 2026-07-23
 
 ### Added
@@ -79,6 +113,7 @@ Initial release.
 - Custom names, root-directory scoping, red tray icon on failure
 - Lives in the tray — closing the window just hides it
 
+[1.7.0]: https://github.com/zanopyth/local-host-manager/releases/tag/v1.7.0
 [1.6.1]: https://github.com/zanopyth/local-host-manager/releases/tag/v1.6.1
 [1.6.0]: https://github.com/zanopyth/local-host-manager/releases/tag/v1.6.0
 [1.5.2]: https://github.com/zanopyth/local-host-manager/releases/tag/v1.5.2

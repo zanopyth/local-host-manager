@@ -44,7 +44,7 @@ Invoke-PS2EXE `
   -iconFile "LocalhostManager.ico" `
   -title "Localhost Manager" `
   -product "Localhost Manager" `
-  -version "1.6.0.0"
+  -version "1.7.0.0"
 ```
 
 `-noConsole` is important — without it, every launch pops a visible
