@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.7] - 2026-07-26
+
+### Fixed
+- Menu bar (and other) text looked smeared/rainbow-fringed - "unfinished",
+  as if ClearType hadn't settled. Root cause: the app never declared DPI
+  awareness, so on any scaled display (125%/150%, the common laptop/4K
+  default) Windows silently bitmap-stretched the whole rendered window to
+  match, which is what fringed the text (confirmed by zooming into a
+  screenshot: the OS-drawn title bar text, never stretched, stayed crisp
+  at the same zoom level the app's own text visibly fringed at). Now
+  declares Per-Monitor-v2 DPI awareness at startup (falling back through
+  the older per-process APIs on pre-1703 Windows), before any window is
+  created. Note: since the app's layout uses fixed pixel positions with no
+  DPI-scaling logic of its own, it will now render at its literal declared
+  size - sharp, but physically smaller on a scaled display than the
+  blurry upscale it was showing before
+
+### Changed
+- **Check for Updates** (Help menu) now opens immediately with an animated
+  "Checking..." state instead of giving no feedback until a MessageBox
+  showed up seconds later (or never, if it silently failed) - resolves in
+  place into up-to-date / update-available / check-failed once the
+  background check lands
+
 ## [1.8.6] - 2026-07-26
 
 ### Added

@@ -1,3 +1,29 @@
+# Must run before any window/handle is created (hence first thing in the
+# file, before even loading WinForms). Without an explicit DPI-awareness
+# declaration, Windows treats this process as DPI-unaware on a scaled
+# display (125%/150%, the common laptop/4K default) and bitmap-stretches
+# the whole rendered window to match - which is what was fringing/blurring
+# the menu and other ClearType text into a smeared "unfinished" look, while
+# window chrome Windows draws itself (the title bar) stayed crisp. Per-
+# Monitor-v2 (Win 10 1703+) is tried first for the sharpest result; each
+# older API is a documented fallback for earlier Windows versions.
+Add-Type -Name DpiAwareness -Namespace LocalhostManager -MemberDefinition @"
+[DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+[DllImport("SHCore.dll")]
+public static extern int SetProcessDpiAwareness(int value);
+[DllImport("user32.dll")]
+public static extern bool SetProcessDPIAware();
+"@
+try {
+    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    $ctx = [IntPtr](-4)
+    if (-not [LocalhostManager.DpiAwareness]::SetProcessDpiAwarenessContext($ctx)) { throw 'unsupported' }
+} catch {
+    try { [void][LocalhostManager.DpiAwareness]::SetProcessDpiAwareness(2) }
+    catch { try { [void][LocalhostManager.DpiAwareness]::SetProcessDPIAware() } catch {} }
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1556,7 +1582,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.8.6'
+$script:AppVersion = '1.8.7'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -1635,12 +1661,20 @@ $script:UpdateAvailable = $false
 $script:UpdateLatestVersion = $null
 $script:UpdateUrl = $null
 
+$script:UpdateCheckError = $null
+
 function Complete-UpdateCheck {
-    param($Cache, [bool]$Interactive)
+    # No MessageBox here on purpose - Show-UpdateCheckDialog (opened
+    # immediately on click, before this ever resolves) polls these same
+    # script:Update* fields and updates itself in place once
+    # UpdateCheckInFlight flips false, so the manual "Check for Updates..."
+    # path always gets visible feedback instead of a silent wait. The
+    # automatic startup check has no dialog open to update, so it still
+    # only surfaces a found update via the tray balloon below.
+    param($Cache)
+    $script:UpdateCheckError = $null
     if ($Cache.Error -or -not $Cache.Latest) {
-        if ($Interactive) {
-            [System.Windows.Forms.MessageBox]::Show("Couldn't check for updates: $($Cache.Error)", 'Check for Updates', 'OK', 'Warning') | Out-Null
-        }
+        $script:UpdateCheckError = if ($Cache.Error) { $Cache.Error } else { 'No release information returned.' }
         return
     }
     $latest = [string]$Cache.Latest
@@ -1652,12 +1686,6 @@ function Complete-UpdateCheck {
             $script:BalloonAction = 'Update'
             $notifyIcon.ShowBalloonTip(6000, 'Localhost Manager', "Update available: $latest (you have v$script:AppVersion). Click to download.", [System.Windows.Forms.ToolTipIcon]::Info)
         } catch {}
-        if ($Interactive) {
-            $open = [System.Windows.Forms.MessageBox]::Show("A new version is available: $latest (you have v$script:AppVersion).`n`nOpen the download page?", 'Update Available', 'YesNo', 'Information')
-            if ($open -eq 'Yes') { try { Start-Process $script:UpdateUrl } catch {} }
-        }
-    } elseif ($Interactive) {
-        [System.Windows.Forms.MessageBox]::Show("You're up to date (v$script:AppVersion).", 'Check for Updates', 'OK', 'Information') | Out-Null
     }
 }
 
@@ -1694,7 +1722,7 @@ function Start-UpdateCheck {
         try { $ps.EndInvoke($asyncHandle) } catch {}
         $ps.Dispose(); $rs.Close(); $rs.Dispose()
         $script:UpdateCheckInFlight = $false
-        Complete-UpdateCheck -Cache $cache -Interactive $Interactive
+        Complete-UpdateCheck -Cache $cache
     }.GetNewClosure())
     $timer.Start()
 }
@@ -1926,7 +1954,7 @@ $menuDashboard.Add_Click({ Show-DashboardDialog })
 
 $menuHelp = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 $menuHelpUpdate = New-Object System.Windows.Forms.ToolStripMenuItem('Check for Updates...')
-$menuHelpUpdate.Add_Click({ Start-UpdateCheck -Interactive })
+$menuHelpUpdate.Add_Click({ Show-UpdateCheckDialog })
 $menuHelpAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
 $menuHelpAbout.Add_Click({ Show-AboutDialog })
 [System.Windows.Forms.ToolStripItem[]]$menuHelpItems = @($menuHelpUpdate, (New-Object System.Windows.Forms.ToolStripSeparator), $menuHelpAbout)
@@ -3420,6 +3448,105 @@ function Show-AboutDialog {
     [System.Windows.Forms.Control[]]$dlgControls = @($iconBox, $titleLabel, $versionLabel, $descLabel, $linkLabel, $closeButton) + $dlgExtraControls
     $dlg.Controls.AddRange($dlgControls)
     $dlg.AcceptButton = $closeButton
+    $dlg.ShowDialog($form) | Out-Null
+}
+
+function Show-UpdateCheckDialog {
+    # Opens immediately on click with an animated "Checking..." state, then
+    # resolves itself in place once the background check lands - replaces
+    # the old behavior where clicking "Check for Updates..." gave no
+    # feedback at all until a MessageBox appeared several seconds later
+    # (or never, if it silently failed).
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Check for Updates'
+    $dlg.Size = New-Object System.Drawing.Size(360, 170)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.Icon = $script:IconOk
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $spinner = New-Object System.Windows.Forms.Label
+    $spinner.Text = ([char]0x25CF)
+    $spinner.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+    $spinner.ForeColor = $script:Theme.Accent
+    $spinner.Location = New-Object System.Drawing.Point(20, 22)
+    $spinner.Size = New-Object System.Drawing.Size(30, 30)
+    $spinner.TextAlign = 'MiddleCenter'
+
+    $statusLbl = New-Object System.Windows.Forms.Label
+    $statusLbl.Text = 'Checking for updates'
+    $statusLbl.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $statusLbl.ForeColor = $script:Theme.TextPrimary
+    $statusLbl.Location = New-Object System.Drawing.Point(60, 20)
+    $statusLbl.Size = New-Object System.Drawing.Size(270, 26)
+
+    $detailLbl = New-Object System.Windows.Forms.Label
+    $detailLbl.Text = "You're on v$script:AppVersion"
+    $detailLbl.ForeColor = $script:Theme.TextDim
+    $detailLbl.Location = New-Object System.Drawing.Point(60, 48)
+    $detailLbl.Size = New-Object System.Drawing.Size(270, 20)
+
+    $actionButton = New-Object System.Windows.Forms.Button
+    $actionButton.Text = 'Close'
+    $actionButton.Location = New-Object System.Drawing.Point(245, 100)
+    $actionButton.Size = New-Object System.Drawing.Size(85, 28)
+    Initialize-ModernButton -Button $actionButton -Variant Accent
+    $actionButton.Add_Click({ $dlg.Close() })
+
+    $dlg.Controls.AddRange(@($spinner, $statusLbl, $detailLbl, $actionButton))
+    $dlg.AcceptButton = $actionButton
+
+    # Pulses the dot's opacity via foreground color lerp between the accent
+    # color and the window background - a cheap "still working" heartbeat
+    # that doesn't need a sprite sheet or GDI+ arc-drawing timer.
+    $pulseStep = 0
+    $animTimer = New-Object System.Windows.Forms.Timer
+    $animTimer.Interval = 90
+    $animTimer.Add_Tick({
+        $pulseStep = ($pulseStep + 1) % 20
+        $t = if ($pulseStep -le 10) { $pulseStep / 10.0 } else { (20 - $pulseStep) / 10.0 }
+        $a = $script:Theme.Accent
+        $bg = $script:Theme.WindowBg
+        $r = [int]($bg.R + ($a.R - $bg.R) * $t)
+        $g = [int]($bg.G + ($a.G - $bg.G) * $t)
+        $b = [int]($bg.B + ($a.B - $bg.B) * $t)
+        $spinner.ForeColor = [System.Drawing.Color]::FromArgb($r, $g, $b)
+    }.GetNewClosure())
+    $animTimer.Start()
+
+    $pollTimer = New-Object System.Windows.Forms.Timer
+    $pollTimer.Interval = 150
+    $pollTimer.Add_Tick({
+        if ($script:UpdateCheckInFlight) { return }
+        $pollTimer.Stop()
+        $animTimer.Stop()
+        if ($script:UpdateCheckError) {
+            $spinner.Text = [char]0x2715
+            $spinner.ForeColor = $script:Theme.Danger
+            $statusLbl.Text = "Couldn't check for updates"
+            $detailLbl.Text = $script:UpdateCheckError
+        } elseif ($script:UpdateAvailable) {
+            $spinner.Text = [char]0x2191
+            $spinner.ForeColor = $script:Theme.Accent
+            $statusLbl.Text = "Update available: v$script:UpdateLatestVersion"
+            $detailLbl.Text = "You're on v$script:AppVersion"
+            $actionButton.Text = 'Download'
+            $actionButton.Add_Click({ try { Start-Process $script:UpdateUrl } catch {}; $dlg.Close() })
+        } else {
+            $spinner.Text = [char]0x2713
+            $spinner.ForeColor = $script:Theme.Success
+            $statusLbl.Text = "You're up to date"
+            $detailLbl.Text = "Version $script:AppVersion is the latest release"
+        }
+    }.GetNewClosure())
+    $pollTimer.Start()
+
+    Start-UpdateCheck -Interactive
+    $dlg.Add_FormClosed({ $animTimer.Stop(); $pollTimer.Stop() })
     $dlg.ShowDialog($form) | Out-Null
 }
 
