@@ -5,6 +5,82 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.4] - 2026-07-26
+
+### Fixed
+- About dialog's app icon rendered as colored static instead of the actual
+  logo - `Icon.ToBitmap()` corrupts modern `.ico` files whose larger frames
+  are embedded as PNG (GDI+'s bitmap-conversion path can't decode those).
+  Now drawn via `Graphics.DrawIcon`, the same Windows-native path already
+  used everywhere else the icon is shown (title bar, tray)
+
+## [1.8.3] - 2026-07-26
+
+### Changed
+- **Start All** now gets the same inline split-pill confirm as Stop All (X
+  to cancel, check to confirm) instead of firing immediately on click -
+  green instead of red, since it's not destructive, but a misclick still
+  launches every stopped project in the group
+
+## [1.8.2] - 2026-07-26
+
+### Changed
+- **Stop All**'s inline confirm step is now a real split pill instead of a
+  single button that just relabels itself "Confirm?" - the first click
+  divides it into two independently-clickable halves: a plain X (cancel,
+  left) and a solid check (confirm, right), so backing out is an explicit
+  option next to the destructive one instead of only a 3-second timeout or
+  clicking away
+
+## [1.8.1] - 2026-07-26
+
+### Fixed
+- A live, listening port could lose its project identity entirely if
+  something else restarted it in a way this app couldn't read the new
+  process's memory (its working-directory PEB read) - notably a dev server
+  restarted from inside another tool's sandboxed/job-restricted shell (an
+  agent or CI runner), which blocks that kind of cross-process read from
+  unrelated apps even though the process itself is completely normal and
+  visible. Previously this clobbered the port's ProjectPath to null on the
+  very next refresh, silently dropping it out of Groups, Manage Groups, and
+  the Dev Servers Only filter - even if it had been pinned. Build-Rows now
+  falls back to the port's last known-good path/command line when a live
+  read comes back empty, so a previously-identified port keeps its
+  group/pin association through an unreadable restart. A process that
+  resolves its own path always takes priority over the fallback
+- Also now enables SeDebugPrivilege on its own process token at startup
+  when available (present only on an elevated/Administrator launch - a
+  silent no-op otherwise). Where present, this can let the PEB read
+  succeed against sandboxed processes directly, instead of relying on the
+  history fallback above
+
+## [1.8.0] - 2026-07-25
+
+### Added
+- **Dark theme** (Settings ▸ Preferences ▸ Appearance): a full dark palette
+  across the main window, grid, dialogs, tray menu, and popups. Takes
+  effect after a restart, which the Settings dialog will offer to do for
+  you as soon as you change it
+- **Preferences redesign**: the Settings dialog is now tabbed (General /
+  Appearance / Startup / Diagnostics) instead of one long stacked list
+- **Launch at Windows startup** (Settings ▸ Startup)
+- **Start minimized to tray** (Settings ▸ Startup) - skips showing the
+  main window on launch, straight to the tray icon
+- **Crash notifications toggle** (Settings ▸ Startup) - the balloon tip
+  shown when a tracked dev server crashes unexpectedly can now be turned
+  off; the error log still records it either way
+
+### Changed
+- Toolbar's "Groups: N selected" button now just reads "Groups" (matching
+  the size/shape of Refresh/Start All/Stop All); the selection detail
+  moved to a hover tooltip
+
+### Fixed
+- Right-clicking the tray icon could occasionally render the popup menu
+  partly behind the taskbar - the menu's on-screen position was being
+  computed from its previous (often shorter) size before its items were
+  rebuilt for the current project list
+
 ## [1.7.0] - 2026-07-23
 
 ### Added

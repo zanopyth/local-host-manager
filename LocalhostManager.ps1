@@ -19,6 +19,113 @@ public static extern int NtQueryInformationProcess(IntPtr hProcess, int piClass,
 public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
 "@
 
+Add-Type -Name TokenPriv -Namespace LocalhostManager -MemberDefinition @"
+[StructLayout(LayoutKind.Sequential)]
+public struct LUID { public uint LowPart; public int HighPart; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+
+[DllImport("advapi32.dll", SetLastError = true)]
+public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+[DllImport("advapi32.dll", SetLastError = true)]
+public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+[DllImport("kernel32.dll")]
+public static extern IntPtr GetCurrentProcess();
+"@
+
+# Best-effort: enable SeDebugPrivilege on our own token. Present only on a
+# token that already has it (elevated/Administrator launches - UAC strips it
+# from a standard token entirely), so this is a silent no-op unless run "as
+# Administrator". Where it IS present, it lets ReadProcessMemory/PEB reads
+# (Get-ProcessWorkingDirectory) succeed against processes this app couldn't
+# otherwise open a handle into - notably ones spawned inside another tool's
+# sandboxed/job-restricted shell (an agent or CI runner), which normally
+# block cross-process memory reads from unrelated apps regardless of same
+# user/session. Without this, such a process's working directory can only
+# ever be recovered via the history fallback in Build-Rows, never read live.
+function Enable-DebugPrivilege {
+    try {
+        $TOKEN_ADJUST_PRIVILEGES = 0x20
+        $TOKEN_QUERY = 0x8
+        $SE_PRIVILEGE_ENABLED = 0x2
+        $hToken = [IntPtr]::Zero
+        if (-not [LocalhostManager.TokenPriv]::OpenProcessToken([LocalhostManager.TokenPriv]::GetCurrentProcess(), ($TOKEN_ADJUST_PRIVILEGES -bor $TOKEN_QUERY), [ref]$hToken)) { return }
+        $luid = New-Object LocalhostManager.TokenPriv+LUID
+        if (-not [LocalhostManager.TokenPriv]::LookupPrivilegeValue($null, 'SeDebugPrivilege', [ref]$luid)) { return }
+        $tp = New-Object LocalhostManager.TokenPriv+TOKEN_PRIVILEGES
+        $tp.PrivilegeCount = 1
+        $tp.Luid = $luid
+        $tp.Attributes = $SE_PRIVILEGE_ENABLED
+        [void][LocalhostManager.TokenPriv]::AdjustTokenPrivileges($hToken, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+    } catch {}
+}
+Enable-DebugPrivilege
+
+Add-Type -Name DwmApi -Namespace LocalhostManager -MemberDefinition @"
+[DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+"@
+
+# WinForms client-area colors never reach the native title bar/window frame
+# Windows itself draws - that's DWM chrome, opted into dark rendering via
+# this specific attribute (Windows 10 2004+ and all of Windows 11). Without
+# it, a dark-themed window still gets a light title bar and window border no
+# matter what colors the form and its controls use.
+function Set-DarkTitleBar {
+    param($FormControl)
+    if (-not $script:Theme.IsDark) { return }
+    try {
+        $enabled = 1
+        [LocalhostManager.DwmApi]::DwmSetWindowAttribute($FormControl.Handle, 20, [ref]$enabled, 4) | Out-Null
+    } catch {}
+}
+
+# Recolors MenuStrip/ContextMenuStrip chrome (dropdown background, image
+# margin, hover/press highlight, borders) for the dark theme — the default
+# ProfessionalColorTable is hardcoded light and would otherwise paint a
+# white band behind dark-mode menu text no matter what BackColor is set on
+# the strip itself.
+Add-Type -TypeDefinition @"
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace LocalhostManager {
+    public class ThemedColorTable : ProfessionalColorTable {
+        private Color _base, _hover, _border, _accent;
+        public ThemedColorTable(Color baseColor, Color hover, Color border, Color accent) {
+            _base = baseColor; _hover = hover; _border = border; _accent = accent;
+            UseSystemColors = false;
+        }
+        public override Color MenuStripGradientBegin { get { return _base; } }
+        public override Color MenuStripGradientEnd { get { return _base; } }
+        public override Color ToolStripDropDownBackground { get { return _base; } }
+        public override Color ImageMarginGradientBegin { get { return _base; } }
+        public override Color ImageMarginGradientMiddle { get { return _base; } }
+        public override Color ImageMarginGradientEnd { get { return _base; } }
+        public override Color MenuItemSelected { get { return _hover; } }
+        public override Color MenuItemSelectedGradientBegin { get { return _hover; } }
+        public override Color MenuItemSelectedGradientEnd { get { return _hover; } }
+        public override Color MenuItemPressedGradientBegin { get { return _hover; } }
+        public override Color MenuItemPressedGradientMiddle { get { return _hover; } }
+        public override Color MenuItemPressedGradientEnd { get { return _hover; } }
+        public override Color MenuItemBorder { get { return _accent; } }
+        public override Color SeparatorDark { get { return _border; } }
+        public override Color SeparatorLight { get { return _border; } }
+        public override Color ToolStripBorder { get { return _border; } }
+        public override Color MenuBorder { get { return _border; } }
+    }
+}
+"@ -ReferencedAssemblies System.Windows.Forms, System.Drawing
+
 # ---------------------------------------------------------------------------
 # Recovers the true working directory of an arbitrary running process by
 # reading its PEB (ProcessParameters->CurrentDirectory) directly out of its
@@ -86,7 +193,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Light'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -95,14 +202,22 @@ function Load-Settings {
         $webPort = if ($raw.PSObject.Properties.Name -contains 'WebPort' -and [int]$raw.WebPort -gt 0) { [int]$raw.WebPort } else { 3199 }
         $dashboardEnabled = if ($raw.PSObject.Properties.Name -contains 'DashboardEnabled') { [bool]$raw.DashboardEnabled } else { $false }
         $showSystemPorts = if ($raw.PSObject.Properties.Name -contains 'ShowSystemPorts') { [bool]$raw.ShowSystemPorts } else { $false }
+        $theme = if ($raw.PSObject.Properties.Name -contains 'Theme' -and [string]$raw.Theme -eq 'Dark') { 'Dark' } else { 'Light' }
+        $launchAtStartup = if ($raw.PSObject.Properties.Name -contains 'LaunchAtStartup') { [bool]$raw.LaunchAtStartup } else { $false }
+        $startMinimized = if ($raw.PSObject.Properties.Name -contains 'StartMinimized') { [bool]$raw.StartMinimized } else { $false }
+        $crashNotifications = if ($raw.PSObject.Properties.Name -contains 'CrashNotifications') { [bool]$raw.CrashNotifications } else { $true }
         return @{
-            OnlyNode         = [bool]$raw.OnlyNode
-            RootDir          = [string]$raw.RootDir
-            ShowGroups       = $showGroups
-            SelectedGroups   = $selectedGroups
-            WebPort          = $webPort
-            DashboardEnabled = $dashboardEnabled
-            ShowSystemPorts  = $showSystemPorts
+            OnlyNode           = [bool]$raw.OnlyNode
+            RootDir            = [string]$raw.RootDir
+            ShowGroups         = $showGroups
+            SelectedGroups     = $selectedGroups
+            WebPort            = $webPort
+            DashboardEnabled   = $dashboardEnabled
+            ShowSystemPorts    = $showSystemPorts
+            Theme              = $theme
+            LaunchAtStartup    = $launchAtStartup
+            StartMinimized     = $startMinimized
+            CrashNotifications = $crashNotifications
         }
     } catch { return $defaults }
 }
@@ -110,6 +225,50 @@ function Load-Settings {
 function Save-Settings($settings) {
     if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
     $settings | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+}
+
+$script:StartupRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$script:StartupRunName = 'LocalhostManager'
+
+# The launch path a user actually double-clicks: the compiled .exe (its own
+# process) normally, or "powershell -File script.ps1" when run unpackaged
+# from source - MainModule.FileName alone would point at powershell.exe with
+# no argument in that case and just open a blank shell on login.
+function Get-AppLaunchCommand {
+    if ($PSCommandPath -and $PSCommandPath -like '*.ps1') {
+        return "powershell.exe -WindowStyle Hidden -File `"$PSCommandPath`""
+    }
+    return "`"$([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)`""
+}
+
+function Set-LaunchAtStartup {
+    param([bool]$Enable)
+    try {
+        if ($Enable) {
+            New-ItemProperty -Path $script:StartupRunKey -Name $script:StartupRunName -Value (Get-AppLaunchCommand) -PropertyType String -Force | Out-Null
+        } else {
+            Remove-ItemProperty -Path $script:StartupRunKey -Name $script:StartupRunName -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+# Relaunches the app and exits this instance - used after a theme change,
+# since every control reads $script:Theme.* once at creation time rather
+# than repainting live on toggle. Releases the single-instance mutex first
+# so the freshly spawned copy's own startup check doesn't see this (still
+# exiting) instance and refuse to open.
+function Restart-App {
+    try { $script:SingleInstanceMutex.Close() } catch {}
+    try {
+        if ($PSCommandPath -and $PSCommandPath -like '*.ps1') {
+            Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', $PSCommandPath)
+        } else {
+            Start-Process -FilePath ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+        }
+    } catch {}
+    $script:ReallyExit = $true
+    $notifyIcon.Visible = $false
+    $form.Close()
 }
 
 $script:CustomNamesPath = Join-Path $script:HistoryDir 'customnames.json'
@@ -463,9 +622,33 @@ function Get-NetworkInterfaceLabel {
 function Build-Rows {
     param([bool]$OnlyNode, [string]$RootDir)
 
-    $live = Get-LiveListeners
+    $rawLive = Get-LiveListeners
     $history = Load-History
     $lanIps = @(Get-LanIPv4Addresses)
+
+    # The PEB read behind ProjectPath can fail for a perfectly normal, live
+    # process - e.g. one spawned inside a sandboxed shell (an agent/CI
+    # runner) whose job/security context blocks an unrelated app like this
+    # one from opening a memory-reading handle into it, even though the
+    # process's name/PID/command line are all still visible. When that
+    # happens for a port this app has already resolved before, fall back to
+    # the last known-good path/command line instead of clobbering it to
+    # null - otherwise a single unreadable restart silently drops the port
+    # out of Groups (path match), Manage Groups (path is required to even
+    # list it) and the "Dev Servers Only" filter (needs IsNode). A process
+    # that resolves fine this cycle always wins over history.
+    $live = @{}
+    foreach ($key in $rawLive.Keys) {
+        $e = $rawLive[$key]
+        $prior = $history[$key]
+        if (-not $e.ProjectPath -and $prior -and $prior.ProjectPath) {
+            $e = $e.Clone()
+            $e.ProjectPath = $prior.ProjectPath
+            if (-not $e.CommandLine) { $e.CommandLine = $prior.CommandLine }
+            $e.IsNode = $true
+        }
+        $live[$key] = $e
+    }
 
     # A pinned port is remembered here regardless of IsNode - that's the
     # whole point of pinning: keep tracking something (even a non-npm
@@ -636,13 +819,22 @@ if (-not $script:SingleInstanceCreatedNew) {
     exit
 }
 
+# Loaded here (ahead of everything else that used to load it further down)
+# because the Light/Dark palette selection right below needs to know the
+# saved theme choice before any control gets built against it.
+$script:Settings = Load-Settings
+
 # ---------------------------------------------------------------------------
-# Theme — flat, light, GNOME/Adwaita-inspired palette. Swapped in for the
-# default WinForms 3D-bevel gray look: flat bordered buttons with rounded
-# corners, a real background/foreground color system, and a white grid
-# instead of the OS default ButtonFace gray filling unused rows.
+# Theme — flat, GNOME/Adwaita-inspired palettes, light and dark. Swapped in
+# for the default WinForms 3D-bevel gray look: flat bordered buttons with
+# rounded corners, a real background/foreground color system, and a
+# grid/card background instead of the OS default ButtonFace gray filling
+# unused rows. $script:Settings.Theme (loaded above) picks which one is
+# active; because controls read $script:Theme.* once, at creation time,
+# switching between the two takes a restart (Show-SettingsDialog offers to
+# do that automatically) rather than repainting live.
 # ---------------------------------------------------------------------------
-$script:Theme = @{
+$script:LightTheme = @{
     WindowBg    = [System.Drawing.Color]::FromArgb(0xFA, 0xFA, 0xFA)
     PanelBg     = [System.Drawing.Color]::FromArgb(0xF2, 0xF1, 0xF0)
     CardBg      = [System.Drawing.Color]::White
@@ -657,6 +849,167 @@ $script:Theme = @{
     Danger      = [System.Drawing.Color]::FromArgb(0xC0, 0x1C, 0x28)
     DangerTint  = [System.Drawing.Color]::FromArgb(0xFB, 0xE6, 0xE7)
     RowAlt      = [System.Drawing.Color]::FromArgb(0xF7, 0xF6, 0xF5)
+    ToggleOff   = [System.Drawing.Color]::FromArgb(0xC6, 0xC6, 0xC6)
+    IsDark      = $false
+}
+
+# Dark variant — Discord's palette family: blue-gray (not neutral-gray or
+# navy-black) surfaces at three tiers of lightness - tertiary/darkest for
+# outer chrome (title bar, toolbar row), secondary for panels/inactive tabs,
+# primary/brightest for the main content surface - plus its blurple accent
+# and muted (not pure white/full-saturation) text and status colors.
+$script:DarkTheme = @{
+    WindowBg    = [System.Drawing.Color]::FromArgb(0x1E, 0x1F, 0x22)
+    PanelBg     = [System.Drawing.Color]::FromArgb(0x2B, 0x2D, 0x31)
+    CardBg      = [System.Drawing.Color]::FromArgb(0x31, 0x33, 0x38)
+    Border      = [System.Drawing.Color]::FromArgb(0x3F, 0x42, 0x48)
+    TextPrimary = [System.Drawing.Color]::FromArgb(0xDB, 0xDE, 0xE1)
+    TextDim     = [System.Drawing.Color]::FromArgb(0x94, 0x9B, 0xA4)
+    Accent      = [System.Drawing.Color]::FromArgb(0x58, 0x65, 0xF2)
+    AccentDark  = [System.Drawing.Color]::FromArgb(0x75, 0x81, 0xF5)
+    AccentTint  = [System.Drawing.Color]::FromArgb(0x35, 0x37, 0x4B)
+    Success     = [System.Drawing.Color]::FromArgb(0x23, 0xA5, 0x5A)
+    SuccessTint = [System.Drawing.Color]::FromArgb(0x1E, 0x2E, 0x25)
+    Danger      = [System.Drawing.Color]::FromArgb(0xF2, 0x3F, 0x42)
+    DangerTint  = [System.Drawing.Color]::FromArgb(0x30, 0x22, 0x24)
+    RowAlt      = [System.Drawing.Color]::FromArgb(0x2E, 0x30, 0x35)
+    ToggleOff   = [System.Drawing.Color]::FromArgb(0x4E, 0x50, 0x58)
+    IsDark      = $true
+}
+
+$script:Theme = if ($script:Settings.Theme -eq 'Dark') { $script:DarkTheme } else { $script:LightTheme }
+
+# Dark mode needs a custom ToolStrip renderer (see ThemedColorTable above) so
+# menu/tray-menu chrome matches; light mode keeps the default renderer ($null
+# below restores it) since it already matches this palette.
+$script:MenuRenderer = if ($script:Theme.IsDark) {
+    $colorTable = New-Object LocalhostManager.ThemedColorTable($script:Theme.CardBg, $script:Theme.AccentTint, $script:Theme.Border, $script:Theme.Accent)
+    New-Object System.Windows.Forms.ToolStripProfessionalRenderer($colorTable)
+} else {
+    $null
+}
+
+function Draw-ToolbarIcon {
+    # Small hand-drawn vector glyphs (no image assets), matching the
+    # anti-aliased vector look the rest of this file already draws buttons
+    # and rounded-rects with. $Alpha lets Draw-ButtonContent crossfade two
+    # icons during a morph animation.
+    param($Graphics, [string]$Icon, [System.Drawing.RectangleF]$Rect, [System.Drawing.Color]$Color, [float]$Alpha = 1.0)
+    if (-not $Icon -or $Alpha -le 0.01) { return }
+    $a = [Math]::Max(0, [Math]::Min(255, [int](255 * $Alpha)))
+    $c = [System.Drawing.Color]::FromArgb($a, $Color)
+    $pen = New-Object System.Drawing.Pen($c, 1.6)
+    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+
+    switch ($Icon) {
+        'Play' {
+            $pts = @(
+                (New-Object System.Drawing.PointF($Rect.Left, $Rect.Top)),
+                (New-Object System.Drawing.PointF($Rect.Left, $Rect.Bottom)),
+                (New-Object System.Drawing.PointF($Rect.Right, ($Rect.Top + $Rect.Height / 2)))
+            )
+            $brush = New-Object System.Drawing.SolidBrush($c)
+            $Graphics.FillPolygon($brush, $pts)
+            $brush.Dispose()
+        }
+        'Square' {
+            $Graphics.DrawRectangle($pen, $Rect.X, $Rect.Y, $Rect.Width, $Rect.Height)
+        }
+        'Check' {
+            $pts = @(
+                (New-Object System.Drawing.PointF($Rect.Left, ($Rect.Top + $Rect.Height * 0.55))),
+                (New-Object System.Drawing.PointF(($Rect.Left + $Rect.Width * 0.38), $Rect.Bottom)),
+                (New-Object System.Drawing.PointF($Rect.Right, $Rect.Top))
+            )
+            $Graphics.DrawLines($pen, $pts)
+        }
+        'X' {
+            $Graphics.DrawLine($pen, $Rect.Left, $Rect.Top, $Rect.Right, $Rect.Bottom)
+            $Graphics.DrawLine($pen, $Rect.Right, $Rect.Top, $Rect.Left, $Rect.Bottom)
+        }
+    }
+    $pen.Dispose()
+}
+
+function Draw-ButtonLayer {
+    # Draws one icon+text layer centered as a group, offset vertically by
+    # $YOffset and faded by $Alpha — the two knobs Draw-ButtonContent needs
+    # to crossfade an old layer out and a new one in during a morph.
+    param($Graphics, [System.Drawing.RectangleF]$Rect, [string]$Icon, [string]$Text, $Font, [System.Drawing.Color]$Color, [float]$Alpha, [float]$YOffset)
+    if ($Alpha -le 0.01 -or -not $Text) { return }
+    $iconSize = 12
+    $gap = 6
+    $textSize = [System.Windows.Forms.TextRenderer]::MeasureText($Graphics, $Text, $Font, [System.Drawing.Size]::Empty, [System.Windows.Forms.TextFormatFlags]::NoPadding)
+    $hasIcon = [bool]$Icon
+    $totalW = $textSize.Width + $(if ($hasIcon) { $iconSize + $gap } else { 0 })
+    $startX = $Rect.X + ($Rect.Width - $totalW) / 2.0
+    $centerY = $Rect.Y + $Rect.Height / 2.0 + $YOffset
+
+    if ($hasIcon) {
+        $iconRect = New-Object System.Drawing.RectangleF($startX, ($centerY - $iconSize / 2.0), $iconSize, $iconSize)
+        Draw-ToolbarIcon -Graphics $Graphics -Icon $Icon -Rect $iconRect -Color $Color -Alpha $Alpha
+        $startX += $iconSize + $gap
+    }
+    $textColor = [System.Drawing.Color]::FromArgb([int](255 * $Alpha), $Color)
+    $brush = New-Object System.Drawing.SolidBrush($textColor)
+    $Graphics.DrawString($Text, $Font, $brush, $startX, ($centerY - $textSize.Height / 2.0))
+    $brush.Dispose()
+}
+
+function Draw-ButtonContent {
+    # When a morph is mid-flight ($t.AnimProgress < 1), crossfades the old
+    # icon/text out (fading up) while the new one fades in (from below) —
+    # the same idea as the React version's AnimatePresence icon/text swap,
+    # just driven by a WinForms Timer tick instead of framer-motion.
+    param($Graphics, [System.Drawing.RectangleF]$Rect, $Tag, $Font, [System.Drawing.Color]$Color)
+    $Graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $p = $Tag.AnimProgress
+    if ($p -ge 1.0 -or -not $Tag.PrevText) {
+        Draw-ButtonLayer -Graphics $Graphics -Rect $Rect -Icon $Tag.Icon -Text $Tag.DisplayText -Font $Font -Color $Color -Alpha 1.0 -YOffset 0
+        return
+    }
+    $eased = 1 - [Math]::Pow(1 - $p, 3)
+    Draw-ButtonLayer -Graphics $Graphics -Rect $Rect -Icon $Tag.PrevIcon -Text $Tag.PrevText -Font $Font -Color $Color -Alpha (1 - $eased) -YOffset (-4 * $eased)
+    Draw-ButtonLayer -Graphics $Graphics -Rect $Rect -Icon $Tag.Icon -Text $Tag.DisplayText -Font $Font -Color $Color -Alpha $eased -YOffset (4 * (1 - $eased))
+}
+
+function Start-ButtonMorph {
+    # Arms the crossfade + (optional) solid-fill flip on a button already
+    # set up by Initialize-ModernButton. Used to turn Stop All into an
+    # inline "Confirm?" state instead of a blocking MessageBox.
+    param($Button, [string]$Icon, [string]$Text, [string]$Variant = $null)
+    $t = $Button.Tag
+    if ($t.DisplayText -eq $Text -and $t.Icon -eq $Icon) { return }
+
+    $t.PrevIcon = $t.Icon
+    $t.PrevText = $t.DisplayText
+    $t.Icon = $Icon
+    $t.DisplayText = $Text
+
+    switch ($Variant) {
+        'Accent'  { $t.Fg = $script:Theme.Accent;  $t.BorderNormal = $script:Theme.Border;  $t.FillActive = $script:Theme.AccentTint;  $t.BorderActive = $script:Theme.Accent; $t.SolidFill = $null }
+        'Success' { $t.Fg = $script:Theme.Success; $t.BorderNormal = $script:Theme.Success; $t.FillActive = $script:Theme.SuccessTint; $t.BorderActive = $script:Theme.Success; $t.SolidFill = $null }
+        'Danger'  { $t.Fg = $script:Theme.Danger;  $t.BorderNormal = $script:Theme.Danger;  $t.FillActive = $script:Theme.DangerTint;  $t.BorderActive = $script:Theme.Danger; $t.SolidFill = $null }
+        'DangerSolid' { $t.Fg = [System.Drawing.Color]::White; $t.BorderNormal = $script:Theme.Danger; $t.BorderActive = $script:Theme.Danger; $t.FillActive = $script:Theme.Danger; $t.SolidFill = $script:Theme.Danger }
+    }
+
+    $t.AnimProgress = 0.0
+    if (-not $t.AnimTimer) {
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 15
+        $timer.Add_Tick({
+            param($s, $e)
+            $bt = $Button.Tag
+            $bt.AnimProgress += 0.15
+            if ($bt.AnimProgress -ge 1.0) { $bt.AnimProgress = 1.0; $s.Stop() }
+            if (-not $Button.IsDisposed) { $Button.Invalidate() }
+        }.GetNewClosure())
+        $t.AnimTimer = $timer
+    }
+    $t.AnimTimer.Start()
+    $Button.Invalidate()
 }
 
 function Initialize-ModernButton {
@@ -668,7 +1021,10 @@ function Initialize-ModernButton {
     # Neutral = white with a gray border. Accent/Success/Danger keep a white
     # fill but swap the border + text color, so semantic buttons (Save,
     # Delete, Stop All) read as colored without becoming a solid block.
-    param($Button, [string]$Variant = 'Neutral', [int]$Radius = 8)
+    # -Icon opts a button into the icon+text layer (Draw-ButtonContent) so
+    # it can later be morphed via Start-ButtonMorph; plain buttons just get
+    # a single static layer with Icon = $null.
+    param($Button, [string]$Variant = 'Neutral', [int]$Radius = 8, [string]$Icon = $null)
 
     switch ($Variant) {
         'Accent'  { $fg = $script:Theme.Accent;  $borderNormal = $script:Theme.Border;  $fillActive = $script:Theme.AccentTint;  $borderActive = $script:Theme.Accent }
@@ -686,6 +1042,8 @@ function Initialize-ModernButton {
     $Button.UseVisualStyleBackColor = $false
     $Button.Tag = [PSCustomObject]@{
         State = 'Normal'; Fg = $fg; BorderNormal = $borderNormal; FillActive = $fillActive; BorderActive = $borderActive; Radius = $Radius
+        Icon = $Icon; DisplayText = $Button.Text; PrevIcon = $null; PrevText = $null; AnimProgress = 1.0; AnimTimer = $null; SolidFill = $null
+        SplitMode = $false; LastMouseDownX = 0; SplitAccent = $script:Theme.Danger
     }
 
     $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
@@ -693,7 +1051,7 @@ function Initialize-ModernButton {
 
     $Button.Add_MouseEnter({ param($s, $e) $s.Tag.State = 'Hover'; $s.Invalidate() })
     $Button.Add_MouseLeave({ param($s, $e) $s.Tag.State = 'Normal'; $s.Invalidate() })
-    $Button.Add_MouseDown({ param($s, $e) $s.Tag.State = 'Pressed'; $s.Invalidate() })
+    $Button.Add_MouseDown({ param($s, $e) $s.Tag.State = 'Pressed'; $s.Tag.LastMouseDownX = $e.X; $s.Invalidate() })
     $Button.Add_MouseUp({ param($s, $e) $s.Tag.State = 'Hover'; $s.Invalidate() })
     $Button.Add_EnabledChanged({ param($s, $e) $s.Tag.State = 'Normal'; $s.Invalidate() })
 
@@ -702,10 +1060,14 @@ function Initialize-ModernButton {
         $t = $s.Tag
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { [System.Drawing.Color]::White }
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
         $g.Clear($parentColor)
 
-        $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+        # Pressed state insets the drawn rect by a couple of px instead of
+        # resizing the actual control — a cheap stand-in for the original's
+        # whileTap={{ scale: 0.98 }}, without disturbing sibling layout.
+        $inset = if ($t.State -eq 'Pressed') { 2 } else { 0 }
+        $rect = New-Object System.Drawing.Rectangle($inset, $inset, ($s.Width - 1 - 2 * $inset), ($s.Height - 1 - 2 * $inset))
         $d = [Math]::Min($t.Radius * 2, [Math]::Min($rect.Width, $rect.Height))
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
         $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
@@ -714,18 +1076,69 @@ function Initialize-ModernButton {
         $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
         $path.CloseFigure()
 
+        if ($t.SplitMode) {
+            # Two-option pill: left half is a plain "Cancel" tile (an X, no
+            # fill commitment), right half is the actual destructive action
+            # (solid Danger, a check) - same rounded outline as a normal
+            # button, just clipped into two independently-filled halves
+            # either side of a thin divider, so the confirm step reads as
+            # "pick one of two buttons" instead of "click here again".
+            $midX = $rect.X + $rect.Width / 2.0
+            $leftRectF  = New-Object System.Drawing.RectangleF($rect.X, $rect.Y, ($midX - $rect.X), $rect.Height)
+            $rightRectF = New-Object System.Drawing.RectangleF($midX, $rect.Y, ($rect.Right - $midX), $rect.Height)
+            $leftFill   = if ($t.State -eq 'Pressed') { $script:Theme.PanelBg } else { $script:Theme.CardBg }
+
+            $origClip = $g.Clip.Clone()
+            $g.SetClip($path, [System.Drawing.Drawing2D.CombineMode]::Replace)
+            $g.SetClip($leftRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
+            $leftBrush = New-Object System.Drawing.SolidBrush($leftFill)
+            $g.FillRectangle($leftBrush, $rect)
+            $leftBrush.Dispose()
+            $g.Clip = $origClip.Clone()
+
+            $g.SetClip($path, [System.Drawing.Drawing2D.CombineMode]::Replace)
+            $g.SetClip($rightRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
+            $rightBrush = New-Object System.Drawing.SolidBrush($t.SplitAccent)
+            $g.FillRectangle($rightBrush, $rect)
+            $rightBrush.Dispose()
+            $g.Clip = $origClip.Clone()
+            $g.ResetClip()
+
+            $borderPen = New-Object System.Drawing.Pen($t.SplitAccent, 1.4)
+            $g.DrawPath($borderPen, $path)
+            $borderPen.Dispose()
+
+            $dividerColor = [System.Drawing.Color]::FromArgb(100, $script:Theme.Border)
+            $dividerPen = New-Object System.Drawing.Pen($dividerColor, 1.2)
+            $g.DrawLine($dividerPen, $midX, ($rect.Y + 4), $midX, ($rect.Bottom - 4))
+            $dividerPen.Dispose()
+
+            $iconSize = 13
+            $leftIconRect  = New-Object System.Drawing.RectangleF(($leftRectF.X + $leftRectF.Width / 2.0 - $iconSize / 2.0), ($rect.Y + $rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
+            $rightIconRect = New-Object System.Drawing.RectangleF(($rightRectF.X + $rightRectF.Width / 2.0 - $iconSize / 2.0), ($rect.Y + $rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
+            Draw-ToolbarIcon -Graphics $g -Icon 'X' -Rect $leftIconRect -Color $script:Theme.TextPrimary -Alpha 1.0
+            Draw-ToolbarIcon -Graphics $g -Icon 'Check' -Rect $rightIconRect -Color ([System.Drawing.Color]::White) -Alpha 1.0
+
+            $path.Dispose()
+            return
+        }
+
         if (-not $s.Enabled) {
             $fillColor = $parentColor
             $borderColor = $script:Theme.Border
             $textColor = $script:Theme.TextDim
+        } elseif ($t.SolidFill) {
+            $fillColor = $t.SolidFill
+            $borderColor = $t.SolidFill
+            $textColor = $t.Fg
         } else {
-            $fillColor = if ($t.State -eq 'Normal') { [System.Drawing.Color]::White } else { $t.FillActive }
+            $fillColor = if ($t.State -eq 'Normal') { $script:Theme.CardBg } else { $t.FillActive }
             $borderColor = if ($t.State -eq 'Normal') { $t.BorderNormal } else { $t.BorderActive }
             $textColor = $t.Fg
         }
-        if ($null -eq $fillColor) { $fillColor = [System.Drawing.Color]::White }
-        if ($null -eq $borderColor) { $borderColor = [System.Drawing.Color]::FromArgb(0xD1, 0xD1, 0xD1) }
-        if ($null -eq $textColor) { $textColor = [System.Drawing.Color]::Black }
+        if ($null -eq $fillColor) { $fillColor = $script:Theme.CardBg }
+        if ($null -eq $borderColor) { $borderColor = $script:Theme.Border }
+        if ($null -eq $textColor) { $textColor = $script:Theme.TextPrimary }
 
         $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
         $g.FillPath($fillBrush, $path)
@@ -735,11 +1148,173 @@ function Initialize-ModernButton {
         $g.DrawPath($borderPen, $path)
         $borderPen.Dispose()
 
-        $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $textColor, $flags)
+        $contentRect = New-Object System.Drawing.RectangleF($rect.X, $rect.Y, $rect.Width, $rect.Height)
+        Draw-ButtonContent -Graphics $g -Rect $contentRect -Tag $t -Font $s.Font -Color $textColor
 
         $path.Dispose()
     })
+}
+
+# Fully custom tab strip, used instead of the native TabControl. TabControl
+# paints its tab-strip chrome via the OS visual style renderer regardless of
+# any owner-draw hookup - fine in light mode since that native look is
+# already near-white, but in dark mode the selected tab in particular kept
+# showing a native light background no matter what DrawItem painted (a
+# long-standing WinForms/TabControl quirk, not something fixable from
+# DrawItem alone). Same custom-control philosophy already used for buttons/
+# toggles/pills elsewhere in this file, applied here for the same reason:
+# guaranteed colors in both themes instead of fighting native chrome.
+function New-CustomTabControl {
+    param([string[]]$Labels)
+
+    $root = New-Object System.Windows.Forms.Panel
+    $root.BackColor = $script:Theme.CardBg
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'
+    $header.Height = 32
+    $header.BackColor = $script:Theme.PanelBg
+
+    $headerBorder = New-Object System.Windows.Forms.Panel
+    $headerBorder.Dock = 'Bottom'
+    $headerBorder.Height = 1
+    $headerBorder.BackColor = $script:Theme.Border
+    $header.Controls.Add($headerBorder)
+
+    $body = New-Object System.Windows.Forms.Panel
+    $body.Dock = 'Fill'
+    $body.BackColor = $script:Theme.CardBg
+
+    $root.Controls.Add($body)
+    $root.Controls.Add($header)
+
+    $tabSet = [PSCustomObject]@{
+        Root     = $root
+        Header   = $header
+        Body     = $body
+        Buttons  = @()
+        Pages    = @()
+        Selected = 0
+    }
+
+    foreach ($lbl in $Labels) {
+        $btn = New-Object System.Windows.Forms.Label
+        $btn.Text = $lbl
+        $btn.TextAlign = 'MiddleCenter'
+        $btn.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $btn.Height = $header.Height - 1
+        $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $header.Controls.Add($btn)
+        $tabSet.Buttons += $btn
+
+        $page = New-Object System.Windows.Forms.Panel
+        $page.Dock = 'Fill'
+        $page.BackColor = $script:Theme.CardBg
+        $page.Visible = $false
+        $body.Controls.Add($page)
+        $tabSet.Pages += $page
+    }
+
+    for ($i = 0; $i -lt $tabSet.Buttons.Count; $i++) {
+        $idx = $i
+        $tabSet.Buttons[$i].Add_Click({ Select-CustomTab -TabSet $tabSet -Index $idx }.GetNewClosure())
+    }
+
+    Update-CustomTabLayout -TabSet $tabSet
+    Select-CustomTab -TabSet $tabSet -Index 0
+    return $tabSet
+}
+
+function Update-CustomTabLayout {
+    param($TabSet)
+    $x = 6
+    $btnHeight = $TabSet.Header.Height - 1
+    foreach ($btn in $TabSet.Buttons) {
+        $w = ([System.Windows.Forms.TextRenderer]::MeasureText($btn.Text, $btn.Font).Width) + 28
+        $btn.Location = New-Object System.Drawing.Point($x, 0)
+        $btn.Size = New-Object System.Drawing.Size($w, $btnHeight)
+        $x += $w
+    }
+}
+
+function Select-CustomTab {
+    param($TabSet, [int]$Index)
+    for ($i = 0; $i -lt $TabSet.Buttons.Count; $i++) {
+        $btn = $TabSet.Buttons[$i]
+        $isSel = ($i -eq $Index)
+        $btn.BackColor = if ($isSel) { $script:Theme.CardBg } else { $script:Theme.PanelBg }
+        $btn.ForeColor = if (-not $btn.Enabled) { $script:Theme.Border } elseif ($isSel) { $script:Theme.TextPrimary } else { $script:Theme.TextDim }
+        $TabSet.Pages[$i].Visible = $isSel
+    }
+    $TabSet.Selected = $Index
+}
+
+function Set-CustomTabEnabled {
+    # Grayed out, not hidden, when disabled - same idiom the old TabPage-
+    # based System tab used (Update-SystemTabState): still visible/
+    # discoverable, just inert. Doesn't force navigation away if it happens
+    # to already be the selected tab - the page's own content (grid vs.
+    # placeholder) already communicates the "off" state.
+    param($TabSet, [int]$Index, [bool]$Enabled)
+    $btn = $TabSet.Buttons[$Index]
+    $btn.Enabled = $Enabled
+    $btn.Cursor = if ($Enabled) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default }
+    $isSel = ($TabSet.Selected -eq $Index)
+    $btn.ForeColor = if (-not $Enabled) { $script:Theme.Border } elseif ($isSel) { $script:Theme.TextPrimary } else { $script:Theme.TextDim }
+}
+
+function Set-CustomTabText {
+    param($TabSet, [int]$Index, [string]$Text)
+    $TabSet.Buttons[$Index].Text = $Text
+    Update-CustomTabLayout -TabSet $TabSet
+}
+
+# Small owner-drawn capsule/"badge" label (rounded ends, tinted fill) used
+# for at-a-glance health indicators - e.g. the error-log status in Settings.
+# Same anti-aliased-path technique as Initialize-ModernButton above, just
+# fully rounded (pill) instead of a soft-corner rect, and non-interactive.
+function New-StatusPill {
+    param([string]$Text, [string]$Tone = 'Success')
+    $fill = if ($Tone -eq 'Danger') { $script:Theme.DangerTint } else { $script:Theme.SuccessTint }
+    $fg   = if ($Tone -eq 'Danger') { $script:Theme.Danger } else { $script:Theme.Success }
+
+    $pill = New-Object System.Windows.Forms.Label
+    $pill.AutoSize = $false
+    $pill.TextAlign = 'MiddleCenter'
+    $pill.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+    $pill.ForeColor = $fg
+    $pill.Tag = [PSCustomObject]@{ Fill = $fill }
+
+    $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+    $dbProp.SetValue($pill, $true, $null)
+
+    $pill.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
+        $g.Clear($parentColor)
+
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+        $d = $rect.Height
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
+        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
+        $path.CloseFigure()
+
+        $fillBrush = New-Object System.Drawing.SolidBrush($s.Tag.Fill)
+        $g.FillPath($fillBrush, $path)
+        $fillBrush.Dispose()
+
+        $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $s.Text, $s.Font, $s.ClientRectangle, $s.ForeColor, $flags)
+        $path.Dispose()
+    })
+
+    $pill.Text = $Text
+    $measured = [System.Windows.Forms.TextRenderer]::MeasureText($Text, $pill.Font)
+    $pill.Size = New-Object System.Drawing.Size(($measured.Width + 22), 20)
+    return $pill
 }
 
 # ---------------------------------------------------------------------------
@@ -751,7 +1326,7 @@ function Initialize-ModernButton {
 # ---------------------------------------------------------------------------
 function Enable-RoundedPopup {
     param($Popup, [int]$Radius = 8)
-    $Popup.BackColor = [System.Drawing.Color]::White
+    $Popup.BackColor = $script:Theme.CardBg
     $paintHandler = {
         param($s, $e)
         if ($s.Width -le 0 -or $s.Height -le 0) { return }
@@ -776,7 +1351,6 @@ function Enable-RoundedPopup {
     $Popup.Add_Paint($paintHandler)
 }
 
-$script:Settings = Load-Settings
 $script:RootDir = $script:Settings.RootDir
 $script:CustomNames = Load-CustomNames
 $script:Groups = Load-Groups
@@ -791,6 +1365,8 @@ $script:ManagedProcesses = @{}
 $script:LogCap = 1000
 $script:LogDir = Join-Path $script:HistoryDir 'logs'
 $script:LogDiskCap = 2000
+$script:AppLogPath = Join-Path $script:LogDir 'app-error.log'
+$script:AppLogDiskCap = 2000
 
 function New-ManagedLogLine {
     param([string]$Text)
@@ -833,6 +1409,66 @@ function Limit-ProjectLogFile {
         Set-Content -Path $path -Value $lines -Encoding UTF8
     } catch {}
 }
+
+# App-level failures (as opposed to a managed dev server crashing) -
+# startup errors, unhandled exceptions in event handlers, things that don't
+# have a project to attach a per-project log to. Kept separate from the
+# per-project logs above so "is Localhost Manager itself broken" is always
+# one file, regardless of which project (if any) was involved.
+function Write-AppErrorLog {
+    param([string]$Context, [System.Exception]$Exception, [string]$Extra, [ValidateSet('Error', 'Warning')][string]$Level = 'Error')
+    try {
+        if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+        $lines = @("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$($Level.ToUpper())] $Context")
+        if ($Exception) {
+            $lines += "    $($Exception.GetType().FullName): $($Exception.Message)"
+            if ($Exception.StackTrace) {
+                $lines += ($Exception.StackTrace -split "`r?`n" | ForEach-Object { "    $_" })
+            }
+        }
+        if ($Extra) { $lines += "    $Extra" }
+        Add-Content -Path $script:AppLogPath -Value $lines -Encoding UTF8
+        $existing = @(Get-Content -Path $script:AppLogPath -ErrorAction Stop)
+        if ($existing.Count -gt $script:AppLogDiskCap) {
+            Set-Content -Path $script:AppLogPath -Value ($existing | Select-Object -Last $script:AppLogDiskCap) -Encoding UTF8
+        }
+    } catch {}
+}
+
+# Each logged failure starts with a "[yyyy-MM-dd HH:mm:ss] Context" line,
+# optionally followed by indented detail lines - counting matches of that
+# header pattern gives an entry count without having to parse the whole
+# file into structured records just to answer "is anything wrong?".
+function Get-AppErrorLogStats {
+    $stats = [PSCustomObject]@{ Count = 0; LastText = $null }
+    if (-not (Test-Path $script:AppLogPath)) { return $stats }
+    try {
+        $headers = @(Get-Content -Path $script:AppLogPath -ErrorAction Stop |
+            Where-Object { $_ -match '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]' })
+        $stats.Count = $headers.Count
+        if ($headers.Count -gt 0 -and $headers[-1] -match '^\[([^\]]+)\]\s*(?:\[(?:ERROR|WARNING)\]\s*)?(.*)$') {
+            $stats.LastText = "$($matches[2]) ($($matches[1]))"
+        }
+    } catch {}
+    return $stats
+}
+
+# Belt-and-suspenders net for the many event handlers below (timer ticks,
+# grid/menu click handlers, Register-ObjectEvent callbacks) that have no
+# try/catch of their own - without this, an exception raised inside one of
+# those just vanishes (or takes the whole message loop down) with nothing
+# on disk to explain why. This does NOT replace the explicit
+# Write-AppErrorLog calls at specific failure points below; those give
+# better context than "an unhandled exception happened somewhere".
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) | Out-Null
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    Write-AppErrorLog -Context 'Unhandled UI exception' -Exception $e.Exception
+})
+[System.AppDomain]::CurrentDomain.add_UnhandledException({
+    param($sender, $e)
+    Write-AppErrorLog -Context 'Unhandled exception (fatal)' -Exception ($e.ExceptionObject -as [System.Exception])
+})
 
 function Add-ManagedLog {
     param($Entry, [string]$Text)
@@ -879,7 +1515,7 @@ function New-ToggleSwitch {
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $isOn = $s.Tag.Checked
-        $bg = if ($isOn) { $script:Theme.Accent } else { [System.Drawing.Color]::FromArgb(0xC6, 0xC6, 0xC6) }
+        $bg = if ($isOn) { $script:Theme.Accent } else { $script:Theme.ToggleOff }
         $d = $s.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
         $path.AddArc(0, 0, $d, $d, 90, 180)
@@ -947,7 +1583,7 @@ function New-DashboardPill {
         $t = $s.Tag
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { [System.Drawing.Color]::White }
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
         $g.Clear($parentColor)
 
         $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
@@ -1031,6 +1667,7 @@ $form.MinimumSize = New-Object System.Drawing.Size(700, 400)
 $form.Icon = $script:IconOk
 $form.BackColor = $script:Theme.WindowBg
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+Set-DarkTitleBar -FormControl $form
 
 # ---------------------------------------------------------------------------
 # Menu bar — the standard File / Settings / About a desktop app is expected
@@ -1039,10 +1676,11 @@ $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 # the tray Exit path); no persistence/business logic lives here.
 # ---------------------------------------------------------------------------
 $menuStrip = New-Object System.Windows.Forms.MenuStrip
-$menuStrip.BackColor = [System.Drawing.Color]::White
+$menuStrip.BackColor = $script:Theme.CardBg
 $menuStrip.ForeColor = $script:Theme.TextPrimary
 $menuStrip.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $menuStrip.Padding = New-Object System.Windows.Forms.Padding(8, 3, 0, 3)
+if ($script:MenuRenderer) { $menuStrip.Renderer = $script:MenuRenderer }
 
 $menuFile = New-Object System.Windows.Forms.ToolStripMenuItem('File')
 $menuFileRefresh = New-Object System.Windows.Forms.ToolStripMenuItem('Refresh')
@@ -1088,6 +1726,28 @@ $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
 Enable-RoundedPopup -Popup $menuFile.DropDown -Radius 8
 Enable-RoundedPopup -Popup $menuSettings.DropDown -Radius 8
+# Each top-level item's DropDown is a separate auto-created
+# ToolStripDropDownMenu, not the MenuStrip itself - it doesn't inherit
+# $menuStrip.ForeColor, so its item text defaulted to black regardless of
+# the (dark, in dark mode) background Enable-RoundedPopup gives it.
+$menuFile.DropDown.ForeColor = $script:Theme.TextPrimary
+$menuSettings.DropDown.ForeColor = $script:Theme.TextPrimary
+
+# By default, once one top-level menu is opened by a click, MenuStrip lets
+# you switch to the next one just by hovering over it - standard Windows
+# behavior, but not wanted here: every menu should need its own explicit
+# click. A click-triggered open happens while the mouse button is still
+# physically down (menus open on mouse-DOWN, not mouse-up, to support the
+# classic press-drag-release gesture); a hover-triggered auto-switch to a
+# sibling item happens with no button held at all. Checking MouseButtons at
+# Opening time (fires for both cases) tells them apart without needing to
+# track clicks ourselves.
+foreach ($topItem in @($menuFile, $menuSettings)) {
+    $topItem.DropDown.Add_Opening({
+        param($s, $e)
+        if ([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::None) { $e.Cancel = $true }
+    })
+}
 
 $topPanel = New-Object System.Windows.Forms.Panel
 $topPanel.Dock = 'Top'
@@ -1215,11 +1875,9 @@ $scopeLabel.Anchor = 'Top,Right'
 $script:BottomBar.Controls.AddRange(@($statusLabel, $scopeLabel, $script:BottomBarDivider))
 
 $groupsButton = New-Object System.Windows.Forms.Button
-$groupsButton.Text = 'Groups: none selected'
-$groupsButton.TextAlign = 'MiddleLeft'
-$groupsButton.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+$groupsButton.Text = 'Groups'
 $groupsButton.Location = New-Object System.Drawing.Point(112, 12)
-$groupsButton.Size = New-Object System.Drawing.Size(150, 28)
+$groupsButton.Size = New-Object System.Drawing.Size(84, 28)
 
 # Multi-select "dropdown": a plain Button that pops open a checked-list so
 # 2+ groups can be active in the table at once (a normal ComboBox only
@@ -1235,6 +1893,8 @@ $groupsCheckedList.BorderStyle = 'None'
 $groupsCheckedList.IntegralHeight = $false
 $groupsCheckedList.Size = New-Object System.Drawing.Size(200, 130)
 $groupsCheckedList.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$groupsCheckedList.BackColor = $script:Theme.CardBg
+$groupsCheckedList.ForeColor = $script:Theme.TextPrimary
 
 $groupsListHost = New-Object System.Windows.Forms.ToolStripControlHost($groupsCheckedList)
 $groupsListHost.AutoSize = $false
@@ -1244,8 +1904,8 @@ $groupsPopup.Items.Add($groupsListHost) | Out-Null
 
 Initialize-ModernButton -Button $refreshButton
 Initialize-ModernButton -Button $groupsButton
-Initialize-ModernButton -Button $startAllButton -Variant Success
-Initialize-ModernButton -Button $stopAllButton -Variant Danger
+Initialize-ModernButton -Button $startAllButton -Variant Success -Icon Play
+Initialize-ModernButton -Button $stopAllButton -Variant Danger -Icon Square
 
 [System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $startAllButton, $stopAllButton, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
@@ -1257,7 +1917,7 @@ function Update-SystemTabState {
     # below - the tab stays visible/discoverable, its content just goes
     # inert and swaps in an explanatory placeholder instead of an empty grid.
     $show = [bool]$script:Settings.ShowSystemPorts
-    $tabPageSystem.Enabled = $show
+    Set-CustomTabEnabled -TabSet $script:MainTabs -Index 2 -Enabled $show
     $systemGrid.Visible = $show
     $systemPlaceholderLabel.Visible = -not $show
 }
@@ -1272,8 +1932,11 @@ function Update-GroupsVisibility {
 }
 
 function Update-GroupsButtonText {
+    # Button label stays a static "Groups" to match the other toolbar
+    # buttons; the selection detail moves to a hover tooltip instead.
     $count = $script:SelectedGroups.Count
-    $groupsButton.Text = if ($count -eq 0) { 'Groups: none selected' } elseif ($count -eq 1) { "Group: $($script:SelectedGroups[0])" } else { "Groups: $count selected" }
+    $detail = if ($count -eq 0) { 'None selected' } elseif ($count -eq 1) { "Selected: $($script:SelectedGroups[0])" } else { "Selected: $count groups" }
+    $script:DashboardTip.SetToolTip($groupsButton, $detail)
 }
 
 function Sync-GroupsCheckedList {
@@ -1351,7 +2014,7 @@ function New-PortsGrid {
     $g.ColumnHeadersHeightSizeMode = 'DisableResizing'
     $g.ColumnHeadersHeight = 34
     $g.RowTemplate.Height = 32
-    $g.DefaultCellStyle.BackColor = [System.Drawing.Color]::White
+    $g.DefaultCellStyle.BackColor = $script:Theme.CardBg
     $g.DefaultCellStyle.ForeColor = $script:Theme.TextPrimary
     $g.DefaultCellStyle.SelectionBackColor = $script:Theme.AccentTint
     $g.DefaultCellStyle.SelectionForeColor = $script:Theme.TextPrimary
@@ -1365,15 +2028,15 @@ function New-PortsGrid {
     $colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
 
-    # Icon-only toggle button - always the same glyph, colored per row (see
-    # Add-DataRow) rather than swapped between a "pin"/"unpin" glyph pair,
-    # so clicking it can't cause a visible layout jump.
-    $colPin = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    # Icon-only toggle, colored per row (see Add-DataRow) rather than swapped
+    # between a "pin"/"unpin" glyph pair, so clicking it can't cause a
+    # visible layout jump. Plain text cell rather than a DataGridViewButton
+    # column - the native button chrome paints its own light face regardless
+    # of cell BackColor, which reads fine blended into a white grid but shows
+    # up as a stray light-gray box in dark mode.
+    $colPin = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPin.Name = 'Pin'; $colPin.HeaderText = ''; $colPin.FillWeight = 34; $colPin.MinimumWidth = 32
-    $colPin.Text = [string][char]0xE718
-    $colPin.UseColumnTextForButtonValue = $true
     $colPin.ReadOnly = $true
-    $colPin.FlatStyle = 'Flat'
     $colPin.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 9.5)
     $colPin.DefaultCellStyle.Alignment = 'MiddleCenter'
     $colPin.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
@@ -1396,20 +2059,18 @@ function New-PortsGrid {
     $colPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 162; $colPath.ReadOnly = $true
 
-    $colLog = New-Object System.Windows.Forms.DataGridViewButtonColumn
-    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65; $colLog.Text = 'Restart'
-    $colLog.UseColumnTextForButtonValue = $true
+    $colLog = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 65
     $colLog.ReadOnly = $true
-    $colLog.FlatStyle = 'Flat'
+    $colLog.DefaultCellStyle.Alignment = 'MiddleCenter'
     $colLog.DefaultCellStyle.ForeColor = $script:Theme.TextDim
     $colLog.DefaultCellStyle.SelectionForeColor = $script:Theme.TextDim
     $colLog.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
 
-    $colAction = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    $colAction = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.FillWeight = 60
-    $colAction.UseColumnTextForButtonValue = $false
     $colAction.ReadOnly = $true
-    $colAction.FlatStyle = 'Flat'
+    $colAction.DefaultCellStyle.Alignment = 'MiddleCenter'
 
     [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colPin, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
     $g.Columns.AddRange($gridColumns)
@@ -1445,20 +2106,11 @@ $systemGrid.Columns['Log'].Visible = $false
 $systemGrid.Columns['Action'].Visible = $false
 $systemGrid.Columns['Pin'].Visible = $false
 
-$tabControl = New-Object System.Windows.Forms.TabControl
-$tabControl.Anchor = 'Top,Bottom,Left,Right'
-$tabControl.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-$tabControl.Padding = New-Object System.Drawing.Point(14, 5)
+$script:MainTabs = New-CustomTabControl -Labels @('Live', 'History', 'System')
+$script:MainTabs.Root.Anchor = 'Top,Bottom,Left,Right'
 
-$tabPageLive = New-Object System.Windows.Forms.TabPage
-$tabPageLive.Text = 'Live'
-$tabPageLive.BackColor = $script:Theme.CardBg
-$tabPageLive.Controls.Add($liveGrid)
-
-$tabPageHistory = New-Object System.Windows.Forms.TabPage
-$tabPageHistory.Text = 'History'
-$tabPageHistory.BackColor = $script:Theme.CardBg
-$tabPageHistory.Controls.Add($historyGrid)
+$script:MainTabs.Pages[0].Controls.Add($liveGrid)
+$script:MainTabs.Pages[1].Controls.Add($historyGrid)
 
 $systemPlaceholderLabel = New-Object System.Windows.Forms.Label
 $systemPlaceholderLabel.Text = "System-owned ports are hidden.`r`nEnable `"Show system-owned ports`" in Settings > Preferences to view them here."
@@ -1468,23 +2120,17 @@ $systemPlaceholderLabel.ForeColor = $script:Theme.TextDim
 $systemPlaceholderLabel.BackColor = $script:Theme.CardBg
 $systemPlaceholderLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
 
-$tabPageSystem = New-Object System.Windows.Forms.TabPage
-$tabPageSystem.Text = 'System'
-$tabPageSystem.BackColor = $script:Theme.CardBg
-$tabPageSystem.Controls.Add($systemGrid)
-$tabPageSystem.Controls.Add($systemPlaceholderLabel)
-
-[System.Windows.Forms.TabPage[]]$tabPages = @($tabPageLive, $tabPageHistory, $tabPageSystem)
-$tabControl.TabPages.AddRange($tabPages)
+$script:MainTabs.Pages[2].Controls.Add($systemGrid)
+$script:MainTabs.Pages[2].Controls.Add($systemPlaceholderLabel)
 
 $gridTop = $menuStrip.Height + $topPanel.Height
-$tabControl.Location = New-Object System.Drawing.Point(0, $gridTop)
-$tabControl.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop - $script:BottomBar.Height))
+$script:MainTabs.Root.Location = New-Object System.Drawing.Point(0, $gridTop)
+$script:MainTabs.Root.Size = New-Object System.Drawing.Size($form.ClientSize.Width, ($form.ClientSize.Height - $gridTop - $script:BottomBar.Height))
 
 # Fill/content control added first, then Dock='Top'/'Bottom' controls in
 # reverse visual order (later-added = higher z-order = closer to its dock
 # edge) — the standard WinForms pattern for MenuStrip + toolbar + content.
-$form.Controls.Add($tabControl)
+$form.Controls.Add($script:MainTabs.Root)
 $form.Controls.Add($script:BottomBar)
 $form.Controls.Add($topPanel)
 $form.Controls.Add($menuStrip)
@@ -1493,7 +2139,7 @@ Update-SystemTabState
 
 function Add-DataRow {
     param($Grid, $r)
-    $idx = $Grid.Rows.Add($r.Status, $r.Port, '', $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
+    $idx = $Grid.Rows.Add($r.Status, $r.Port, ([string][char]0xE718), $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
     $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
@@ -1602,9 +2248,10 @@ function Render-Grid {
 
 function Update-TabHeaders {
     param([int]$LiveCount, [int]$HistoryCount, [int]$SystemCount)
-    $tabPageLive.Text = "Live ($LiveCount)"
-    $tabPageHistory.Text = "History ($HistoryCount)"
-    $tabPageSystem.Text = if ([bool]$script:Settings.ShowSystemPorts) { "System ($SystemCount)" } else { 'System' }
+    Set-CustomTabText -TabSet $script:MainTabs -Index 0 -Text "Live ($LiveCount)"
+    Set-CustomTabText -TabSet $script:MainTabs -Index 1 -Text "History ($HistoryCount)"
+    $systemText = if ([bool]$script:Settings.ShowSystemPorts) { "System ($SystemCount)" } else { 'System' }
+    Set-CustomTabText -TabSet $script:MainTabs -Index 2 -Text $systemText
 }
 
 $script:FlashTimer = New-Object System.Windows.Forms.Timer
@@ -1758,9 +2405,12 @@ function Start-ProjectAtPath {
                 $e.Crashed = $true
                 $code = $e.Proc.ExitCode
                 Add-ManagedLog -Entry $e -Text "*** process exited unexpectedly (exit code $code) ***"
+                $label = Split-Path -Leaf $Event.MessageData.ProjectPath
+                Write-AppErrorLog -Context "Project crashed: $label (exit code $code)"
                 try {
-                    $label = Split-Path -Leaf $Event.MessageData.ProjectPath
-                    $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "$label crashed (exit code $code).", [System.Windows.Forms.ToolTipIcon]::Warning)
+                    if ([bool]$script:Settings.CrashNotifications) {
+                        $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "$label crashed (exit code $code).", [System.Windows.Forms.ToolTipIcon]::Warning)
+                    }
                 } catch {}
             }
             $p = $Event.MessageData.SubPrefix
@@ -1775,6 +2425,7 @@ function Start-ProjectAtPath {
 
         return $true
     } catch {
+        Write-AppErrorLog -Context "Failed to start project: $ProjectPath" -Exception $_.Exception
         return $false
     }
 }
@@ -1786,7 +2437,23 @@ function Stop-ProjectById {
     if ($managed -and -not $managed.Proc.HasExited) {
         $managed.StoppedByUser = $true
         try {
-            Start-Process -FilePath 'taskkill.exe' -ArgumentList "/PID $($managed.Proc.Id) /T /F" -WindowStyle Hidden -Wait | Out-Null
+            $killProc = New-Object System.Diagnostics.Process
+            $killProc.StartInfo.FileName = 'taskkill.exe'
+            $killProc.StartInfo.Arguments = "/PID $($managed.Proc.Id) /T /F"
+            $killProc.StartInfo.UseShellExecute = $false
+            $killProc.StartInfo.CreateNoWindow = $true
+            [void]$killProc.Start()
+            # Bounded wait, not -Wait: every caller of Stop-ProjectById (grid
+            # buttons, "stop all", the web dashboard action queue) runs on
+            # the single WinForms UI thread. A slow/stuck taskkill (AV
+            # scanning it, an unkillable detached grandchild process, ...)
+            # must never block that thread indefinitely - that's what froze
+            # the whole app for an hour after a phone-hub restart. If it
+            # doesn't finish in time we just move on; taskkill keeps running
+            # independently and the safety net below still has a shot at it.
+            if (-not $killProc.WaitForExit(3000)) {
+                Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($managed.Proc.Id) ($ProjectPath) - continuing without waiting" -Level Warning
+            }
         } catch {}
         # Safety net: the discovered listening PID is sometimes a grandchild
         # a couple of hops below the wrapper we hold a handle to, and
@@ -1914,6 +2581,7 @@ function Show-LogViewer {
     $dlg.Size = New-Object System.Drawing.Size(760, 520)
     $dlg.StartPosition = 'CenterParent'
     $dlg.MinimumSize = New-Object System.Drawing.Size(420, 260)
+    Set-DarkTitleBar -FormControl $dlg
 
     $textBox = New-Object System.Windows.Forms.TextBox
     $textBox.Multiline = $true
@@ -1990,6 +2658,231 @@ function Show-LogViewer {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+function Show-AppErrorLogViewer {
+    # Same live-tail shape as Show-LogViewer above, but reading the single
+    # flat app-error.log file instead of a per-project in-memory queue, and
+    # colorizing each entry's header line so a scroll through a busy log
+    # reads as a list of incidents rather than a wall of text.
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Error & Crash Log'
+    $dlg.Size = New-Object System.Drawing.Size(780, 520)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimumSize = New-Object System.Drawing.Size(480, 300)
+    $dlg.Icon = $script:IconOk
+    $dlg.BackColor = $script:Theme.WindowBg
+    Set-DarkTitleBar -FormControl $dlg
+
+    $rtb = New-Object System.Windows.Forms.RichTextBox
+    $rtb.Dock = 'Fill'
+    $rtb.ReadOnly = $true
+    # WordWrap on, not off: a long single-line entry (a full exception
+    # message, a stack trace frame) otherwise requires horizontal scrolling,
+    # and RichTextBox auto-scrolls horizontally to follow the caret after
+    # AppendText - which left the START of the line (often the most useful
+    # part) scrolled out of view. Wrapping means everything is always
+    # on-screen without the reader having to scroll sideways to read it.
+    $rtb.WordWrap = $true
+    $rtb.ScrollBars = 'Vertical'
+    $rtb.BorderStyle = 'None'
+    $rtb.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $rtb.BackColor = [System.Drawing.Color]::FromArgb(0x1E, 0x1E, 0x1E)
+    $rtb.ForeColor = [System.Drawing.Color]::Gainsboro
+
+    $bottomPanel = New-Object System.Windows.Forms.Panel
+    $bottomPanel.Dock = 'Bottom'
+    $bottomPanel.Height = 44
+    $bottomPanel.BackColor = $script:Theme.PanelBg
+
+    $filterPanel = New-Object System.Windows.Forms.Panel
+    $filterPanel.Dock = 'Top'
+    $filterPanel.Height = 40
+    $filterPanel.BackColor = $script:Theme.PanelBg
+
+    # Parent rtb/bottomPanel/filterPanel to the form BEFORE adding the
+    # Top,Right-anchored buttons below: anchoring captures its
+    # distance-from-edge baseline against the parent's size at the moment
+    # the child is parented. Adding buttons to a not-yet-docked bottomPanel
+    # (still at its default ~200px design-time width) baselines them
+    # against that wrong width, and once bottomPanel gets its real ~760px
+    # docked width the anchor math throws them far off to the right,
+    # outside the visible window - which is exactly why they went missing.
+    $dlg.Controls.Add($rtb)
+    $dlg.Controls.Add($bottomPanel)
+    $dlg.Controls.Add($filterPanel)
+
+    $filterLbl = New-Object System.Windows.Forms.Label
+    $filterLbl.Text = 'Filter:'
+    $filterLbl.Location = New-Object System.Drawing.Point(12, 12)
+    $filterLbl.Size = New-Object System.Drawing.Size(40, 20)
+    $filterLbl.ForeColor = $script:Theme.TextDim
+
+    $filterBox = New-Object System.Windows.Forms.TextBox
+    $filterBox.Location = New-Object System.Drawing.Point(54, 8)
+    $filterBox.Size = New-Object System.Drawing.Size(320, 24)
+    $filterBox.BorderStyle = 'FixedSingle'
+    $filterBox.BackColor = $script:Theme.CardBg
+    $filterBox.ForeColor = $script:Theme.TextPrimary
+
+    [System.Windows.Forms.Control[]]$filterControls = @($filterLbl, $filterBox)
+    $filterPanel.Controls.AddRange($filterControls)
+
+    $countLbl = New-Object System.Windows.Forms.Label
+    $countLbl.Location = New-Object System.Drawing.Point(12, 15)
+    $countLbl.Size = New-Object System.Drawing.Size(420, 20)
+    $countLbl.ForeColor = $script:Theme.TextDim
+    $countLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $countLbl.AutoEllipsis = $true
+
+    $openFolderButton = New-Object System.Windows.Forms.Button
+    $openFolderButton.Text = 'Open Folder'
+    $openFolderButton.Anchor = 'Top,Right'
+    $openFolderButton.Location = New-Object System.Drawing.Point(475, 8)
+    $openFolderButton.Size = New-Object System.Drawing.Size(95, 28)
+    $openFolderButton.Add_Click({
+        try {
+            if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+            Start-Process explorer.exe $script:LogDir
+        } catch {}
+    })
+    Initialize-ModernButton -Button $openFolderButton
+
+    $clearButton = New-Object System.Windows.Forms.Button
+    $clearButton.Text = 'Clear Log'
+    $clearButton.Anchor = 'Top,Right'
+    $clearButton.Location = New-Object System.Drawing.Point(580, 8)
+    $clearButton.Size = New-Object System.Drawing.Size(85, 28)
+    Initialize-ModernButton -Button $clearButton -Variant Danger
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = 'Close'
+    $closeButton.Anchor = 'Top,Right'
+    $closeButton.Location = New-Object System.Drawing.Point(675, 8)
+    $closeButton.Size = New-Object System.Drawing.Size(80, 28)
+    $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton -Variant Accent
+
+    [System.Windows.Forms.Control[]]$bottomControls = @($countLbl, $openFolderButton, $clearButton, $closeButton)
+    $bottomPanel.Controls.AddRange($bottomControls)
+
+    $headerFont = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold)
+    $bodyFont = New-Object System.Drawing.Font('Consolas', 9)
+    $errorColor = [System.Drawing.Color]::FromArgb(0xFF, 0x8A, 0x65)
+    $warningColor = [System.Drawing.Color]::FromArgb(0xFF, 0xD5, 0x4F)
+    $bodyColor = [System.Drawing.Color]::FromArgb(0xAA, 0xAA, 0xAA)
+    $emptyColor = [System.Drawing.Color]::FromArgb(0x77, 0x77, 0x77)
+    $entryHeaderPattern = '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(?:\[(ERROR|WARNING)\]\s*)?(.*)$'
+
+    # State is an object (not a bare variable) so the nested functions/event
+    # handlers below - which run in this same scope but can only read outer
+    # variables, not reassign them - can still mutate it via property
+    # assignment. Signature bundles the filter text in with the file's raw
+    # content so a filter keystroke forces a re-render exactly like a file
+    # change does, without needing two separate change-tracking paths.
+    $state = [PSCustomObject]@{ Signature = $null }
+
+    function Get-AppLogEntries {
+        # Groups raw lines into per-incident records (header + its indented
+        # detail lines) so filtering/highlighting always keeps a header
+        # together with the detail that explains it, instead of matching
+        # (or hiding) stray lines out of context.
+        param([string]$Text)
+        $entries = @()
+        $current = $null
+        foreach ($line in ($Text -split "`r?`n")) {
+            if ($line -eq '') { continue }
+            if ($line -match $entryHeaderPattern) {
+                if ($current) { $entries += $current }
+                $level = if ($matches[2]) { $matches[2] } else { 'ERROR' }
+                $current = [PSCustomObject]@{
+                    Header  = "[$($matches[1])] $($matches[3])"
+                    Level   = $level
+                    Details = @()
+                }
+            } elseif ($current) {
+                $current.Details += $line
+            }
+        }
+        if ($current) { $entries += $current }
+        return $entries
+    }
+
+    function Update-AppLogText {
+        $text = $null
+        if (Test-Path $script:AppLogPath) {
+            try { $text = Get-Content -Path $script:AppLogPath -Raw -ErrorAction Stop } catch {}
+        }
+        $filter = $filterBox.Text.Trim()
+        $sig = "$filter|$text"
+        if ($sig -eq $state.Signature) { return }
+        $state.Signature = $sig
+
+        $allEntries = if ($text) { @(Get-AppLogEntries -Text $text) } else { @() }
+        $shownEntries = if ($filter) {
+            @($allEntries | Where-Object { $_.Header -like "*$filter*" -or ($_.Details -join "`n") -like "*$filter*" })
+        } else {
+            $allEntries
+        }
+
+        if ($allEntries.Count -eq 0) {
+            $countLbl.Text = "$script:AppLogPath"
+        } elseif ($filter) {
+            $countLbl.Text = "$($shownEntries.Count) of $($allEntries.Count) entries match `"$filter`""
+        } else {
+            $stats = Get-AppErrorLogStats
+            $countLbl.Text = "$($allEntries.Count) entr$(if ($allEntries.Count -eq 1) {'y'} else {'ies'}) - last: $($stats.LastText)"
+        }
+
+        $atBottom = $rtb.SelectionStart -ge ($rtb.TextLength - 2)
+        $rtb.SuspendLayout()
+        $rtb.Clear()
+        if ($shownEntries.Count -eq 0) {
+            $rtb.SelectionColor = $emptyColor
+            $rtb.SelectionFont = $bodyFont
+            $emptyMessage = if ($allEntries.Count -eq 0) {
+                'No errors logged. Startup failures, unhandled exceptions, and dev-server crashes will show up here automatically.'
+            } else {
+                "No entries match `"$filter`"."
+            }
+            $rtb.AppendText($emptyMessage)
+        } else {
+            foreach ($entry in $shownEntries) {
+                $icon = if ($entry.Level -eq 'WARNING') { [char]0x26A0 } else { [char]0x2716 }
+                $rtb.SelectionColor = if ($entry.Level -eq 'WARNING') { $warningColor } else { $errorColor }
+                $rtb.SelectionFont = $headerFont
+                $rtb.AppendText("$icon $($entry.Header)`r`n")
+                foreach ($detail in $entry.Details) {
+                    $rtb.SelectionColor = $bodyColor
+                    $rtb.SelectionFont = $bodyFont
+                    $rtb.AppendText("$detail`r`n")
+                }
+            }
+        }
+        $rtb.ResumeLayout()
+        if ($atBottom) {
+            $rtb.SelectionStart = $rtb.TextLength
+            $rtb.ScrollToCaret()
+        }
+    }
+    Update-AppLogText
+
+    $filterBox.Add_TextChanged({ Update-AppLogText })
+
+    $clearButton.Add_Click({
+        $confirm = [System.Windows.Forms.MessageBox]::Show('Clear the error log? This cannot be undone.', 'Clear Log', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { return }
+        try { if (Test-Path $script:AppLogPath) { Clear-Content -Path $script:AppLogPath -Force } } catch {}
+        Update-AppLogText
+    })
+
+    $liveTimer = New-Object System.Windows.Forms.Timer
+    $liveTimer.Interval = 2000
+    $liveTimer.Add_Tick({ Update-AppLogText })
+    $liveTimer.Start()
+    $dlg.Add_FormClosed({ $liveTimer.Stop() })
+
+    $dlg.ShowDialog($form) | Out-Null
+}
+
 function Show-RowDetail {
     # Sticky-note style: compact, appears right at the click point, and
     # nothing in the body is a clickable/editable control except the copy
@@ -2033,8 +2926,8 @@ function Show-RowDetail {
     $topMargin = 8
     $dlgWidth = 420
     $clientHeight = $topMargin + ($fields.Count * $rowHeight) + 38
-    $purpleBg = [System.Drawing.Color]::FromArgb(0xEA, 0xDD, 0xF7)
-    $purpleAccent = [System.Drawing.Color]::FromArgb(0x6A, 0x1B, 0x9A)
+    $purpleBg = if ($script:Theme.IsDark) { [System.Drawing.Color]::FromArgb(0x3A, 0x2E, 0x47) } else { [System.Drawing.Color]::FromArgb(0xEA, 0xDD, 0xF7) }
+    $purpleAccent = if ($script:Theme.IsDark) { [System.Drawing.Color]::FromArgb(0xC7, 0x9A, 0xF0) } else { [System.Drawing.Color]::FromArgb(0x6A, 0x1B, 0x9A) }
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Details - $label"
@@ -2045,6 +2938,7 @@ function Show-RowDetail {
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
 
     $screenArea = [System.Windows.Forms.Screen]::FromPoint($ScreenPoint).WorkingArea
     $px = [Math]::Max($screenArea.Left, [Math]::Min($ScreenPoint.X, $screenArea.Right - $dlg.Width))
@@ -2247,11 +3141,24 @@ function Show-AboutDialog {
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.Icon = $script:IconOk
-    $dlg.BackColor = [System.Drawing.Color]::White
+    $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
 
     $iconBox = New-Object System.Windows.Forms.PictureBox
-    $iconBox.Image = $script:IconOk.ToBitmap()
+    # Icon.ToBitmap() corrupts into colored static for modern .ico files
+    # whose larger frames are embedded as PNG (GDI+'s bitmap-conversion
+    # path doesn't decode those correctly) - Graphics.DrawIcon goes through
+    # Windows' own icon renderer instead, which handles PNG-frame icons
+    # fine. Form.Icon/NotifyIcon.Icon elsewhere in the app hand the Icon
+    # object straight to Windows already, which is why only this one spot
+    # (the only .ToBitmap() call in the file) ever showed the corruption.
+    $iconBmp = New-Object System.Drawing.Bitmap(48, 48)
+    $iconGfx = [System.Drawing.Graphics]::FromImage($iconBmp)
+    $iconGfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $iconGfx.DrawIcon($script:IconOk, (New-Object System.Drawing.Rectangle(0, 0, 48, 48)))
+    $iconGfx.Dispose()
+    $iconBox.Image = $iconBmp
     $iconBox.SizeMode = 'CenterImage'
     $iconBox.Location = New-Object System.Drawing.Point(20, 24)
     $iconBox.Size = New-Object System.Drawing.Size(48, 48)
@@ -2264,7 +3171,7 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.7.0'
+    $versionLabel.Text = 'Version 1.8.4'
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
@@ -2298,17 +3205,44 @@ function Show-AboutDialog {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+function New-SettingsSectionLabel {
+    # Small bold section heading used to break up a settings tab without a
+    # full GroupBox - matches the "Diagnostics" heading the dialog already
+    # had, just reusable across every tab now that there are several.
+    param([string]$Text, [int]$X, [int]$Y)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $Text
+    $l.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $l.Location = New-Object System.Drawing.Point($X, $Y)
+    $l.Size = New-Object System.Drawing.Size(300, 20)
+    $l.ForeColor = $script:Theme.TextPrimary
+    return $l
+}
+
 function Show-SettingsDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Settings'
-    $dlg.Size = New-Object System.Drawing.Size(480, 270)
+    $dlg.Size = New-Object System.Drawing.Size(500, 430)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
 
+    $tabs = New-CustomTabControl -Labels @('General', 'Appearance', 'Startup', 'Diagnostics')
+    $tabs.Root.Location = New-Object System.Drawing.Point(12, 12)
+    $tabs.Root.Size = New-Object System.Drawing.Size(464, 330)
+    foreach ($p in $tabs.Pages) { $p.BackColor = $script:Theme.WindowBg }
+    $tabs.Root.BackColor = $script:Theme.WindowBg
+
+    $tabGeneral = $tabs.Pages[0]
+    $tabAppearance = $tabs.Pages[1]
+    $tabStartup = $tabs.Pages[2]
+    $tabDiagnostics = $tabs.Pages[3]
+
+    # --- General ------------------------------------------------------------
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = 'Only show projects under this root directory:'
     $lbl.Location = New-Object System.Drawing.Point(15, 15)
@@ -2318,15 +3252,15 @@ function Show-SettingsDialog {
     $pathBox = New-Object System.Windows.Forms.TextBox
     $pathBox.Text = $script:RootDir
     $pathBox.Location = New-Object System.Drawing.Point(15, 40)
-    $pathBox.Size = New-Object System.Drawing.Size(330, 24)
+    $pathBox.Size = New-Object System.Drawing.Size(315, 24)
     $pathBox.ReadOnly = $true
     $pathBox.BorderStyle = 'FixedSingle'
-    $pathBox.BackColor = [System.Drawing.Color]::White
+    $pathBox.BackColor = $script:Theme.CardBg
     $pathBox.ForeColor = $script:Theme.TextPrimary
 
     $browseButton = New-Object System.Windows.Forms.Button
     $browseButton.Text = 'Browse...'
-    $browseButton.Location = New-Object System.Drawing.Point(355, 39)
+    $browseButton.Location = New-Object System.Drawing.Point(340, 39)
     $browseButton.Size = New-Object System.Drawing.Size(95, 26)
     $browseButton.Add_Click({
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -2343,38 +3277,121 @@ function Show-SettingsDialog {
     Initialize-ModernButton -Button $clearButton
 
     $systemPortsSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.ShowSystemPorts)
-    $systemPortsSwitch.Location = New-Object System.Drawing.Point(15, 116)
+    $systemPortsSwitch.Location = New-Object System.Drawing.Point(15, 121)
 
     $systemPortsLbl = New-Object System.Windows.Forms.Label
     $systemPortsLbl.Text = 'Show system-owned ports'
-    $systemPortsLbl.Location = New-Object System.Drawing.Point(60, 116)
+    $systemPortsLbl.Location = New-Object System.Drawing.Point(60, 121)
     $systemPortsLbl.Size = New-Object System.Drawing.Size(250, 20)
     $systemPortsLbl.ForeColor = $script:Theme.TextPrimary
     Connect-ToggleLabel -Switch $systemPortsSwitch -Label $systemPortsLbl
 
     $systemPortsHintLbl = New-Object System.Windows.Forms.Label
     $systemPortsHintLbl.Text = "Adds a System tab for ports owned by OS processes (System, svchost, lsass, ...) - e.g. a kernel http.sys listener shadowing a port you meant to use yourself. Read-only: nothing here can be stopped or restarted."
-    $systemPortsHintLbl.Location = New-Object System.Drawing.Point(15, 142)
-    $systemPortsHintLbl.Size = New-Object System.Drawing.Size(435, 48)
+    $systemPortsHintLbl.Location = New-Object System.Drawing.Point(15, 147)
+    $systemPortsHintLbl.Size = New-Object System.Drawing.Size(420, 48)
     $systemPortsHintLbl.ForeColor = $script:Theme.TextDim
     $systemPortsHintLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
 
+    $tabGeneral.Controls.AddRange(@($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl))
+
+    # --- Appearance -----------------------------------------------------------
+    $themeLbl = New-SettingsSectionLabel -Text 'Theme' -X 15 -Y 15
+
+    $themeLightRadio = New-Object System.Windows.Forms.RadioButton
+    $themeLightRadio.Text = 'Light'
+    $themeLightRadio.Location = New-Object System.Drawing.Point(18, 42)
+    $themeLightRadio.Size = New-Object System.Drawing.Size(100, 22)
+    $themeLightRadio.ForeColor = $script:Theme.TextPrimary
+    $themeLightRadio.Checked = ($script:Settings.Theme -ne 'Dark')
+
+    $themeDarkRadio = New-Object System.Windows.Forms.RadioButton
+    $themeDarkRadio.Text = 'Dark'
+    $themeDarkRadio.Location = New-Object System.Drawing.Point(18, 68)
+    $themeDarkRadio.Size = New-Object System.Drawing.Size(100, 22)
+    $themeDarkRadio.ForeColor = $script:Theme.TextPrimary
+    $themeDarkRadio.Checked = ($script:Settings.Theme -eq 'Dark')
+
+    $themeHintLbl = New-Object System.Windows.Forms.Label
+    $themeHintLbl.Text = 'Applies after a restart - you will be offered one automatically if you change this.'
+    $themeHintLbl.Location = New-Object System.Drawing.Point(15, 98)
+    $themeHintLbl.Size = New-Object System.Drawing.Size(420, 32)
+    $themeHintLbl.ForeColor = $script:Theme.TextDim
+    $themeHintLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+
+    $tabAppearance.Controls.AddRange(@($themeLbl, $themeLightRadio, $themeDarkRadio, $themeHintLbl))
+
+    # --- Startup ----------------------------------------------------------
+    $launchSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.LaunchAtStartup)
+    $launchSwitch.Location = New-Object System.Drawing.Point(15, 15)
+
+    $launchLbl = New-Object System.Windows.Forms.Label
+    $launchLbl.Text = 'Launch at Windows startup'
+    $launchLbl.Location = New-Object System.Drawing.Point(60, 15)
+    $launchLbl.Size = New-Object System.Drawing.Size(300, 20)
+    $launchLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $launchSwitch -Label $launchLbl
+
+    $minimizedSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.StartMinimized)
+    $minimizedSwitch.Location = New-Object System.Drawing.Point(15, 51)
+
+    $minimizedLbl = New-Object System.Windows.Forms.Label
+    $minimizedLbl.Text = 'Start minimized to tray'
+    $minimizedLbl.Location = New-Object System.Drawing.Point(60, 51)
+    $minimizedLbl.Size = New-Object System.Drawing.Size(300, 20)
+    $minimizedLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $minimizedSwitch -Label $minimizedLbl
+
+    $crashNotifSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.CrashNotifications)
+    $crashNotifSwitch.Location = New-Object System.Drawing.Point(15, 87)
+
+    $crashNotifLbl = New-Object System.Windows.Forms.Label
+    $crashNotifLbl.Text = 'Notify me when a tracked dev server crashes'
+    $crashNotifLbl.Location = New-Object System.Drawing.Point(60, 87)
+    $crashNotifLbl.Size = New-Object System.Drawing.Size(300, 20)
+    $crashNotifLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $crashNotifSwitch -Label $crashNotifLbl
+
+    $tabStartup.Controls.AddRange(@($launchSwitch, $launchLbl, $minimizedSwitch, $minimizedLbl, $crashNotifSwitch, $crashNotifLbl))
+
+    # --- Diagnostics --------------------------------------------------------
+    $logStats = Get-AppErrorLogStats
+    $pillTone = if ($logStats.Count -gt 0) { 'Danger' } else { 'Success' }
+    $pillText = if ($logStats.Count -gt 0) { "$($logStats.Count) logged" } else { 'All clear' }
+    $diagPill = New-StatusPill -Text $pillText -Tone $pillTone
+    $diagPill.Location = New-Object System.Drawing.Point(15, 16)
+
+    $diagDescLbl = New-Object System.Windows.Forms.Label
+    $diagDescLbl.Text = 'Startup failures, unhandled exceptions, and dev-server crashes are recorded automatically so you have something to check after the app misbehaves.'
+    $diagDescLbl.Location = New-Object System.Drawing.Point(15, 46)
+    $diagDescLbl.Size = New-Object System.Drawing.Size(420, 40)
+    $diagDescLbl.ForeColor = $script:Theme.TextDim
+    $diagDescLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+
+    $viewLogButton = New-Object System.Windows.Forms.Button
+    $viewLogButton.Text = 'View Log'
+    $viewLogButton.Location = New-Object System.Drawing.Point(15, 92)
+    $viewLogButton.Size = New-Object System.Drawing.Size(95, 26)
+    $viewLogButton.Add_Click({ Show-AppErrorLogViewer })
+    Initialize-ModernButton -Button $viewLogButton
+
+    $tabDiagnostics.Controls.AddRange(@($diagPill, $diagDescLbl, $viewLogButton))
+
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'OK'
-    $okButton.Location = New-Object System.Drawing.Point(275, 195)
+    $okButton.Location = New-Object System.Drawing.Point(295, 355)
     $okButton.Size = New-Object System.Drawing.Size(85, 28)
     $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
     Initialize-ModernButton -Button $okButton -Variant Accent
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Cancel'
-    $cancelButton.Location = New-Object System.Drawing.Point(365, 195)
+    $cancelButton.Location = New-Object System.Drawing.Point(385, 355)
     $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
     $cancelButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $cancelButton
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl, $okButton, $cancelButton)
-    $dlg.Controls.AddRange($dlgControls)
+    $dlg.Controls.AddRange(@($tabs.Root, $okButton, $cancelButton))
     $dlg.AcceptButton = $okButton
     $dlg.ShowDialog($form) | Out-Null
 
@@ -2382,10 +3399,27 @@ function Show-SettingsDialog {
         $script:RootDir = $pathBox.Text
         $script:Settings.RootDir = $script:RootDir
         $script:Settings.ShowSystemPorts = Get-ToggleChecked $systemPortsSwitch
+
+        $newTheme = if ($themeDarkRadio.Checked) { 'Dark' } else { 'Light' }
+        $themeChanged = $newTheme -ne $script:Settings.Theme
+        $script:Settings.Theme = $newTheme
+
+        $newLaunchAtStartup = Get-ToggleChecked $launchSwitch
+        if ($newLaunchAtStartup -ne [bool]$script:Settings.LaunchAtStartup) { Set-LaunchAtStartup -Enable $newLaunchAtStartup }
+        $script:Settings.LaunchAtStartup = $newLaunchAtStartup
+
+        $script:Settings.StartMinimized = Get-ToggleChecked $minimizedSwitch
+        $script:Settings.CrashNotifications = Get-ToggleChecked $crashNotifSwitch
+
         Save-Settings $script:Settings
         Update-ScopeLabel
         Update-SystemTabState
         Refresh-Grid
+
+        if ($themeChanged) {
+            $restart = [System.Windows.Forms.MessageBox]::Show('Restart Localhost Manager now to apply the new theme?', 'Theme Changed', 'YesNo', 'Question')
+            if ($restart -eq 'Yes') { Restart-App }
+        }
     }
 }
 
@@ -2399,6 +3433,7 @@ function Show-DashboardDialog {
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
 
     $introLbl = New-Object System.Windows.Forms.Label
     $introLbl.Text = 'View the current table and stop/restart projects from a browser, on this PC or (once you set up reachability) your LAN/Tailnet.'
@@ -2551,6 +3586,7 @@ function Show-ManageGroupsDialog {
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    Set-DarkTitleBar -FormControl $dlg
 
     $nameLabel = New-Object System.Windows.Forms.Label
     $nameLabel.Text = 'Group name:'
@@ -2705,7 +3741,11 @@ function Start-GroupAll {
 }
 
 function Stop-GroupAll {
-    param([string[]]$Names)
+    # -SkipConfirm is set by the Stop All button, which now gets its
+    # confirmation from the inline arm/confirm morph (see Disarm-StopAllButton
+    # below) instead of this blocking dialog. The per-group context-menu
+    # item still calls this without -SkipConfirm, so it keeps the dialog.
+    param([string[]]$Names, [switch]$SkipConfirm)
 
     $Names = @($Names | Where-Object { $_ -and $script:Groups.ContainsKey($_) })
     if ($Names.Count -eq 0) {
@@ -2722,9 +3762,11 @@ function Stop-GroupAll {
         [System.Windows.Forms.MessageBox]::Show("Nothing in '$label' is currently running.", 'Nothing to Stop', 'OK', 'Information') | Out-Null
         return
     }
-    $list = ($toStop | ForEach-Object { "$($_.ProcessName) (port $($_.Port))" }) -join "`n"
-    $confirm = [System.Windows.Forms.MessageBox]::Show("Stop these $($toStop.Count) process(es)?`n`n$list", 'Confirm Stop All', 'YesNo', 'Warning')
-    if ($confirm -ne 'Yes') { return }
+    if (-not $SkipConfirm) {
+        $list = ($toStop | ForEach-Object { "$($_.ProcessName) (port $($_.Port))" }) -join "`n"
+        $confirm = [System.Windows.Forms.MessageBox]::Show("Stop these $($toStop.Count) process(es)?`n`n$list", 'Confirm Stop All', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { return }
+    }
 
     $stopped = 0
     foreach ($row in $toStop) {
@@ -2734,14 +3776,107 @@ function Stop-GroupAll {
     [System.Windows.Forms.MessageBox]::Show("Stopped $stopped of $($toStop.Count) process(es) in '$label'.", 'Stop All', 'OK', 'Information') | Out-Null
 }
 
-$startAllButton.Add_Click({ Start-GroupAll -Names $script:SelectedGroups })
-$stopAllButton.Add_Click({ Stop-GroupAll -Names $script:SelectedGroups })
+# Stop All is destructive, so it keeps a confirm step — but as an inline
+# button morph (icon+text crossfade to a solid "Confirm?" state) instead of
+# a blocking MessageBox, echoing the two-step delete-button pattern. First
+# click arms it; a second click within 3s (or the button's own re-click)
+# actually stops things. It auto-disarms on timeout, on losing window focus,
+# or if the user starts something else from the toolbar first.
+$script:StopAllArmed = $false
+$script:StopAllDisarmTimer = New-Object System.Windows.Forms.Timer
+$script:StopAllDisarmTimer.Interval = 3000
+
+function Disarm-StopAllButton {
+    if (-not $script:StopAllArmed) { return }
+    $script:StopAllArmed = $false
+    $script:StopAllDisarmTimer.Stop()
+    $stopAllButton.Tag.SplitMode = $false
+    Start-ButtonMorph -Button $stopAllButton -Icon 'Square' -Text 'Stop All' -Variant 'Danger'
+}
+
+function Enter-StopAllConfirmState {
+    # Snaps straight into the split (cancel | confirm) render - no
+    # crossfade, since Draw-ButtonContent's icon/text morph doesn't know how
+    # to animate into two independently-clipped halves.
+    $t = $stopAllButton.Tag
+    $t.Icon = 'Check'
+    $t.DisplayText = 'Confirm?'
+    $t.PrevIcon = $null
+    $t.PrevText = $null
+    $t.AnimProgress = 1.0
+    $t.SplitMode = $true
+    $t.SplitAccent = $script:Theme.Danger
+    $stopAllButton.Invalidate()
+}
+
+# Start All isn't destructive, but a misclick still spins up every stopped
+# project in the group - same inline split-pill confirm as Stop All, just
+# green instead of red, so backing out is as easy as getting into it.
+$script:StartAllArmed = $false
+$script:StartAllDisarmTimer = New-Object System.Windows.Forms.Timer
+$script:StartAllDisarmTimer.Interval = 3000
+
+function Disarm-StartAllButton {
+    if (-not $script:StartAllArmed) { return }
+    $script:StartAllArmed = $false
+    $script:StartAllDisarmTimer.Stop()
+    $startAllButton.Tag.SplitMode = $false
+    Start-ButtonMorph -Button $startAllButton -Icon 'Play' -Text 'Start All' -Variant 'Success'
+}
+
+function Enter-StartAllConfirmState {
+    $t = $startAllButton.Tag
+    $t.Icon = 'Check'
+    $t.DisplayText = 'Confirm?'
+    $t.PrevIcon = $null
+    $t.PrevText = $null
+    $t.AnimProgress = 1.0
+    $t.SplitMode = $true
+    $t.SplitAccent = $script:Theme.Success
+    $startAllButton.Invalidate()
+}
+
+$script:StopAllDisarmTimer.Add_Tick({ Disarm-StopAllButton })
+$script:StartAllDisarmTimer.Add_Tick({ Disarm-StartAllButton })
+$form.Add_Deactivate({ Disarm-StopAllButton; Disarm-StartAllButton })
+
+$startAllButton.Add_Click({
+    Disarm-StopAllButton
+    if (-not $script:StartAllArmed) {
+        $script:StartAllArmed = $true
+        Enter-StartAllConfirmState
+        $script:StartAllDisarmTimer.Stop()
+        $script:StartAllDisarmTimer.Start()
+        return
+    }
+    $clickedCancel = $startAllButton.Tag.LastMouseDownX -lt ($startAllButton.Width / 2.0)
+    Disarm-StartAllButton
+    if ($clickedCancel) { return }
+    Start-GroupAll -Names $script:SelectedGroups
+})
+$stopAllButton.Add_Click({
+    Disarm-StartAllButton
+    if (-not $script:StopAllArmed) {
+        $script:StopAllArmed = $true
+        Enter-StopAllConfirmState
+        $script:StopAllDisarmTimer.Stop()
+        $script:StopAllDisarmTimer.Start()
+        return
+    }
+    # Split pill is live: left half (X) cancels, right half (check) confirms.
+    $clickedCancel = $stopAllButton.Tag.LastMouseDownX -lt ($stopAllButton.Width / 2.0)
+    Disarm-StopAllButton
+    if ($clickedCancel) { return }
+    Stop-GroupAll -Names $script:SelectedGroups -SkipConfirm
+})
 
 # ---------------------------------------------------------------------------
 # System tray
 # ---------------------------------------------------------------------------
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 Enable-RoundedPopup -Popup $trayMenu -Radius 8
+$trayMenu.ForeColor = $script:Theme.TextPrimary
+if ($script:MenuRenderer) { $trayMenu.Renderer = $script:MenuRenderer }
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = $script:IconOk
@@ -2758,6 +3893,20 @@ function Restore-MainWindow {
 $notifyIcon.Add_MouseClick({
     param($s, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Restore-MainWindow }
+})
+
+# Rebuild the menu items here, on MouseUp, rather than relying solely on
+# ContextMenuStrip's own Opening event. NotifyIcon picks the popup's
+# on-screen position (including whether to flip it above the cursor to
+# clear the taskbar) using the strip's size at the moment it decides to
+# show it, which happens right after this event — Opening fires too late,
+# so if the item count grew since the last show (e.g. a project was
+# added), the position was still computed from the old, shorter menu and
+# the taller one ends up rendered partly behind the taskbar. Building here
+# guarantees the strip is already its final size before that calculation.
+$notifyIcon.Add_MouseUp({
+    param($s, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { Build-TrayMenuItems }
 })
 
 function Update-TrayIcon {
@@ -2817,6 +3966,7 @@ function Build-TrayMenuItems {
         $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
         foreach ($groupName in ($script:Groups.Keys | Sort-Object)) {
             $groupItem = New-Object System.Windows.Forms.ToolStripMenuItem "Group: $groupName"
+            $groupItem.DropDown.ForeColor = $script:Theme.TextPrimary
             $capturedName = $groupName
 
             $startItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Start All'
@@ -2866,7 +4016,7 @@ $form.Add_FormClosing({
     }
 })
 
-$refreshButton.Add_Click({ Refresh-Grid })
+$refreshButton.Add_Click({ Disarm-StopAllButton; Disarm-StartAllButton; Refresh-Grid })
 Set-ToggleOnChange -Switch $nodeOnlySwitch -Handler {
     $script:Settings.OnlyNode = Get-ToggleChecked $nodeOnlySwitch
     Save-Settings $script:Settings
@@ -3345,6 +4495,7 @@ $script:DashboardActionTimer.Add_Tick({
         $script:DashboardCache.Addresses = @(Get-DashboardAddresses -Port $script:DashboardCache.Port)
     } elseif ($script:DashboardCache.ListenError -and -not $script:DashboardNotifiedFailure) {
         $script:DashboardNotifiedFailure = $true
+        Write-AppErrorLog -Context "Web dashboard failed to start on port $($script:DashboardCache.Port)" -Extra $script:DashboardCache.ListenError
         try {
             $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "Web dashboard failed to start on port $($script:DashboardCache.Port): $($script:DashboardCache.ListenError)", [System.Windows.Forms.ToolTipIcon]::Warning)
         } catch {}
@@ -3369,6 +4520,15 @@ try {
     }
     Update-DashboardPill
 } catch {
+    Write-AppErrorLog -Context 'Startup error' -Exception $_.Exception
     [System.Windows.Forms.MessageBox]::Show("Startup error: $_", 'Error') | Out-Null
 }
+
+if ([bool]$script:Settings.StartMinimized) {
+    # Same hide-not-close idiom as FormClosing: the window still gets
+    # created (so first-show layout/handle creation happens normally),
+    # it just never becomes visible - straight to the tray icon.
+    $form.Add_Shown({ $form.Hide() })
+}
+
 [System.Windows.Forms.Application]::Run($form)
