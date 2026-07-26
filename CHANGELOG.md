@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.6] - 2026-07-26
+
+### Added
+- **Check for Updates** (Help menu): compares the running version against
+  GitHub's latest release tag on startup (Settings ▸ Startup, on by
+  default) and on demand. A found update shows a tray balloon (click to
+  open the download page) and a link in the About dialog; the on-demand
+  check also confirms when you're already up to date. The network call
+  runs on a background runspace so a slow/offline check never blocks the UI
+- **Backup Settings... / Restore Backup...** (File menu): zips
+  settings/groups/history/custom-names into a single `.lhmbackup` file and
+  can restore one back, for moving to a new machine or recovering after a
+  reinstall. Restoring confirms first and restarts the app to reload
+
 ## [1.8.5] - 2026-07-26
 
 ### Fixed

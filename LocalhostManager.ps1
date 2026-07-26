@@ -193,7 +193,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Light'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Light'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -206,6 +206,7 @@ function Load-Settings {
         $launchAtStartup = if ($raw.PSObject.Properties.Name -contains 'LaunchAtStartup') { [bool]$raw.LaunchAtStartup } else { $false }
         $startMinimized = if ($raw.PSObject.Properties.Name -contains 'StartMinimized') { [bool]$raw.StartMinimized } else { $false }
         $crashNotifications = if ($raw.PSObject.Properties.Name -contains 'CrashNotifications') { [bool]$raw.CrashNotifications } else { $true }
+        $checkForUpdates = if ($raw.PSObject.Properties.Name -contains 'CheckForUpdates') { [bool]$raw.CheckForUpdates } else { $true }
         return @{
             OnlyNode           = [bool]$raw.OnlyNode
             RootDir            = [string]$raw.RootDir
@@ -218,6 +219,7 @@ function Load-Settings {
             LaunchAtStartup    = $launchAtStartup
             StartMinimized     = $startMinimized
             CrashNotifications = $crashNotifications
+            CheckForUpdates    = $checkForUpdates
         }
     } catch { return $defaults }
 }
@@ -269,6 +271,72 @@ function Restart-App {
     $script:ReallyExit = $true
     $notifyIcon.Visible = $false
     $form.Close()
+}
+
+# Everything the app knows (settings, groups, port history, custom names)
+# lives as four small JSON files under %LOCALAPPDATA%\LocalhostManager -
+# nothing here needs a database or an installer-managed profile, so backup/
+# restore is just zipping and unzipping that folder's known files.
+$script:BackupFileNames = @('settings.json', 'groups.json', 'history.json', 'customnames.json')
+
+function Export-AppBackup {
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Filter = 'Localhost Manager Backup (*.lhmbackup)|*.lhmbackup'
+    $sfd.FileName = "LocalhostManager-Backup-$(Get-Date -Format 'yyyy-MM-dd').lhmbackup"
+    if ($sfd.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $tempDir = Join-Path $env:TEMP "LHM-Backup-$([guid]::NewGuid())"
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $included = 0
+        foreach ($f in $script:BackupFileNames) {
+            $src = Join-Path $script:HistoryDir $f
+            if (Test-Path $src) { Copy-Item $src -Destination (Join-Path $tempDir $f) -Force; $included++ }
+        }
+        if (Test-Path $sfd.FileName) { Remove-Item $sfd.FileName -Force }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $sfd.FileName)
+        [System.Windows.Forms.MessageBox]::Show("Backed up $included file(s) to:`n$($sfd.FileName)", 'Backup Complete', 'OK', 'Information') | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Backup failed: $($_.Exception.Message)", 'Backup Failed', 'OK', 'Error') | Out-Null
+    } finally {
+        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Import-AppBackup {
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Filter = 'Localhost Manager Backup (*.lhmbackup;*.zip)|*.lhmbackup;*.zip|All files (*.*)|*.*'
+    if ($ofd.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "This replaces your current settings, groups, port history, and custom names with the backup's, then restarts the app. This can't be undone. Continue?",
+        'Restore Backup', 'YesNo', 'Warning')
+    if ($confirm -ne 'Yes') { return }
+
+    $tempDir = Join-Path $env:TEMP "LHM-Restore-$([guid]::NewGuid())"
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ofd.FileName, $tempDir)
+        $restored = 0
+        foreach ($f in $script:BackupFileNames) {
+            $src = Join-Path $tempDir $f
+            if (Test-Path $src) {
+                if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+                Copy-Item $src -Destination (Join-Path $script:HistoryDir $f) -Force
+                $restored++
+            }
+        }
+        if ($restored -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("That file doesn't look like a Localhost Manager backup - none of the expected files ($($script:BackupFileNames -join ', ')) were found inside it.", 'Restore Failed', 'OK', 'Warning') | Out-Null
+            return
+        }
+        Restart-App
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Restore failed: $($_.Exception.Message)", 'Restore Failed', 'OK', 'Error') | Out-Null
+    } finally {
+        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 $script:CustomNamesPath = Join-Path $script:HistoryDir 'customnames.json'
@@ -1485,6 +1553,12 @@ function Add-ManagedLog {
 
 $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
 
+# Single source of truth for the version shown in About and compared
+# against GitHub's latest release tag by the update checker - bump this
+# (and CHANGELOG.md) on every release instead of editing the About label.
+$script:AppVersion = '1.8.6'
+$script:UpdateRepo = 'zanopyth/local-host-manager'
+
 function Get-AppIcon {
     param([string]$FileName)
     $path = Join-Path $script:AppDir $FileName
@@ -1534,6 +1608,96 @@ function Get-AppIconBitmap {
 
 $script:IconOk = Get-AppIcon 'LocalhostManager.ico'
 $script:IconAlert = Get-AppIcon 'LocalhostManager-alert.ico'
+
+# ---------------------------------------------------------------------------
+# Update checker: compares $script:AppVersion against the tag of GitHub's
+# "latest" release for this repo. Runs the actual HTTP call on a background
+# runspace (same pattern as the live-listener poller) so a slow/offline
+# network never blocks the UI thread, and reports back through a
+# synchronized hashtable a WinForms Timer polls until it's done.
+# ---------------------------------------------------------------------------
+function Compare-VersionStrings {
+    # Positive if A > B, negative if A < B, 0 if equal. Numeric per-segment
+    # comparison (not string comparison) so "1.8.10" correctly beats "1.8.9".
+    param([string]$A, [string]$B)
+    $pa = @(($A -replace '^v') -split '\.' | ForEach-Object { [int]([regex]::Match($_, '\d+').Value) })
+    $pb = @(($B -replace '^v') -split '\.' | ForEach-Object { [int]([regex]::Match($_, '\d+').Value) })
+    for ($i = 0; $i -lt [Math]::Max($pa.Count, $pb.Count); $i++) {
+        $x = if ($i -lt $pa.Count) { $pa[$i] } else { 0 }
+        $y = if ($i -lt $pb.Count) { $pb[$i] } else { 0 }
+        if ($x -ne $y) { return $x - $y }
+    }
+    return 0
+}
+
+$script:UpdateCheckInFlight = $false
+$script:UpdateAvailable = $false
+$script:UpdateLatestVersion = $null
+$script:UpdateUrl = $null
+
+function Complete-UpdateCheck {
+    param($Cache, [bool]$Interactive)
+    if ($Cache.Error -or -not $Cache.Latest) {
+        if ($Interactive) {
+            [System.Windows.Forms.MessageBox]::Show("Couldn't check for updates: $($Cache.Error)", 'Check for Updates', 'OK', 'Warning') | Out-Null
+        }
+        return
+    }
+    $latest = [string]$Cache.Latest
+    if ((Compare-VersionStrings $latest $script:AppVersion) -gt 0) {
+        $script:UpdateAvailable = $true
+        $script:UpdateLatestVersion = $latest -replace '^v'
+        $script:UpdateUrl = [string]$Cache.Url
+        try {
+            $script:BalloonAction = 'Update'
+            $notifyIcon.ShowBalloonTip(6000, 'Localhost Manager', "Update available: $latest (you have v$script:AppVersion). Click to download.", [System.Windows.Forms.ToolTipIcon]::Info)
+        } catch {}
+        if ($Interactive) {
+            $open = [System.Windows.Forms.MessageBox]::Show("A new version is available: $latest (you have v$script:AppVersion).`n`nOpen the download page?", 'Update Available', 'YesNo', 'Information')
+            if ($open -eq 'Yes') { try { Start-Process $script:UpdateUrl } catch {} }
+        }
+    } elseif ($Interactive) {
+        [System.Windows.Forms.MessageBox]::Show("You're up to date (v$script:AppVersion).", 'Check for Updates', 'OK', 'Information') | Out-Null
+    }
+}
+
+function Start-UpdateCheck {
+    param([switch]$Interactive)
+    if ($script:UpdateCheckInFlight) { return }
+    if (-not $Interactive -and -not [bool]$script:Settings.CheckForUpdates) { return }
+
+    $script:UpdateCheckInFlight = $true
+    $cache = [hashtable]::Synchronized(@{ Done = $false; Latest = $null; Url = $null; Error = $null })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        param($Cache, $Repo)
+        try {
+            $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'LocalhostManager-UpdateCheck' } -TimeoutSec 6
+            $Cache.Latest = [string]$resp.tag_name
+            $Cache.Url = [string]$resp.html_url
+        } catch {
+            $Cache.Error = $_.Exception.Message
+        } finally {
+            $Cache.Done = $true
+        }
+    }).AddArgument($cache).AddArgument($script:UpdateRepo)
+    $asyncHandle = $ps.BeginInvoke()
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 400
+    $timer.Add_Tick({
+        if (-not $cache.Done) { return }
+        $timer.Stop()
+        try { $ps.EndInvoke($asyncHandle) } catch {}
+        $ps.Dispose(); $rs.Close(); $rs.Dispose()
+        $script:UpdateCheckInFlight = $false
+        Complete-UpdateCheck -Cache $cache -Interactive $Interactive
+    }.GetNewClosure())
+    $timer.Start()
+}
 
 # ---------------------------------------------------------------------------
 # On/off toggle switch (pill + sliding knob) used in place of plain
@@ -1724,13 +1888,17 @@ $menuFile = New-Object System.Windows.Forms.ToolStripMenuItem('File')
 $menuFileRefresh = New-Object System.Windows.Forms.ToolStripMenuItem('Refresh')
 $menuFileRefresh.ShortcutKeys = [System.Windows.Forms.Keys]::F5
 $menuFileRefresh.Add_Click({ Refresh-Grid })
+$menuFileBackup = New-Object System.Windows.Forms.ToolStripMenuItem('Backup Settings...')
+$menuFileBackup.Add_Click({ Export-AppBackup })
+$menuFileRestore = New-Object System.Windows.Forms.ToolStripMenuItem('Restore Backup...')
+$menuFileRestore.Add_Click({ Import-AppBackup })
 $menuFileExit = New-Object System.Windows.Forms.ToolStripMenuItem('Exit')
 $menuFileExit.Add_Click({
     $script:ReallyExit = $true
     $notifyIcon.Visible = $false
     $form.Close()
 })
-[System.Windows.Forms.ToolStripItem[]]$menuFileItems = @($menuFileRefresh, (New-Object System.Windows.Forms.ToolStripSeparator), $menuFileExit)
+[System.Windows.Forms.ToolStripItem[]]$menuFileItems = @($menuFileRefresh, (New-Object System.Windows.Forms.ToolStripSeparator), $menuFileBackup, $menuFileRestore, (New-Object System.Windows.Forms.ToolStripSeparator), $menuFileExit)
 $menuFile.DropDownItems.AddRange($menuFileItems)
 
 $menuSettings = New-Object System.Windows.Forms.ToolStripMenuItem('Settings')
@@ -1756,13 +1924,19 @@ $menuSettings.DropDownItems.AddRange($menuSettingsItems)
 $menuDashboard = New-Object System.Windows.Forms.ToolStripMenuItem('Dashboard')
 $menuDashboard.Add_Click({ Show-DashboardDialog })
 
-$menuAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
-$menuAbout.Add_Click({ Show-AboutDialog })
+$menuHelp = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
+$menuHelpUpdate = New-Object System.Windows.Forms.ToolStripMenuItem('Check for Updates...')
+$menuHelpUpdate.Add_Click({ Start-UpdateCheck -Interactive })
+$menuHelpAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
+$menuHelpAbout.Add_Click({ Show-AboutDialog })
+[System.Windows.Forms.ToolStripItem[]]$menuHelpItems = @($menuHelpUpdate, (New-Object System.Windows.Forms.ToolStripSeparator), $menuHelpAbout)
+$menuHelp.DropDownItems.AddRange($menuHelpItems)
 
-[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuAbout)
+[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuHelp)
 $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
 Enable-RoundedPopup -Popup $menuFile.DropDown -Radius 8
+Enable-RoundedPopup -Popup $menuHelp.DropDown -Radius 8
 Enable-RoundedPopup -Popup $menuSettings.DropDown -Radius 8
 # Each top-level item's DropDown is a separate auto-created
 # ToolStripDropDownMenu, not the MenuStrip itself - it doesn't inherit
@@ -3203,10 +3377,22 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.8.5'
+    $versionLabel.Text = "Version $script:AppVersion"
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)
+
+    [System.Windows.Forms.Control[]]$dlgExtraControls = @()
+    if ($script:UpdateAvailable -and $script:UpdateLatestVersion) {
+        $updateLabel = New-Object System.Windows.Forms.LinkLabel
+        $updateLabel.Text = "Update available: v$script:UpdateLatestVersion - click to download"
+        $updateLabel.LinkColor = $script:Theme.Accent
+        $updateLabel.ActiveLinkColor = $script:Theme.AccentDark
+        $updateLabel.Location = New-Object System.Drawing.Point(20, 188)
+        $updateLabel.Size = New-Object System.Drawing.Size(330, 20)
+        $updateLabel.Add_LinkClicked({ try { Start-Process $script:UpdateUrl } catch {} })
+        $dlgExtraControls += $updateLabel
+    }
 
     $descLabel = New-Object System.Windows.Forms.Label
     $descLabel.Text = 'Scans your machine for running localhost dev servers, shows their status and LAN URLs, and lets you start/stop them individually or in named groups.'
@@ -3231,7 +3417,7 @@ function Show-AboutDialog {
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton -Variant Accent
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($iconBox, $titleLabel, $versionLabel, $descLabel, $linkLabel, $closeButton)
+    [System.Windows.Forms.Control[]]$dlgControls = @($iconBox, $titleLabel, $versionLabel, $descLabel, $linkLabel, $closeButton) + $dlgExtraControls
     $dlg.Controls.AddRange($dlgControls)
     $dlg.AcceptButton = $closeButton
     $dlg.ShowDialog($form) | Out-Null
@@ -3384,7 +3570,17 @@ function Show-SettingsDialog {
     $crashNotifLbl.ForeColor = $script:Theme.TextPrimary
     Connect-ToggleLabel -Switch $crashNotifSwitch -Label $crashNotifLbl
 
-    $tabStartup.Controls.AddRange(@($launchSwitch, $launchLbl, $minimizedSwitch, $minimizedLbl, $crashNotifSwitch, $crashNotifLbl))
+    $updateCheckSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.CheckForUpdates)
+    $updateCheckSwitch.Location = New-Object System.Drawing.Point(15, 123)
+
+    $updateCheckLbl = New-Object System.Windows.Forms.Label
+    $updateCheckLbl.Text = 'Check for updates on startup'
+    $updateCheckLbl.Location = New-Object System.Drawing.Point(60, 123)
+    $updateCheckLbl.Size = New-Object System.Drawing.Size(300, 20)
+    $updateCheckLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $updateCheckSwitch -Label $updateCheckLbl
+
+    $tabStartup.Controls.AddRange(@($launchSwitch, $launchLbl, $minimizedSwitch, $minimizedLbl, $crashNotifSwitch, $crashNotifLbl, $updateCheckSwitch, $updateCheckLbl))
 
     # --- Diagnostics --------------------------------------------------------
     $logStats = Get-AppErrorLogStats
@@ -3442,6 +3638,7 @@ function Show-SettingsDialog {
 
         $script:Settings.StartMinimized = Get-ToggleChecked $minimizedSwitch
         $script:Settings.CrashNotifications = Get-ToggleChecked $crashNotifSwitch
+        $script:Settings.CheckForUpdates = Get-ToggleChecked $updateCheckSwitch
 
         Save-Settings $script:Settings
         Update-ScopeLabel
@@ -3925,6 +4122,12 @@ function Restore-MainWindow {
 $notifyIcon.Add_MouseClick({
     param($s, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Restore-MainWindow }
+})
+
+$script:BalloonAction = $null
+$notifyIcon.Add_BalloonTipClicked({
+    if ($script:BalloonAction -eq 'Update' -and $script:UpdateUrl) { try { Start-Process $script:UpdateUrl } catch {} }
+    $script:BalloonAction = $null
 })
 
 # Rebuild the menu items here, on MouseUp, rather than relying solely on
@@ -4551,6 +4754,7 @@ try {
         Start-WebDashboard -Port ([int]$script:Settings.WebPort)
     }
     Update-DashboardPill
+    Start-UpdateCheck
 } catch {
     Write-AppErrorLog -Context 'Startup error' -Exception $_.Exception
     [System.Windows.Forms.MessageBox]::Show("Startup error: $_", 'Error') | Out-Null
