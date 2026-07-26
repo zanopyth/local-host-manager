@@ -1494,6 +1494,44 @@ function Get-AppIcon {
     try { return [System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch { return [System.Drawing.SystemIcons]::Application }
 }
 
+# System.Drawing.Icon's own pixel data comes out corrupted (colored static)
+# for any frame stored PNG-compressed - which every frame in a modern .ico
+# saved by current icon tools is - and that's not just a .ToBitmap() quirk:
+# Graphics.DrawIcon on the same Icon object reproduces the identical
+# garbage, so nothing routed through the Icon class can be trusted for a
+# static bitmap. Windows' own native icon painting (Form.Icon, NotifyIcon)
+# is unaffected - only .NET's own extraction is broken - so this reads the
+# .ico's ICONDIR by hand, grabs the entry closest to the wanted size, and
+# decodes its embedded image bytes directly as a PNG/Bitmap, never touching
+# System.Drawing.Icon at all.
+function Get-AppIconBitmap {
+    param([string]$FileName, [int]$Size = 48)
+    $path = Join-Path $script:AppDir $FileName
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $count = [BitConverter]::ToUInt16($bytes, 4)
+        $best = $null
+        for ($i = 0; $i -lt $count; $i++) {
+            $off = 6 + ($i * 16)
+            $w = $bytes[$off]; if ($w -eq 0) { $w = 256 }
+            $entry = [PSCustomObject]@{
+                Width      = $w
+                ByteSize   = [BitConverter]::ToUInt32($bytes, $off + 8)
+                ImgOffset  = [BitConverter]::ToUInt32($bytes, $off + 12)
+            }
+            if (-not $best -or [Math]::Abs($entry.Width - $Size) -lt [Math]::Abs($best.Width - $Size)) { $best = $entry }
+        }
+        if ($best) {
+            $frameBytes = New-Object byte[] $best.ByteSize
+            [Array]::Copy($bytes, $best.ImgOffset, $frameBytes, 0, $best.ByteSize)
+            $ms = New-Object System.IO.MemoryStream(,$frameBytes)
+            $bmp = [System.Drawing.Image]::FromStream($ms)
+            return New-Object System.Drawing.Bitmap($bmp, $Size, $Size)
+        }
+    } catch {}
+    return $null
+}
+
 $script:IconOk = Get-AppIcon 'LocalhostManager.ico'
 $script:IconAlert = Get-AppIcon 'LocalhostManager-alert.ico'
 
@@ -3146,19 +3184,13 @@ function Show-AboutDialog {
     Set-DarkTitleBar -FormControl $dlg
 
     $iconBox = New-Object System.Windows.Forms.PictureBox
-    # Icon.ToBitmap() corrupts into colored static for modern .ico files
-    # whose larger frames are embedded as PNG (GDI+'s bitmap-conversion
-    # path doesn't decode those correctly) - Graphics.DrawIcon goes through
-    # Windows' own icon renderer instead, which handles PNG-frame icons
-    # fine. Form.Icon/NotifyIcon.Icon elsewhere in the app hand the Icon
-    # object straight to Windows already, which is why only this one spot
-    # (the only .ToBitmap() call in the file) ever showed the corruption.
-    $iconBmp = New-Object System.Drawing.Bitmap(48, 48)
-    $iconGfx = [System.Drawing.Graphics]::FromImage($iconBmp)
-    $iconGfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $iconGfx.DrawIcon($script:IconOk, (New-Object System.Drawing.Rectangle(0, 0, 48, 48)))
-    $iconGfx.Dispose()
-    $iconBox.Image = $iconBmp
+    # System.Drawing.Icon's own pixel data is corrupted for this file
+    # (confirmed: both .ToBitmap() and Graphics.DrawIcon on the same Icon
+    # object produce identical colored static) - Get-AppIconBitmap sidesteps
+    # the Icon class entirely and decodes the .ico's embedded PNG frame
+    # directly, which renders correctly.
+    $iconBmp = Get-AppIconBitmap -FileName 'LocalhostManager.ico' -Size 48
+    if ($iconBmp) { $iconBox.Image = $iconBmp }
     $iconBox.SizeMode = 'CenterImage'
     $iconBox.Location = New-Object System.Drawing.Point(20, 24)
     $iconBox.Size = New-Object System.Drawing.Size(48, 48)
@@ -3171,7 +3203,7 @@ function Show-AboutDialog {
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
 
     $versionLabel = New-Object System.Windows.Forms.Label
-    $versionLabel.Text = 'Version 1.8.4'
+    $versionLabel.Text = 'Version 1.8.5'
     $versionLabel.ForeColor = $script:Theme.TextDim
     $versionLabel.Location = New-Object System.Drawing.Point(80, 54)
     $versionLabel.Size = New-Object System.Drawing.Size(270, 20)

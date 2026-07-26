@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.5] - 2026-07-26
+
+### Fixed
+- The 1.8.4 About-icon fix (switching `.ToBitmap()` for `Graphics.DrawIcon`)
+  turned out not to fix it - both go through `System.Drawing.Icon`, whose
+  own pixel data is corrupted for every frame in this file (confirmed: the
+  two produced identical static). The embedded PNG frames themselves decode
+  perfectly on their own. Now reads the `.ico`'s frame directory directly
+  and decodes the chosen frame's PNG bytes straight into a Bitmap, never
+  touching `System.Drawing.Icon`
+
 ## [1.8.4] - 2026-07-26
 
 ### Fixed
