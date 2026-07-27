@@ -228,7 +228,7 @@ function Load-Settings {
         $webPort = if ($raw.PSObject.Properties.Name -contains 'WebPort' -and [int]$raw.WebPort -gt 0) { [int]$raw.WebPort } else { 3199 }
         $dashboardEnabled = if ($raw.PSObject.Properties.Name -contains 'DashboardEnabled') { [bool]$raw.DashboardEnabled } else { $false }
         $showSystemPorts = if ($raw.PSObject.Properties.Name -contains 'ShowSystemPorts') { [bool]$raw.ShowSystemPorts } else { $false }
-        $theme = if ($raw.PSObject.Properties.Name -contains 'Theme' -and [string]$raw.Theme -eq 'Dark') { 'Dark' } else { 'Light' }
+        $theme = if ($raw.PSObject.Properties.Name -contains 'Theme' -and [string]$raw.Theme -in @('Dark', 'Terminal')) { [string]$raw.Theme } else { 'Light' }
         $launchAtStartup = if ($raw.PSObject.Properties.Name -contains 'LaunchAtStartup') { [bool]$raw.LaunchAtStartup } else { $false }
         $startMinimized = if ($raw.PSObject.Properties.Name -contains 'StartMinimized') { [bool]$raw.StartMinimized } else { $false }
         $crashNotifications = if ($raw.PSObject.Properties.Name -contains 'CrashNotifications') { [bool]$raw.CrashNotifications } else { $true }
@@ -945,6 +945,8 @@ $script:LightTheme = @{
     RowAlt      = [System.Drawing.Color]::FromArgb(0xF7, 0xF6, 0xF5)
     ToggleOff   = [System.Drawing.Color]::FromArgb(0xC6, 0xC6, 0xC6)
     IsDark      = $false
+    Radius      = 8
+    FontFamily  = 'Segoe UI'
 }
 
 # Dark variant — Discord's palette family: blue-gray (not neutral-gray or
@@ -969,9 +971,42 @@ $script:DarkTheme = @{
     RowAlt      = [System.Drawing.Color]::FromArgb(0x2E, 0x30, 0x35)
     ToggleOff   = [System.Drawing.Color]::FromArgb(0x4E, 0x50, 0x58)
     IsDark      = $true
+    Radius      = 8
+    FontFamily  = 'Segoe UI'
 }
 
-$script:Theme = if ($script:Settings.Theme -eq 'Dark') { $script:DarkTheme } else { $script:LightTheme }
+# Terminal variant — Catppuccin Mocha, translated from the herdr-tui-design
+# skill: crust/mantle/base tiering for the three background levels, one blue
+# accent, semantic status colors, muted (not pure gray) borders. Radius = 0
+# and a monospace FontFamily are the two tokens that turn every rounded
+# WinForms control flat and every proportional-font label into terminal text
+# without touching the drawing code itself (see Initialize-ModernButton).
+$script:TerminalTheme = @{
+    WindowBg    = [System.Drawing.Color]::FromArgb(0x11, 0x11, 0x1B)
+    PanelBg     = [System.Drawing.Color]::FromArgb(0x18, 0x18, 0x25)
+    CardBg      = [System.Drawing.Color]::FromArgb(0x1E, 0x1E, 0x2E)
+    Border      = [System.Drawing.Color]::FromArgb(0x6C, 0x70, 0x86)
+    TextPrimary = [System.Drawing.Color]::FromArgb(0xCD, 0xD6, 0xF4)
+    TextDim     = [System.Drawing.Color]::FromArgb(0xA6, 0xAD, 0xC8)
+    Accent      = [System.Drawing.Color]::FromArgb(0x89, 0xB4, 0xFA)
+    AccentDark  = [System.Drawing.Color]::FromArgb(0x74, 0xC7, 0xEC)
+    AccentTint  = [System.Drawing.Color]::FromArgb(0x31, 0x32, 0x44)
+    Success     = [System.Drawing.Color]::FromArgb(0xA6, 0xE3, 0xA1)
+    SuccessTint = [System.Drawing.Color]::FromArgb(0x1E, 0x2E, 0x25)
+    Danger      = [System.Drawing.Color]::FromArgb(0xF3, 0x8B, 0xA8)
+    DangerTint  = [System.Drawing.Color]::FromArgb(0x30, 0x22, 0x26)
+    RowAlt      = [System.Drawing.Color]::FromArgb(0x1A, 0x1A, 0x28)
+    ToggleOff   = [System.Drawing.Color]::FromArgb(0x45, 0x47, 0x5A)
+    IsDark      = $true
+    Radius      = 0
+    FontFamily  = 'Cascadia Mono'
+}
+
+$script:Theme = switch ($script:Settings.Theme) {
+    'Dark'     { $script:DarkTheme }
+    'Terminal' { $script:TerminalTheme }
+    default    { $script:LightTheme }
+}
 
 # Dark mode needs a custom ToolStrip renderer (see ThemedColorTable above) so
 # menu/tray-menu chrome matches; light mode keeps the default renderer ($null
@@ -1118,7 +1153,7 @@ function Initialize-ModernButton {
     # -Icon opts a button into the icon+text layer (Draw-ButtonContent) so
     # it can later be morphed via Start-ButtonMorph; plain buttons just get
     # a single static layer with Icon = $null.
-    param($Button, [string]$Variant = 'Neutral', [int]$Radius = 8, [string]$Icon = $null)
+    param($Button, [string]$Variant = 'Neutral', [int]$Radius = $script:Theme.Radius, [string]$Icon = $null)
 
     switch ($Variant) {
         'Accent'  { $fg = $script:Theme.Accent;  $borderNormal = $script:Theme.Border;  $fillActive = $script:Theme.AccentTint;  $borderActive = $script:Theme.Accent }
@@ -1131,7 +1166,7 @@ function Initialize-ModernButton {
     $Button.FlatAppearance.BorderSize = 0
     $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::Transparent
     $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::Transparent
-    $Button.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $Button.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
     $Button.UseVisualStyleBackColor = $false
     $Button.Tag = [PSCustomObject]@{
@@ -1164,11 +1199,15 @@ function Initialize-ModernButton {
         $rect = New-Object System.Drawing.Rectangle($inset, $inset, ($s.Width - 1 - 2 * $inset), ($s.Height - 1 - 2 * $inset))
         $d = [Math]::Min($t.Radius * 2, [Math]::Min($rect.Width, $rect.Height))
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
-        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
-        $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
-        $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
-        $path.CloseFigure()
+        if ($d -le 0) {
+            $path.AddRectangle($rect)
+        } else {
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
+            $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
+            $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
+            $path.CloseFigure()
+        }
 
         if ($t.SplitMode) {
             # Two-option pill: left half is a plain "Cancel" tile (an X, no
@@ -1295,7 +1334,7 @@ function New-CustomTabControl {
         $btn = New-Object System.Windows.Forms.Label
         $btn.Text = $lbl
         $btn.TextAlign = 'MiddleCenter'
-        $btn.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $btn.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
         $btn.Height = $header.Height - 1
         $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
         $header.Controls.Add($btn)
@@ -1375,7 +1414,7 @@ function New-StatusPill {
     $pill = New-Object System.Windows.Forms.Label
     $pill.AutoSize = $false
     $pill.TextAlign = 'MiddleCenter'
-    $pill.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+    $pill.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8, [System.Drawing.FontStyle]::Bold)
     $pill.ForeColor = $fg
     $pill.Tag = [PSCustomObject]@{ Fill = $fill }
 
@@ -1392,9 +1431,13 @@ function New-StatusPill {
         $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
         $d = $rect.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
-        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
-        $path.CloseFigure()
+        if ($script:Theme.Radius -le 0) {
+            $path.AddRectangle($rect)
+        } else {
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
+            $path.CloseFigure()
+        }
 
         $fillBrush = New-Object System.Drawing.SolidBrush($s.Tag.Fill)
         $g.FillPath($fillBrush, $path)
@@ -1418,8 +1461,16 @@ function New-StatusPill {
 # on every paint, since AutoSize means the final Size isn't known until
 # layout, then stroking a matching border so the corners don't look bare.
 # ---------------------------------------------------------------------------
+# Scales a Light/Dark-tuned radius down to 0 under the Terminal theme,
+# instead of every call site hardcoding its own theme check.
+function Get-ThemedRadius {
+    param([int]$Default = $script:Theme.Radius)
+    if ($script:Theme.Radius -le 0) { return 0 }
+    return $Default
+}
+
 function Enable-RoundedPopup {
-    param($Popup, [int]$Radius = 8)
+    param($Popup, [int]$Radius = $script:Theme.Radius)
     $Popup.BackColor = $script:Theme.CardBg
     $paintHandler = {
         param($s, $e)
@@ -1427,11 +1478,15 @@ function Enable-RoundedPopup {
         $rect = New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.Height)
         $d = [Math]::Min($Radius * 2, [Math]::Min($rect.Width, $rect.Height))
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
-        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
-        $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
-        $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
-        $path.CloseFigure()
+        if ($d -le 0) {
+            $path.AddRectangle($rect)
+        } else {
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
+            $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
+            $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
+            $path.CloseFigure()
+        }
         $s.Region = New-Object System.Drawing.Region($path)
         $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $borderColor = $script:Theme.Border
@@ -1582,7 +1637,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.8.7'
+$script:AppVersion = '1.9.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -1747,17 +1802,25 @@ function New-ToggleSwitch {
         $isOn = $s.Tag.Checked
         $bg = if ($isOn) { $script:Theme.Accent } else { $script:Theme.ToggleOff }
         $d = $s.Height
-        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $path.AddArc(0, 0, $d, $d, 90, 180)
-        $path.AddArc($s.Width - $d, 0, $d, $d, 270, 180)
-        $path.CloseFigure()
         $brush = New-Object System.Drawing.SolidBrush($bg)
-        $g.FillPath($brush, $path)
+        if ($script:Theme.Radius -le 0) {
+            $g.FillRectangle($brush, 0, 0, $s.Width, $s.Height)
+        } else {
+            $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+            $path.AddArc(0, 0, $d, $d, 90, 180)
+            $path.AddArc($s.Width - $d, 0, $d, $d, 270, 180)
+            $path.CloseFigure()
+            $g.FillPath($brush, $path)
+            $path.Dispose()
+        }
         $brush.Dispose()
-        $path.Dispose()
         $knobD = $d - 4
         $knobX = if ($isOn) { $s.Width - $knobD - 2 } else { 2 }
-        $g.FillEllipse([System.Drawing.Brushes]::White, $knobX, 2, $knobD, $knobD)
+        if ($script:Theme.Radius -le 0) {
+            $g.FillRectangle([System.Drawing.Brushes]::White, $knobX, 2, $knobD, $knobD)
+        } else {
+            $g.FillEllipse([System.Drawing.Brushes]::White, $knobX, 2, $knobD, $knobD)
+        }
     })
     $sw.Add_Click({ param($s, $e) Invoke-ToggleClick -Switch $s })
     return $sw
@@ -1819,9 +1882,13 @@ function New-DashboardPill {
         $rect = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
         $d = $rect.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
-        $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
-        $path.CloseFigure()
+        if ($script:Theme.Radius -le 0) {
+            $path.AddRectangle($rect)
+        } else {
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
+            $path.CloseFigure()
+        }
 
         $fillColor = if ($t.On) { $script:Theme.SuccessTint } else { $script:Theme.DangerTint }
         $ringColor = if ($t.On) { $script:Theme.Success } else { $script:Theme.Danger }
@@ -1843,7 +1910,11 @@ function New-DashboardPill {
         $cy = $rect.Y + ($rect.Height / 2.0)
         $dotRect = New-Object System.Drawing.RectangleF(($cx - $dotSize / 2.0), ($cy - $dotSize / 2.0), $dotSize, $dotSize)
         $dotBrush = New-Object System.Drawing.SolidBrush($ringColor)
-        $g.FillEllipse($dotBrush, $dotRect)
+        if ($script:Theme.Radius -le 0) {
+            $g.FillRectangle($dotBrush, $dotRect.X, $dotRect.Y, $dotRect.Width, $dotRect.Height)
+        } else {
+            $g.FillEllipse($dotBrush, $dotRect)
+        }
         $dotBrush.Dispose()
 
         $path.Dispose()
@@ -1896,7 +1967,7 @@ $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(700, 400)
 $form.Icon = $script:IconOk
 $form.BackColor = $script:Theme.WindowBg
-$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
 Set-DarkTitleBar -FormControl $form
 
 # ---------------------------------------------------------------------------
@@ -1908,7 +1979,7 @@ Set-DarkTitleBar -FormControl $form
 $menuStrip = New-Object System.Windows.Forms.MenuStrip
 $menuStrip.BackColor = $script:Theme.CardBg
 $menuStrip.ForeColor = $script:Theme.TextPrimary
-$menuStrip.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$menuStrip.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
 $menuStrip.Padding = New-Object System.Windows.Forms.Padding(8, 3, 0, 3)
 if ($script:MenuRenderer) { $menuStrip.Renderer = $script:MenuRenderer }
 
@@ -1936,12 +2007,19 @@ $menuSettingsGroups = New-Object System.Windows.Forms.ToolStripMenuItem('Manage 
 $menuSettingsGroups.Add_Click({ Show-ManageGroupsDialog })
 $menuSettingsNodeOnly = New-Object System.Windows.Forms.ToolStripMenuItem('Dev Servers Only')
 $menuSettingsNodeOnly.Checked = $script:Settings.OnlyNode
+# Stock ToolStripProfessionalRenderer draws a checked item's checkbox glyph
+# and its text at overlapping X positions (reproduced in isolation with a
+# bare, unthemed MenuStrip - not something this app's own rendering causes),
+# clipping the first letter or two behind the checkbox. Padding.Left nudges
+# the text clear of the glyph without touching the renderer/color table.
+$menuSettingsNodeOnly.Padding = New-Object System.Windows.Forms.Padding(20, 2, 4, 2)
 $menuSettingsNodeOnly.Add_Click({
     Invoke-ToggleClick -Switch $nodeOnlySwitch
     $menuSettingsNodeOnly.Checked = Get-ToggleChecked $nodeOnlySwitch
 })
 $menuSettingsUseGroups = New-Object System.Windows.Forms.ToolStripMenuItem('Use Groups')
 $menuSettingsUseGroups.Checked = $script:Settings.ShowGroups
+$menuSettingsUseGroups.Padding = New-Object System.Windows.Forms.Padding(20, 2, 4, 2)
 $menuSettingsUseGroups.Add_Click({
     Invoke-ToggleClick -Switch $useGroupsSwitch
     $menuSettingsUseGroups.Checked = Get-ToggleChecked $useGroupsSwitch
@@ -1963,15 +2041,23 @@ $menuHelp.DropDownItems.AddRange($menuHelpItems)
 [System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuHelp)
 $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
-Enable-RoundedPopup -Popup $menuFile.DropDown -Radius 8
-Enable-RoundedPopup -Popup $menuHelp.DropDown -Radius 8
-Enable-RoundedPopup -Popup $menuSettings.DropDown -Radius 8
+# File and Help have no checkable/iconed items, so the ~25px gutter every
+# ToolStripDropDownMenu reserves on the left for check/image glyphs was
+# pure dead space - a persistent, unused-looking gap down the left edge of
+# both menus. Settings keeps its margin: "Dev Servers Only" / "Use Groups"
+# are real .Checked items that render their checkmark in that gutter.
+$menuFile.DropDown.ShowImageMargin = $false
+$menuHelp.DropDown.ShowImageMargin = $false
+Enable-RoundedPopup -Popup $menuFile.DropDown
+Enable-RoundedPopup -Popup $menuHelp.DropDown
+Enable-RoundedPopup -Popup $menuSettings.DropDown
 # Each top-level item's DropDown is a separate auto-created
 # ToolStripDropDownMenu, not the MenuStrip itself - it doesn't inherit
 # $menuStrip.ForeColor, so its item text defaulted to black regardless of
 # the (dark, in dark mode) background Enable-RoundedPopup gives it.
 $menuFile.DropDown.ForeColor = $script:Theme.TextPrimary
 $menuSettings.DropDown.ForeColor = $script:Theme.TextPrimary
+$menuHelp.DropDown.ForeColor = $script:Theme.TextPrimary
 
 # By default, once one top-level menu is opened by a click, MenuStrip lets
 # you switch to the next one just by hovering over it - standard Windows
@@ -2029,17 +2115,17 @@ function New-VerticalDivider {
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = 'Refresh'
 $refreshButton.Location = New-Object System.Drawing.Point(16, 12)
-$refreshButton.Size = New-Object System.Drawing.Size(84, 28)
+$refreshButton.Size = New-Object System.Drawing.Size(100, 28)
 
 $startAllButton = New-Object System.Windows.Forms.Button
 $startAllButton.Text = 'Start All'
 $startAllButton.Location = New-Object System.Drawing.Point(16, 48)
-$startAllButton.Size = New-Object System.Drawing.Size(84, 28)
+$startAllButton.Size = New-Object System.Drawing.Size(100, 28)
 
 $stopAllButton = New-Object System.Windows.Forms.Button
 $stopAllButton.Text = 'Stop All'
-$stopAllButton.Location = New-Object System.Drawing.Point(112, 48)
-$stopAllButton.Size = New-Object System.Drawing.Size(84, 28)
+$stopAllButton.Location = New-Object System.Drawing.Point(128, 48)
+$stopAllButton.Size = New-Object System.Drawing.Size(100, 28)
 
 $divider1 = New-VerticalDivider -X 278 -Y 8 -Height 72
 
@@ -2116,8 +2202,8 @@ $script:BottomBar.Controls.AddRange(@($statusLabel, $scopeLabel, $script:BottomB
 
 $groupsButton = New-Object System.Windows.Forms.Button
 $groupsButton.Text = 'Groups'
-$groupsButton.Location = New-Object System.Drawing.Point(112, 12)
-$groupsButton.Size = New-Object System.Drawing.Size(84, 28)
+$groupsButton.Location = New-Object System.Drawing.Point(128, 12)
+$groupsButton.Size = New-Object System.Drawing.Size(100, 28)
 
 # Multi-select "dropdown": a plain Button that pops open a checked-list so
 # 2+ groups can be active in the table at once (a normal ComboBox only
@@ -2125,14 +2211,14 @@ $groupsButton.Size = New-Object System.Drawing.Size(84, 28)
 $groupsPopup = New-Object System.Windows.Forms.ToolStripDropDown
 $groupsPopup.AutoClose = $true
 $groupsPopup.Padding = New-Object System.Windows.Forms.Padding(2)
-Enable-RoundedPopup -Popup $groupsPopup -Radius 10
+Enable-RoundedPopup -Popup $groupsPopup -Radius (Get-ThemedRadius 10)
 
 $groupsCheckedList = New-Object System.Windows.Forms.CheckedListBox
 $groupsCheckedList.CheckOnClick = $true
 $groupsCheckedList.BorderStyle = 'None'
 $groupsCheckedList.IntegralHeight = $false
 $groupsCheckedList.Size = New-Object System.Drawing.Size(200, 130)
-$groupsCheckedList.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$groupsCheckedList.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
 $groupsCheckedList.BackColor = $script:Theme.CardBg
 $groupsCheckedList.ForeColor = $script:Theme.TextPrimary
 
@@ -2185,6 +2271,17 @@ function Sync-GroupsCheckedList {
         $isChecked = $script:SelectedGroups -contains $name
         $groupsCheckedList.Items.Add($name, $isChecked) | Out-Null
     }
+    # Size was a fixed 130px tall regardless of item count - fine for ~7
+    # groups, but left a large empty band below the last item (and before
+    # the rounded border) for anyone with only 1-3 groups defined. Size to
+    # fit the actual items instead, still capped at the original 130px so a
+    # long list keeps scrolling rather than growing unbounded.
+    $maxHeight = 130
+    $minHeight = $groupsCheckedList.ItemHeight + 4
+    $contentHeight = ($groupsCheckedList.Items.Count * $groupsCheckedList.ItemHeight) + 4
+    $newHeight = [Math]::Max($minHeight, [Math]::Min($maxHeight, $contentHeight))
+    $groupsCheckedList.Size = New-Object System.Drawing.Size(200, $newHeight)
+    $groupsListHost.Size = $groupsCheckedList.Size
 }
 
 $groupsCheckedList.Add_ItemCheck({
@@ -2244,11 +2341,11 @@ function New-PortsGrid {
     # sidesteps it and guarantees no vertical lines regardless of OS theme.
     $g.CellBorderStyle = 'None'
     $g.GridColor = $script:Theme.Border
-    $g.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $g.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     $g.EnableHeadersVisualStyles = $false
     $g.ColumnHeadersDefaultCellStyle.BackColor = $script:Theme.PanelBg
     $g.ColumnHeadersDefaultCellStyle.ForeColor = $script:Theme.TextPrimary
-    $g.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $g.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
     $g.ColumnHeadersDefaultCellStyle.Alignment = 'MiddleLeft'
     $g.ColumnHeadersBorderStyle = 'None'
     $g.ColumnHeadersHeightSizeMode = 'DisableResizing'
@@ -2323,13 +2420,40 @@ function New-PortsGrid {
     $g.Add_RowPostPaint({
         param($s, $e)
         $row = $s.Rows[$e.RowIndex]
-        if ($row.Tag -eq 'separator') { return }
+        if ($row.Tag -eq 'separator') {
+            # A deliberate group-divider rule, not just a differently-colored
+            # gap - accent-colored and inset from the edges so it reads as an
+            # intentional break between groups rather than a rendering gap.
+            $lineColor = $script:Theme.Accent
+            if ($null -eq $lineColor) { return }
+            $y = $e.RowBounds.Top + [Math]::Floor($e.RowBounds.Height / 2.0)
+            $pen = New-Object System.Drawing.Pen($lineColor, 2)
+            $e.Graphics.DrawLine($pen, $e.RowBounds.Left + 8, $y, $e.RowBounds.Right - 8, $y)
+            $pen.Dispose()
+            return
+        }
         $borderColor = $script:Theme.Border
         if ($null -eq $borderColor) { return }
         $y = $e.RowBounds.Bottom - 1
         $pen = New-Object System.Drawing.Pen($borderColor, 1)
         $e.Graphics.DrawLine($pen, $e.RowBounds.Left, $y, $e.RowBounds.Right, $y)
         $pen.Dispose()
+    })
+
+    # Separator rows are visual dividers only - keyboard/mouse navigation
+    # should skip over them like they aren't there, instead of letting them
+    # become the current cell (which otherwise draws a stray default focus
+    # box on top of an all-but-empty row).
+    $g.Add_CellEnter({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.RowIndex -ge $s.Rows.Count) { return }
+        $row = $s.Rows[$e.RowIndex]
+        if ($row.Tag -ne 'separator') { return }
+        $dir = if ($e.RowIndex + 1 -lt $s.Rows.Count) { 1 } else { -1 }
+        $targetIndex = $e.RowIndex + $dir
+        if ($targetIndex -ge 0 -and $targetIndex -lt $s.Rows.Count) {
+            $s.CurrentCell = $s.Rows[$targetIndex].Cells[$e.ColumnIndex]
+        }
     })
 
     return $g
@@ -2358,7 +2482,7 @@ $systemPlaceholderLabel.Dock = 'Fill'
 $systemPlaceholderLabel.TextAlign = 'MiddleCenter'
 $systemPlaceholderLabel.ForeColor = $script:Theme.TextDim
 $systemPlaceholderLabel.BackColor = $script:Theme.CardBg
-$systemPlaceholderLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
+$systemPlaceholderLabel.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9.5)
 
 $script:MainTabs.Pages[2].Controls.Add($systemGrid)
 $script:MainTabs.Pages[2].Controls.Add($systemPlaceholderLabel)
@@ -2970,7 +3094,7 @@ function Show-AppErrorLogViewer {
     $countLbl.Location = New-Object System.Drawing.Point(12, 15)
     $countLbl.Size = New-Object System.Drawing.Size(420, 20)
     $countLbl.ForeColor = $script:Theme.TextDim
-    $countLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $countLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
     $countLbl.AutoEllipsis = $true
 
     $openFolderButton = New-Object System.Windows.Forms.Button
@@ -3177,7 +3301,7 @@ function Show-RowDetail {
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $screenArea = [System.Windows.Forms.Screen]::FromPoint($ScreenPoint).WorkingArea
@@ -3200,15 +3324,27 @@ function Show-RowDetail {
         $lbl.Location = New-Object System.Drawing.Point(10, 6)
         $lbl.Size = New-Object System.Drawing.Size(88, 16)
         $lbl.ForeColor = if ($f.IsVirtual) { $purpleAccent } else { $script:Theme.TextDim }
-        $lbl.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+        $lbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8, [System.Drawing.FontStyle]::Bold)
         $lbl.BackColor = [System.Drawing.Color]::Transparent
 
-        $valueLbl = New-Object System.Windows.Forms.Label
+        # "Local URL" opens in the default browser on click - the only field
+        # that's always a real, reachable http(s) URL (network entries can
+        # be virtual-adapter/unreachable addresses, so those stay plain text).
+        if ($f.Label -eq 'Local URL' -and $f.Value -match '^https?://') {
+            $valueLbl = New-Object System.Windows.Forms.LinkLabel
+            $valueLbl.LinkColor = $script:Theme.Accent
+            $valueLbl.ActiveLinkColor = $script:Theme.AccentDark
+            $valueLbl.LinkBehavior = 'HoverUnderline'
+            $capturedUrl = $f.Value
+            $valueLbl.Add_LinkClicked({ try { Start-Process $capturedUrl } catch {} }.GetNewClosure())
+        } else {
+            $valueLbl = New-Object System.Windows.Forms.Label
+            $valueLbl.ForeColor = $script:Theme.TextPrimary
+        }
         $valueLbl.Text = $f.Value
         $valueLbl.AutoEllipsis = $true
         $valueLbl.Location = New-Object System.Drawing.Point(100, 6)
         $valueLbl.Size = New-Object System.Drawing.Size(($dlgWidth - 100 - 42), 16)
-        $valueLbl.ForeColor = $script:Theme.TextPrimary
         $valueLbl.BackColor = [System.Drawing.Color]::Transparent
 
         $copyBtn = New-Object System.Windows.Forms.Button
@@ -3216,8 +3352,11 @@ function Show-RowDetail {
         $copyBtn.Size = New-Object System.Drawing.Size(26, 26)
         $capturedValue = $f.Value
         $copyBtn.Add_Click({ if ($capturedValue) { [System.Windows.Forms.Clipboard]::SetText($capturedValue) } }.GetNewClosure())
-        Initialize-ModernButton -Button $copyBtn -Radius 6
+        # Text must be set before Initialize-ModernButton - it owner-draws
+        # from Tag.DisplayText, which is snapshotted from .Text at init time,
+        # so setting .Text afterward silently left the glyph blank.
         $copyBtn.Text = [string][char]0xE8C8
+        Initialize-ModernButton -Button $copyBtn -Radius (Get-ThemedRadius 6)
         $copyBtn.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 10)
 
         [System.Windows.Forms.Control[]]$rowChildren = @($lbl, $valueLbl, $copyBtn)
@@ -3382,7 +3521,7 @@ function Show-AboutDialog {
     $dlg.MinimizeBox = $false
     $dlg.Icon = $script:IconOk
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $iconBox = New-Object System.Windows.Forms.PictureBox
@@ -3399,7 +3538,7 @@ function Show-AboutDialog {
 
     $titleLabel = New-Object System.Windows.Forms.Label
     $titleLabel.Text = 'Localhost Manager'
-    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 13, [System.Drawing.FontStyle]::Bold)
     $titleLabel.ForeColor = $script:Theme.TextPrimary
     $titleLabel.Location = New-Object System.Drawing.Point(80, 24)
     $titleLabel.Size = New-Object System.Drawing.Size(270, 28)
@@ -3466,12 +3605,12 @@ function Show-UpdateCheckDialog {
     $dlg.MinimizeBox = $false
     $dlg.Icon = $script:IconOk
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $spinner = New-Object System.Windows.Forms.Label
     $spinner.Text = ([char]0x25CF)
-    $spinner.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+    $spinner.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 14)
     $spinner.ForeColor = $script:Theme.Accent
     $spinner.Location = New-Object System.Drawing.Point(20, 22)
     $spinner.Size = New-Object System.Drawing.Size(30, 30)
@@ -3479,7 +3618,7 @@ function Show-UpdateCheckDialog {
 
     $statusLbl = New-Object System.Windows.Forms.Label
     $statusLbl.Text = 'Checking for updates'
-    $statusLbl.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $statusLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 11)
     $statusLbl.ForeColor = $script:Theme.TextPrimary
     $statusLbl.Location = New-Object System.Drawing.Point(60, 20)
     $statusLbl.Size = New-Object System.Drawing.Size(270, 26)
@@ -3503,14 +3642,27 @@ function Show-UpdateCheckDialog {
     # Pulses the dot's opacity via foreground color lerp between the accent
     # color and the window background - a cheap "still working" heartbeat
     # that doesn't need a sprite sheet or GDI+ arc-drawing timer.
+    #
+    # Theme colors are pulled into local variables *before* GetNewClosure()
+    # rather than read as $script:Theme.X from inside the closure - chaining
+    # a dotted member-access off a script-scope variable inside a
+    # GetNewClosure()'d scriptblock intermittently throws "Cannot convert
+    # null to type System.Drawing.Color" on the property setter, even though
+    # $script:Theme.X is never actually null. Snapshotting the value first
+    # sidesteps whatever closure-scope resolution bug causes that.
+    $accentColor = $script:Theme.Accent
+    $windowBgColor = $script:Theme.WindowBg
+    $dangerColor = $script:Theme.Danger
+    $successColor = $script:Theme.Success
+
     $pulseStep = 0
     $animTimer = New-Object System.Windows.Forms.Timer
     $animTimer.Interval = 90
     $animTimer.Add_Tick({
         $pulseStep = ($pulseStep + 1) % 20
         $t = if ($pulseStep -le 10) { $pulseStep / 10.0 } else { (20 - $pulseStep) / 10.0 }
-        $a = $script:Theme.Accent
-        $bg = $script:Theme.WindowBg
+        $a = $accentColor
+        $bg = $windowBgColor
         $r = [int]($bg.R + ($a.R - $bg.R) * $t)
         $g = [int]($bg.G + ($a.G - $bg.G) * $t)
         $b = [int]($bg.B + ($a.B - $bg.B) * $t)
@@ -3526,19 +3678,19 @@ function Show-UpdateCheckDialog {
         $animTimer.Stop()
         if ($script:UpdateCheckError) {
             $spinner.Text = [char]0x2715
-            $spinner.ForeColor = $script:Theme.Danger
+            $spinner.ForeColor = $dangerColor
             $statusLbl.Text = "Couldn't check for updates"
             $detailLbl.Text = $script:UpdateCheckError
         } elseif ($script:UpdateAvailable) {
             $spinner.Text = [char]0x2191
-            $spinner.ForeColor = $script:Theme.Accent
+            $spinner.ForeColor = $accentColor
             $statusLbl.Text = "Update available: v$script:UpdateLatestVersion"
             $detailLbl.Text = "You're on v$script:AppVersion"
             $actionButton.Text = 'Download'
             $actionButton.Add_Click({ try { Start-Process $script:UpdateUrl } catch {}; $dlg.Close() })
         } else {
             $spinner.Text = [char]0x2713
-            $spinner.ForeColor = $script:Theme.Success
+            $spinner.ForeColor = $successColor
             $statusLbl.Text = "You're up to date"
             $detailLbl.Text = "Version $script:AppVersion is the latest release"
         }
@@ -3557,7 +3709,7 @@ function New-SettingsSectionLabel {
     param([string]$Text, [int]$X, [int]$Y)
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $Text
-    $l.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $l.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
     $l.Location = New-Object System.Drawing.Point($X, $Y)
     $l.Size = New-Object System.Drawing.Size(300, 20)
     $l.ForeColor = $script:Theme.TextPrimary
@@ -3573,7 +3725,7 @@ function Show-SettingsDialog {
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $tabs = New-CustomTabControl -Labels @('General', 'Appearance', 'Startup', 'Diagnostics')
@@ -3636,7 +3788,7 @@ function Show-SettingsDialog {
     $systemPortsHintLbl.Location = New-Object System.Drawing.Point(15, 147)
     $systemPortsHintLbl.Size = New-Object System.Drawing.Size(420, 48)
     $systemPortsHintLbl.ForeColor = $script:Theme.TextDim
-    $systemPortsHintLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $systemPortsHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
     $tabGeneral.Controls.AddRange(@($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl))
 
@@ -3648,7 +3800,7 @@ function Show-SettingsDialog {
     $themeLightRadio.Location = New-Object System.Drawing.Point(18, 42)
     $themeLightRadio.Size = New-Object System.Drawing.Size(100, 22)
     $themeLightRadio.ForeColor = $script:Theme.TextPrimary
-    $themeLightRadio.Checked = ($script:Settings.Theme -ne 'Dark')
+    $themeLightRadio.Checked = ($script:Settings.Theme -notin @('Dark', 'Terminal'))
 
     $themeDarkRadio = New-Object System.Windows.Forms.RadioButton
     $themeDarkRadio.Text = 'Dark'
@@ -3657,14 +3809,21 @@ function Show-SettingsDialog {
     $themeDarkRadio.ForeColor = $script:Theme.TextPrimary
     $themeDarkRadio.Checked = ($script:Settings.Theme -eq 'Dark')
 
+    $themeTerminalRadio = New-Object System.Windows.Forms.RadioButton
+    $themeTerminalRadio.Text = 'Terminal'
+    $themeTerminalRadio.Location = New-Object System.Drawing.Point(18, 94)
+    $themeTerminalRadio.Size = New-Object System.Drawing.Size(100, 22)
+    $themeTerminalRadio.ForeColor = $script:Theme.TextPrimary
+    $themeTerminalRadio.Checked = ($script:Settings.Theme -eq 'Terminal')
+
     $themeHintLbl = New-Object System.Windows.Forms.Label
     $themeHintLbl.Text = 'Applies after a restart - you will be offered one automatically if you change this.'
-    $themeHintLbl.Location = New-Object System.Drawing.Point(15, 98)
+    $themeHintLbl.Location = New-Object System.Drawing.Point(15, 124)
     $themeHintLbl.Size = New-Object System.Drawing.Size(420, 32)
     $themeHintLbl.ForeColor = $script:Theme.TextDim
-    $themeHintLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $themeHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
-    $tabAppearance.Controls.AddRange(@($themeLbl, $themeLightRadio, $themeDarkRadio, $themeHintLbl))
+    $tabAppearance.Controls.AddRange(@($themeLbl, $themeLightRadio, $themeDarkRadio, $themeTerminalRadio, $themeHintLbl))
 
     # --- Startup ----------------------------------------------------------
     $launchSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.LaunchAtStartup)
@@ -3721,7 +3880,7 @@ function Show-SettingsDialog {
     $diagDescLbl.Location = New-Object System.Drawing.Point(15, 46)
     $diagDescLbl.Size = New-Object System.Drawing.Size(420, 40)
     $diagDescLbl.ForeColor = $script:Theme.TextDim
-    $diagDescLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $diagDescLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
     $viewLogButton = New-Object System.Windows.Forms.Button
     $viewLogButton.Text = 'View Log'
@@ -3755,7 +3914,7 @@ function Show-SettingsDialog {
         $script:Settings.RootDir = $script:RootDir
         $script:Settings.ShowSystemPorts = Get-ToggleChecked $systemPortsSwitch
 
-        $newTheme = if ($themeDarkRadio.Checked) { 'Dark' } else { 'Light' }
+        $newTheme = if ($themeTerminalRadio.Checked) { 'Terminal' } elseif ($themeDarkRadio.Checked) { 'Dark' } else { 'Light' }
         $themeChanged = $newTheme -ne $script:Settings.Theme
         $script:Settings.Theme = $newTheme
 
@@ -3782,62 +3941,65 @@ function Show-SettingsDialog {
 function Show-DashboardDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Dashboard'
-    $dlg.Size = New-Object System.Drawing.Size(480, 300)
+    $dlg.Size = New-Object System.Drawing.Size(520, 340)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $introLbl = New-Object System.Windows.Forms.Label
     $introLbl.Text = 'View the current table and stop/restart projects from a browser, on this PC or (once you set up reachability) your LAN/Tailnet.'
     $introLbl.Location = New-Object System.Drawing.Point(15, 15)
-    $introLbl.Size = New-Object System.Drawing.Size(435, 34)
+    $introLbl.Size = New-Object System.Drawing.Size(475, 48)
     $introLbl.ForeColor = $script:Theme.TextDim
 
     $enableSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.DashboardEnabled)
-    $enableSwitch.Location = New-Object System.Drawing.Point(15, 58)
+    $enableSwitch.Location = New-Object System.Drawing.Point(15, 70)
 
     $enableLbl = New-Object System.Windows.Forms.Label
     $enableLbl.Text = 'Enable web dashboard'
-    $enableLbl.Location = New-Object System.Drawing.Point(60, 58)
+    $enableLbl.Location = New-Object System.Drawing.Point(60, 70)
     $enableLbl.Size = New-Object System.Drawing.Size(250, 20)
     $enableLbl.ForeColor = $script:Theme.TextPrimary
     Connect-ToggleLabel -Switch $enableSwitch -Label $enableLbl
 
     $offByDefaultLbl = New-Object System.Windows.Forms.Label
     $offByDefaultLbl.Text = 'Off by default. Nothing listens on any port until you enable it here.'
-    $offByDefaultLbl.Location = New-Object System.Drawing.Point(15, 84)
-    $offByDefaultLbl.Size = New-Object System.Drawing.Size(435, 18)
+    $offByDefaultLbl.Location = New-Object System.Drawing.Point(15, 96)
+    $offByDefaultLbl.Size = New-Object System.Drawing.Size(475, 32)
     $offByDefaultLbl.ForeColor = $script:Theme.TextDim
-    $offByDefaultLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $offByDefaultLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
     $portLbl = New-Object System.Windows.Forms.Label
     $portLbl.Text = 'Port:'
-    $portLbl.Location = New-Object System.Drawing.Point(15, 118)
-    $portLbl.Size = New-Object System.Drawing.Size(40, 24)
+    $portLbl.Location = New-Object System.Drawing.Point(15, 140)
+    $portLbl.Size = New-Object System.Drawing.Size(55, 24)
     $portLbl.ForeColor = $script:Theme.TextPrimary
     $portLbl.TextAlign = 'MiddleLeft'
 
     $portBox = New-Object System.Windows.Forms.NumericUpDown
-    $portBox.Location = New-Object System.Drawing.Point(60, 116)
+    $portBox.Location = New-Object System.Drawing.Point(75, 138)
     $portBox.Size = New-Object System.Drawing.Size(90, 24)
     $portBox.Minimum = 1024
     $portBox.Maximum = 65535
     $portBox.Value = [Math]::Max(1024, [Math]::Min(65535, [int]$script:Settings.WebPort))
     $portBox.Enabled = [bool]$script:Settings.DashboardEnabled
+    $portBox.BackColor = $script:Theme.CardBg
+    $portBox.ForeColor = $script:Theme.TextPrimary
+    $portBox.BorderStyle = 'FixedSingle'
 
     Set-ToggleOnChange -Switch $enableSwitch -Handler {
         $portBox.Enabled = Get-ToggleChecked $enableSwitch
     }.GetNewClosure()
 
     $statusLbl = New-Object System.Windows.Forms.Label
-    $statusLbl.Location = New-Object System.Drawing.Point(15, 150)
-    $statusLbl.Size = New-Object System.Drawing.Size(435, 60)
+    $statusLbl.Location = New-Object System.Drawing.Point(15, 172)
+    $statusLbl.Size = New-Object System.Drawing.Size(475, 70)
     $statusLbl.ForeColor = $script:Theme.TextDim
-    $statusLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $statusLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
     if ($script:Settings.DashboardEnabled -and $script:DashboardCache.Listening) {
         $addrText = (@($script:DashboardCache.Addresses) | ForEach-Object { "$($_.Label): $($_.Url)" }) -join "`n"
         $statusLbl.Text = "Currently running.`n$addrText"
@@ -3851,14 +4013,14 @@ function Show-DashboardDialog {
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'OK'
-    $okButton.Location = New-Object System.Drawing.Point(275, 225)
+    $okButton.Location = New-Object System.Drawing.Point(315, 255)
     $okButton.Size = New-Object System.Drawing.Size(85, 28)
     $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
     Initialize-ModernButton -Button $okButton -Variant Accent
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Cancel'
-    $cancelButton.Location = New-Object System.Drawing.Point(365, 225)
+    $cancelButton.Location = New-Object System.Drawing.Point(405, 255)
     $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
     $cancelButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $cancelButton
@@ -3941,7 +4103,7 @@ function Show-ManageGroupsDialog {
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $dlg.BackColor = $script:Theme.WindowBg
-    $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
     $nameLabel = New-Object System.Windows.Forms.Label
@@ -3954,6 +4116,8 @@ function Show-ManageGroupsDialog {
     $nameCombo.DropDownStyle = 'DropDown'
     $nameCombo.Location = New-Object System.Drawing.Point(15, 38)
     $nameCombo.Size = New-Object System.Drawing.Size(415, 24)
+    $nameCombo.BackColor = $script:Theme.CardBg
+    $nameCombo.ForeColor = $script:Theme.TextPrimary
     foreach ($n in ($script:Groups.Keys | Sort-Object)) { $nameCombo.Items.Add($n) | Out-Null }
 
     $projLabel = New-Object System.Windows.Forms.Label
@@ -3979,6 +4143,8 @@ function Show-ManageGroupsDialog {
     $projList.Size = New-Object System.Drawing.Size(415, 236)
     $projList.CheckOnClick = $true
     $projList.BorderStyle = 'FixedSingle'
+    $projList.BackColor = $script:Theme.CardBg
+    $projList.ForeColor = $script:Theme.TextPrimary
 
     # Boxed in a hashtable so event handlers (each running in their own
     # PowerShell scope) can update it in place without needing $script: scope.
@@ -4230,7 +4396,8 @@ $stopAllButton.Add_Click({
 # System tray
 # ---------------------------------------------------------------------------
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
-Enable-RoundedPopup -Popup $trayMenu -Radius 8
+$trayMenu.ShowImageMargin = $false
+Enable-RoundedPopup -Popup $trayMenu
 $trayMenu.ForeColor = $script:Theme.TextPrimary
 if ($script:MenuRenderer) { $trayMenu.Renderer = $script:MenuRenderer }
 
@@ -4329,6 +4496,7 @@ function Build-TrayMenuItems {
         foreach ($groupName in ($script:Groups.Keys | Sort-Object)) {
             $groupItem = New-Object System.Windows.Forms.ToolStripMenuItem "Group: $groupName"
             $groupItem.DropDown.ForeColor = $script:Theme.TextPrimary
+            $groupItem.DropDown.ShowImageMargin = $false
             $capturedName = $groupName
 
             $startItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Start All'

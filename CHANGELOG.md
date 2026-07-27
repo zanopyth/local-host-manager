@@ -5,6 +5,78 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - 2026-07-27
+
+### Added
+- **Terminal theme**: a third Settings > Appearance option alongside Light
+  and Dark - a Catppuccin Mocha-inspired palette (near-black panels, one
+  blue accent, semantic green/red status colors), flat/square corners
+  instead of rounded, and a monospace font (Cascadia Mono) throughout, for
+  a terminal-UI look. Applies after a restart, same as switching Light/Dark.
+
+### Fixed
+- Toolbar buttons ("Refresh", "Groups", "Start All", "Stop All") clipped
+  their own text under the wider monospace font - widened to fit.
+- Dashboard dialog: the intro/hint text wrapped and got vertically clipped
+  under the monospace font, and the port field's border/background stayed
+  native white instead of following the theme. Dialog resized and
+  relayouted, port field themed.
+- Manage Groups dialog: the group-name field and project checklist stayed
+  native white regardless of the active theme.
+- Group-divider rows in the ports table were an easy-to-miss blank gap
+  (and could pick up a stray focus-rectangle outline); now a deliberate
+  accent-colored divider line, and no longer selectable via keyboard/mouse
+  navigation.
+
+## [1.8.10] - 2026-07-26
+
+### Fixed
+- **Settings menu**: "Dev Servers Only" and "Use Groups" rendered with
+  their checkmark glyph overlapping the first letter or two of their own
+  text ("Dev Ser...", "se Groups"). Root cause was in the stock
+  `ToolStripProfessionalRenderer` itself, not this app's own rendering -
+  reproduced identically with a bare, unthemed, undecorated `MenuStrip`.
+  Padding.Left on these two items now clears the checkbox glyph.
+
+## [1.8.9] - 2026-07-26
+
+### Fixed
+- **Groups popup**: the checked-list dropdown was a fixed 130px tall no
+  matter how many groups existed, leaving a large empty band below the
+  last item (and before the rounded border) for anyone with only 1-3
+  groups defined. Now sizes to fit the actual items, still capped at
+  130px so a long group list keeps scrolling instead of growing unbounded.
+- **File / Help menus and the tray menu** reserved the standard ~25px
+  left-side gutter every `ToolStripDropDownMenu` sets aside for
+  checkmark/icon glyphs, even though none of their items use one - a
+  permanent, unused-looking gap down the left edge of every plain-text
+  menu. Turned off for these (Settings keeps it: "Dev Servers Only" /
+  "Use Groups" are real checkable items that render into that gutter).
+- Help menu's dropdown text color was never set (File and Settings were),
+  so it silently fell back to black regardless of the active theme.
+
+## [1.8.8] - 2026-07-26
+
+### Fixed
+- **Check for Updates** threw "Exception setting 'ForeColor': Cannot convert
+  null to type 'System.Drawing.Color'" and got stuck on "Checking for
+  updates" once the result landed. Cause: the dialog's timers read
+  `$script:Theme.<Color>` (a dotted member-access off a script-scope
+  variable) from inside a `.GetNewClosure()`'d tick handler, which
+  PowerShell intermittently resolves to `$null` instead of the real color.
+  Now reads the needed theme colors into local variables before the
+  closure is created.
+- Row detail popup's per-row copy icon (the small button next to each
+  value, e.g. Local URL, Network URL, Project Path) rendered as a blank
+  square instead of the copy glyph. Cause: its `.Text` was set *after*
+  `Initialize-ModernButton`, which owner-draws from a snapshot of `.Text`
+  taken at init time - so the glyph assignment never took effect visually.
+  Now set before init.
+
+### Added
+- Row detail popup: **Local URL** is now a clickable link that opens it in
+  the default browser.
+
 ## [1.8.7] - 2026-07-26
 
 ### Fixed
