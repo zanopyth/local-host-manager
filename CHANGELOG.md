@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] - 2026-07-27
+
+### Added
+- **Port collision protection**: Start, Restart, and Start All now check the
+  target port right before launching. If it's already held - by an
+  untracked leftover of the same project (e.g. after a crash/restart of
+  Localhost Manager itself) or by something unrelated - you get an
+  upfront choice to kill it and proceed, instead of the launch silently
+  dying a moment later.
+- **Smarter crash diagnostics**: a launch that exits within seconds of
+  starting, whose own output mentions an address conflict (`EADDRINUSE`,
+  "already in use", ...), is now logged and notified as a port conflict
+  instead of a bare, unhelpful "crashed (exit code 1)".
+
+### Fixed
+- Settings > Appearance: picking a **Group Divider** style silently
+  unchecked whichever **Theme** option was selected, and vice versa - both
+  radio-button groups shared the same parent control, so WinForms treated
+  all six as one mutually exclusive set (and Save, reading an
+  all-unchecked Theme group, quietly fell back to Light). Each group now
+  lives in its own container.
+
+### Changed
+- Default theme (for fresh installs, and upgrades from before the Theme
+  setting existed) is now **Terminal** instead of Light.
+
 ## [1.9.0] - 2026-07-27
 
 ### Added

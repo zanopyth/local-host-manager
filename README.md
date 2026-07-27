@@ -7,6 +7,8 @@ A small Windows tray app that scans your machine for running `localhost` dev
 servers (npm/node projects), shows their status, LAN URLs, and lets you
 start/stop them individually or in named groups — all without a config file.
 
+![Localhost Manager preview](preview.png)
+
 ## Download
 
 Grab the latest `LocalhostManager.exe` from the

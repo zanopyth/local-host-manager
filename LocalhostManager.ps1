@@ -219,7 +219,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Light'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline' }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -228,11 +228,17 @@ function Load-Settings {
         $webPort = if ($raw.PSObject.Properties.Name -contains 'WebPort' -and [int]$raw.WebPort -gt 0) { [int]$raw.WebPort } else { 3199 }
         $dashboardEnabled = if ($raw.PSObject.Properties.Name -contains 'DashboardEnabled') { [bool]$raw.DashboardEnabled } else { $false }
         $showSystemPorts = if ($raw.PSObject.Properties.Name -contains 'ShowSystemPorts') { [bool]$raw.ShowSystemPorts } else { $false }
-        $theme = if ($raw.PSObject.Properties.Name -contains 'Theme' -and [string]$raw.Theme -in @('Dark', 'Terminal')) { [string]$raw.Theme } else { 'Light' }
+        # Explicit 'Light' must be preserved, not treated the same as a
+        # missing property - it used to be safe to conflate the two only
+        # because Light was also the fallback default; now that the
+        # fallback is Terminal, an old settings.json saved as Light would
+        # otherwise get silently upgraded on load.
+        $theme = if ($raw.PSObject.Properties.Name -contains 'Theme' -and [string]$raw.Theme -in @('Light', 'Dark', 'Terminal')) { [string]$raw.Theme } else { 'Terminal' }
         $launchAtStartup = if ($raw.PSObject.Properties.Name -contains 'LaunchAtStartup') { [bool]$raw.LaunchAtStartup } else { $false }
         $startMinimized = if ($raw.PSObject.Properties.Name -contains 'StartMinimized') { [bool]$raw.StartMinimized } else { $false }
         $crashNotifications = if ($raw.PSObject.Properties.Name -contains 'CrashNotifications') { [bool]$raw.CrashNotifications } else { $true }
         $checkForUpdates = if ($raw.PSObject.Properties.Name -contains 'CheckForUpdates') { [bool]$raw.CheckForUpdates } else { $true }
+        $groupDividerStyle = if ($raw.PSObject.Properties.Name -contains 'GroupDividerStyle' -and [string]$raw.GroupDividerStyle -in @('Dotted', 'Labeled')) { [string]$raw.GroupDividerStyle } else { 'Hairline' }
         return @{
             OnlyNode           = [bool]$raw.OnlyNode
             RootDir            = [string]$raw.RootDir
@@ -246,6 +252,7 @@ function Load-Settings {
             StartMinimized     = $startMinimized
             CrashNotifications = $crashNotifications
             CheckForUpdates    = $checkForUpdates
+            GroupDividerStyle  = $groupDividerStyle
         }
     } catch { return $defaults }
 }
@@ -1070,7 +1077,14 @@ function Draw-ButtonLayer {
     if ($Alpha -le 0.01 -or -not $Text) { return }
     $iconSize = 12
     $gap = 6
-    $textSize = [System.Windows.Forms.TextRenderer]::MeasureText($Graphics, $Text, $Font, [System.Drawing.Size]::Empty, [System.Windows.Forms.TextFormatFlags]::NoPadding)
+    # Measure with the same StringFormat we draw with (GenericTypographic,
+    # via Graphics.MeasureString/DrawString - both GDI+). Mixing this with
+    # TextRenderer.MeasureText (GDI) used to under/overshoot by a couple px
+    # because GenericDefault - DrawString's implicit format - pads the
+    # string with extra leading space GDI's measurement doesn't know about,
+    # so the centered group rendered a few px right of true center.
+    $sf = [System.Drawing.StringFormat]::GenericTypographic
+    $textSize = $Graphics.MeasureString($Text, $Font, [System.Drawing.PointF]::Empty, $sf)
     $hasIcon = [bool]$Icon
     $totalW = $textSize.Width + $(if ($hasIcon) { $iconSize + $gap } else { 0 })
     $startX = $Rect.X + ($Rect.Width - $totalW) / 2.0
@@ -1083,7 +1097,7 @@ function Draw-ButtonLayer {
     }
     $textColor = [System.Drawing.Color]::FromArgb([int](255 * $Alpha), $Color)
     $brush = New-Object System.Drawing.SolidBrush($textColor)
-    $Graphics.DrawString($Text, $Font, $brush, $startX, ($centerY - $textSize.Height / 2.0))
+    $Graphics.DrawString($Text, $Font, $brush, $startX, ($centerY - $textSize.Height / 2.0), $sf)
     $brush.Dispose()
 }
 
@@ -1637,7 +1651,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.9.0'
+$script:AppVersion = '1.10.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2421,15 +2435,7 @@ function New-PortsGrid {
         param($s, $e)
         $row = $s.Rows[$e.RowIndex]
         if ($row.Tag -eq 'separator') {
-            # A deliberate group-divider rule, not just a differently-colored
-            # gap - accent-colored and inset from the edges so it reads as an
-            # intentional break between groups rather than a rendering gap.
-            $lineColor = $script:Theme.Accent
-            if ($null -eq $lineColor) { return }
-            $y = $e.RowBounds.Top + [Math]::Floor($e.RowBounds.Height / 2.0)
-            $pen = New-Object System.Drawing.Pen($lineColor, 2)
-            $e.Graphics.DrawLine($pen, $e.RowBounds.Left + 8, $y, $e.RowBounds.Right - 8, $y)
-            $pen.Dispose()
+            Draw-GroupDividerRow -Graphics $e.Graphics -RowBounds $e.RowBounds -GroupName $row.HeaderCell.Value
             return
         }
         $borderColor = $script:Theme.Border
@@ -2540,12 +2546,69 @@ function Add-DataRow {
     }
 }
 
+function Draw-GroupDividerRow {
+    # Renders the rule that breaks the grid between groups. Reads the style
+    # live from Settings > Appearance (Hairline/Dotted/Labeled) so switching
+    # it just needs a Refresh-Grid, no restart. All three keep the same 8px
+    # inset from the row edges the old accent bar used, just with a much
+    # quieter muted-border color instead of a 2px accent-colored bar - the
+    # original read as an alert/warning stripe rather than a section break.
+    param($Graphics, [System.Drawing.Rectangle]$RowBounds, [string]$GroupName)
+    $lineColor = $script:Theme.Border
+    if ($null -eq $lineColor) { return }
+    $y = $RowBounds.Top + [Math]::Floor($RowBounds.Height / 2.0)
+    $left = $RowBounds.Left + 8
+    $right = $RowBounds.Right - 8
+
+    switch ($script:Settings.GroupDividerStyle) {
+        'Dotted' {
+            $pen = New-Object System.Drawing.Pen($lineColor, 1)
+            $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dot
+            $Graphics.DrawLine($pen, $left, $y, $right, $y)
+            $pen.Dispose()
+        }
+        'Labeled' {
+            $text = if ($GroupName) { $GroupName.ToUpperInvariant() } else { '' }
+            $pen = New-Object System.Drawing.Pen($lineColor, 1)
+            if ($text) {
+                $font = New-Object System.Drawing.Font($script:Theme.FontFamily, 7.5, [System.Drawing.FontStyle]::Bold)
+                $sf = [System.Drawing.StringFormat]::GenericTypographic
+                $textSize = $Graphics.MeasureString($text, $font, [System.Drawing.PointF]::Empty, $sf)
+                $pad = 10
+                $textLeft = $RowBounds.Left + ($RowBounds.Width - $textSize.Width) / 2.0
+                $Graphics.DrawLine($pen, $left, $y, ($textLeft - $pad), $y)
+                $Graphics.DrawLine($pen, ($textLeft + $textSize.Width + $pad), $y, $right, $y)
+                $brush = New-Object System.Drawing.SolidBrush($script:Theme.TextDim)
+                $Graphics.DrawString($text, $font, $brush, $textLeft, ($y - $textSize.Height / 2.0), $sf)
+                $brush.Dispose()
+                $font.Dispose()
+            } else {
+                $Graphics.DrawLine($pen, $left, $y, $right, $y)
+            }
+            $pen.Dispose()
+        }
+        default {
+            # Hairline
+            $pen = New-Object System.Drawing.Pen($lineColor, 1)
+            $Graphics.DrawLine($pen, $left, $y, $right, $y)
+            $pen.Dispose()
+        }
+    }
+}
+
 function Add-SeparatorRow {
-    param($Grid)
+    # -GroupName is only consumed by the 'Labeled' divider style (Settings >
+    # Appearance) - stashed on the row header cell since RowHeadersVisible is
+    # false, so it never renders on its own and doesn't disturb row.Tag
+    # (still the 'separator' sentinel every click/double-click/right-click
+    # handler already checks for).
+    param($Grid, [string]$GroupName = '')
     $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '', '')
     $row = $Grid.Rows[$idx]
     $row.Tag = 'separator'
-    $row.Height = 10
+    $row.HeaderCell.Value = $GroupName
+    # Labeled needs room for a centered caption; the plain rules stay thin.
+    $row.Height = if ($script:Settings.GroupDividerStyle -eq 'Labeled') { 20 } else { 10 }
     $row.ReadOnly = $true
     $row.DefaultCellStyle.BackColor = $script:Theme.PanelBg
     $row.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
@@ -2600,7 +2663,7 @@ function Render-Grid {
         $Grid.Rows.Clear()
         $lastGroup = $null
         foreach ($d in $Display) {
-            if ($null -ne $d.Group -and $null -ne $lastGroup -and $d.Group -ne $lastGroup) { Add-SeparatorRow -Grid $Grid }
+            if ($null -ne $d.Group -and $null -ne $lastGroup -and $d.Group -ne $lastGroup) { Add-SeparatorRow -Grid $Grid -GroupName $d.Group }
             Add-DataRow -Grid $Grid -r $d.Row
             $lastGroup = $d.Group
         }
@@ -2741,6 +2804,7 @@ function Start-ProjectAtPath {
             StoppedByUser = $false
             Crashed       = $false
             ProjectPath   = $ProjectPath
+            StartedAt     = [DateTime]::UtcNow
         }
         $script:ManagedProcesses[$key] = $entry
         Limit-ProjectLogFile -ProjectPath $ProjectPath
@@ -2770,12 +2834,36 @@ function Start-ProjectAtPath {
                 $code = $e.Proc.ExitCode
                 Add-ManagedLog -Entry $e -Text "*** process exited unexpectedly (exit code $code) ***"
                 $label = Split-Path -Leaf $Event.MessageData.ProjectPath
-                Write-AppErrorLog -Context "Project crashed: $label (exit code $code)"
-                try {
-                    if ([bool]$script:Settings.CrashNotifications) {
-                        $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "$label crashed (exit code $code).", [System.Windows.Forms.ToolTipIcon]::Warning)
+
+                # A near-instant exit whose own output mentions an address
+                # conflict is a port collision, not a real crash - flag it
+                # separately so the notification/error log point at the
+                # actual cause instead of a bare, unhelpful exit code. (This
+                # is what a plain "exit code 1" looked like for Body Shop
+                # when something else already had port 5100.)
+                $portConflict = $false
+                if (((Get-Date).ToUniversalTime() - $e.StartedAt).TotalSeconds -le 8) {
+                    $recentLog = ($e.Log.ToArray() | Select-Object -Last 25) -join "`n"
+                    if ($recentLog -match '(?i)(EADDRINUSE|address already in use|port \d+ is already in use|already in use)') {
+                        $portConflict = $true
                     }
-                } catch {}
+                }
+
+                if ($portConflict) {
+                    Write-AppErrorLog -Context "Project failed to start: $label - port already in use (exit code $code)"
+                    try {
+                        if ([bool]$script:Settings.CrashNotifications) {
+                            $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "$label didn't start - its port is already in use by something else.", [System.Windows.Forms.ToolTipIcon]::Warning)
+                        }
+                    } catch {}
+                } else {
+                    Write-AppErrorLog -Context "Project crashed: $label (exit code $code)"
+                    try {
+                        if ([bool]$script:Settings.CrashNotifications) {
+                            $notifyIcon.ShowBalloonTip(4000, 'Localhost Manager', "$label crashed (exit code $code).", [System.Windows.Forms.ToolTipIcon]::Warning)
+                        }
+                    } catch {}
+                }
             }
             $p = $Event.MessageData.SubPrefix
             Unregister-Event -SourceIdentifier "${p}_out" -ErrorAction SilentlyContinue
@@ -2875,6 +2963,88 @@ function Test-ProjectStartable {
     return [bool]$CommandLine
 }
 
+function Get-PortListenerInfo {
+    # Fresh, single-port synchronous check used right before a launch -
+    # unlike $script:LiveCache (which can lag behind by up to one poll
+    # interval), this always reflects reality at the moment Start is
+    # clicked. ProjectPath, when available, is borrowed from LiveCache
+    # (whatever the background poller's PEB walk already resolved for this
+    # PID) rather than duplicating that walk here - fine for "whose orphan
+    # is this" context even if it's a tick stale, since the busy/free fact
+    # itself always comes from the fresh check above.
+    param([int]$Port)
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    } catch { $conn = $null }
+    if (-not $conn) { return $null }
+
+    $procId = [int]$conn.OwningProcess
+    $procName = $null
+    try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch {}
+
+    $projectPath = $null
+    $cached = $script:LiveCache.Listeners[[string]$Port]
+    if ($cached -and [int]$cached.ProcId -eq $procId) { $projectPath = $cached.ProjectPath }
+
+    return [PSCustomObject]@{
+        ProcId      = $procId
+        ProcessName = $procName
+        ProjectPath = $projectPath
+    }
+}
+
+function Test-PortCollision {
+    # Runs immediately before a desktop-triggered Start/Restart so a
+    # process already squatting the target port becomes an upfront,
+    # actionable choice instead of the doomed launch that hit Body Shop:
+    # npm's node exiting 1 with "port already in use", logged as a plain,
+    # unexplained crash. Returns $true when it's fine to go ahead and call
+    # Start-ProjectAtPath, $false when the caller should not start it.
+    #
+    # Not wired into Start-ProjectAtPath itself - that function is also the
+    # web dashboard's start/restart path (see Invoke-DashboardAction), and
+    # a blocking MessageBox triggered by a remote browser click would just
+    # hang the desktop app waiting for someone at the keyboard to answer it.
+    param([string]$ProjectPath, [int]$Port, [string]$Label)
+    if ($Port -le 0) { return $true }
+    $info = Get-PortListenerInfo -Port $Port
+    if (-not $info) { return $true }
+
+    $sameProject = $info.ProjectPath -and ((Get-NormalizedPath $info.ProjectPath) -eq (Get-NormalizedPath $ProjectPath))
+    $who = if ($info.ProcessName) { "$($info.ProcessName) (PID $($info.ProcId))" } else { "PID $($info.ProcId)" }
+
+    if ($sameProject) {
+        $title = 'Already Running?'
+        $message = "$Label already appears to be listening on port $Port ($who), but Localhost Manager isn't tracking it - probably left running from an earlier session or crash.`n`nKill it and start fresh?"
+    } else {
+        $title = 'Port In Use'
+        $message = "Port $Port is already in use by $who, which doesn't look related to $Label. Starting now will very likely fail immediately.`n`nKill that process and start anyway?"
+    }
+    $confirm = [System.Windows.Forms.MessageBox]::Show($message, $title, 'YesNo', 'Warning')
+    if ($confirm -ne 'Yes') { return $false }
+
+    # Same taskkill-then-safety-net pattern as Stop-ProjectById: bounded
+    # wait so a slow/stuck taskkill can never block the single UI thread.
+    try {
+        $killProc = New-Object System.Diagnostics.Process
+        $killProc.StartInfo.FileName = 'taskkill.exe'
+        $killProc.StartInfo.Arguments = "/PID $($info.ProcId) /T /F"
+        $killProc.StartInfo.UseShellExecute = $false
+        $killProc.StartInfo.CreateNoWindow = $true
+        [void]$killProc.Start()
+        if (-not $killProc.WaitForExit(3000)) {
+            Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($info.ProcId) (port $Port) - continuing without waiting" -Level Warning
+        }
+    } catch {}
+    try {
+        if (Get-Process -Id $info.ProcId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $info.ProcId -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    Start-Sleep -Milliseconds 400
+    return $true
+}
+
 function Invoke-ToggleAction {
     param($data)
 
@@ -2895,6 +3065,8 @@ function Invoke-ToggleAction {
             [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
             return
         }
+        $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
+        if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
         if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
             [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
         }
@@ -2926,6 +3098,9 @@ function Invoke-Restart {
         }
         Start-Sleep -Milliseconds 800
     }
+
+    $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
+    if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
 
     if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
         [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
@@ -3741,7 +3916,7 @@ function Show-SettingsDialog {
 
     # --- General ------------------------------------------------------------
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = 'Only show projects under this root directory:'
+    $lbl.Text = 'Only show projects under this folder:'
     $lbl.Location = New-Object System.Drawing.Point(15, 15)
     $lbl.Size = New-Object System.Drawing.Size(400, 20)
     $lbl.ForeColor = $script:Theme.TextPrimary
@@ -3793,6 +3968,17 @@ function Show-SettingsDialog {
     $tabGeneral.Controls.AddRange(@($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl))
 
     # --- Appearance -----------------------------------------------------------
+    # Theme and Group Divider each get their own Panel: WinForms auto-groups
+    # every RadioButton sharing an immediate Parent into one mutually
+    # exclusive set, so having both trios directly under $tabAppearance meant
+    # picking a divider style silently unchecked whichever Theme radio was
+    # selected (and Save, reading an all-unchecked Theme group, quietly fell
+    # back to Light).
+    $themeSectionPanel = New-Object System.Windows.Forms.Panel
+    $themeSectionPanel.Location = New-Object System.Drawing.Point(0, 0)
+    $themeSectionPanel.Size = New-Object System.Drawing.Size(450, 160)
+    $themeSectionPanel.BackColor = $script:Theme.WindowBg
+
     $themeLbl = New-SettingsSectionLabel -Text 'Theme' -X 15 -Y 15
 
     $themeLightRadio = New-Object System.Windows.Forms.RadioButton
@@ -3823,7 +4009,46 @@ function Show-SettingsDialog {
     $themeHintLbl.ForeColor = $script:Theme.TextDim
     $themeHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
-    $tabAppearance.Controls.AddRange(@($themeLbl, $themeLightRadio, $themeDarkRadio, $themeTerminalRadio, $themeHintLbl))
+    $themeSectionPanel.Controls.AddRange(@($themeLbl, $themeLightRadio, $themeDarkRadio, $themeTerminalRadio, $themeHintLbl))
+
+    $dividerSectionPanel = New-Object System.Windows.Forms.Panel
+    $dividerSectionPanel.Location = New-Object System.Drawing.Point(0, 168)
+    $dividerSectionPanel.Size = New-Object System.Drawing.Size(450, 90)
+    $dividerSectionPanel.BackColor = $script:Theme.WindowBg
+
+    $dividerLbl = New-SettingsSectionLabel -Text 'Group Divider' -X 15 -Y 0
+
+    $dividerHairlineRadio = New-Object System.Windows.Forms.RadioButton
+    $dividerHairlineRadio.Text = 'Thin line'
+    $dividerHairlineRadio.Location = New-Object System.Drawing.Point(18, 27)
+    $dividerHairlineRadio.Size = New-Object System.Drawing.Size(120, 22)
+    $dividerHairlineRadio.ForeColor = $script:Theme.TextPrimary
+    $dividerHairlineRadio.Checked = ($script:Settings.GroupDividerStyle -notin @('Dotted', 'Labeled'))
+
+    $dividerDottedRadio = New-Object System.Windows.Forms.RadioButton
+    $dividerDottedRadio.Text = 'Dotted line'
+    $dividerDottedRadio.Location = New-Object System.Drawing.Point(148, 27)
+    $dividerDottedRadio.Size = New-Object System.Drawing.Size(120, 22)
+    $dividerDottedRadio.ForeColor = $script:Theme.TextPrimary
+    $dividerDottedRadio.Checked = ($script:Settings.GroupDividerStyle -eq 'Dotted')
+
+    $dividerLabeledRadio = New-Object System.Windows.Forms.RadioButton
+    $dividerLabeledRadio.Text = 'Labeled'
+    $dividerLabeledRadio.Location = New-Object System.Drawing.Point(278, 27)
+    $dividerLabeledRadio.Size = New-Object System.Drawing.Size(120, 22)
+    $dividerLabeledRadio.ForeColor = $script:Theme.TextPrimary
+    $dividerLabeledRadio.Checked = ($script:Settings.GroupDividerStyle -eq 'Labeled')
+
+    $dividerHintLbl = New-Object System.Windows.Forms.Label
+    $dividerHintLbl.Text = 'How the rule between groups looks in the Live/History tables. "Labeled" names the group starting below it.'
+    $dividerHintLbl.Location = New-Object System.Drawing.Point(15, 54)
+    $dividerHintLbl.Size = New-Object System.Drawing.Size(420, 32)
+    $dividerHintLbl.ForeColor = $script:Theme.TextDim
+    $dividerHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+
+    $dividerSectionPanel.Controls.AddRange(@($dividerLbl, $dividerHairlineRadio, $dividerDottedRadio, $dividerLabeledRadio, $dividerHintLbl))
+
+    $tabAppearance.Controls.AddRange(@($themeSectionPanel, $dividerSectionPanel))
 
     # --- Startup ----------------------------------------------------------
     $launchSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.LaunchAtStartup)
@@ -3850,9 +4075,9 @@ function Show-SettingsDialog {
     $crashNotifSwitch.Location = New-Object System.Drawing.Point(15, 87)
 
     $crashNotifLbl = New-Object System.Windows.Forms.Label
-    $crashNotifLbl.Text = 'Notify me when a tracked dev server crashes'
+    $crashNotifLbl.Text = 'Notify me if a dev server crashes'
     $crashNotifLbl.Location = New-Object System.Drawing.Point(60, 87)
-    $crashNotifLbl.Size = New-Object System.Drawing.Size(300, 20)
+    $crashNotifLbl.Size = New-Object System.Drawing.Size(360, 20)
     $crashNotifLbl.ForeColor = $script:Theme.TextPrimary
     Connect-ToggleLabel -Switch $crashNotifSwitch -Label $crashNotifLbl
 
@@ -3925,6 +4150,8 @@ function Show-SettingsDialog {
         $script:Settings.StartMinimized = Get-ToggleChecked $minimizedSwitch
         $script:Settings.CrashNotifications = Get-ToggleChecked $crashNotifSwitch
         $script:Settings.CheckForUpdates = Get-ToggleChecked $updateCheckSwitch
+
+        $script:Settings.GroupDividerStyle = if ($dividerLabeledRadio.Checked) { 'Labeled' } elseif ($dividerDottedRadio.Checked) { 'Dotted' } else { 'Hairline' }
 
         Save-Settings $script:Settings
         Update-ScopeLabel
@@ -4255,6 +4482,8 @@ function Start-GroupAll {
     }
     $started = 0
     foreach ($row in $toStart) {
+        $rowLabel = if ($row.CustomName) { $row.CustomName } else { Split-Path -Leaf $row.ProjectPath }
+        if (-not (Test-PortCollision -ProjectPath $row.ProjectPath -Port ([int]$row.Port) -Label $rowLabel)) { continue }
         if (Start-ProjectAtPath -ProjectPath $row.ProjectPath -CommandLine $row.CommandLine) { $started++ }
     }
     Start-Sleep -Milliseconds 1000
