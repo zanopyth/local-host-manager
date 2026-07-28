@@ -51,8 +51,13 @@ To reach it from your **phone or another device on the same LAN**, or over
 
 ```powershell
 netsh http add urlacl url=http://+:3199/ user=Everyone
-New-NetFirewallRule -DisplayName "Localhost Manager Dashboard" -Direction Inbound -Protocol TCP -LocalPort 3199 -Action Allow
+New-NetFirewallRule -DisplayName "Localhost Manager Dashboard" -Direction Inbound -Protocol TCP -LocalPort 3199 -Action Allow -Profile Domain,Private
 ```
+
+`-Profile Domain,Private` matters: the dashboard has no login, so anyone who can
+reach the port can Stop/Start/Restart your dev servers. Without it, the rule
+defaults to *all* profiles including Public — meaning it'd stay reachable on
+open/public Wi-Fi too, not just your home LAN or Tailscale.
 
 Without this one-time step, the LAN/Tailscale addresses will show up in the
 dashboard's own address list but nothing will actually be listening there —
