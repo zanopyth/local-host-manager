@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.12.0] - 2026-07-28
+
+### Added
+- **CPU and RAM columns** in the Live/History/System tables, and in each
+  row's Detail popup. RAM is a live snapshot; CPU is a percentage sampled
+  across poll ticks (blank, not "0%", until a second sample exists - those
+  mean different things). 100% means one full core busy (matches the
+  older Task Manager / Process Explorer / htop convention, not modern Task
+  Manager's default "% of total system capacity") - on a many-core
+  machine, normalizing by core count would make a single-threaded dev
+  server maxing out its one thread read as a barely-visible few percent,
+  which defeats the point of the column. Also exposed via the web
+  dashboard's `/api/rows` JSON.
+
 ## [1.11.0] - 2026-07-28
 
 ### Added

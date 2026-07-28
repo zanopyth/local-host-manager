@@ -616,6 +616,14 @@ $script:BackgroundPollScript = {
         }
     }
 
+    # CPU% isn't a snapshot value - .NET only exposes cumulative
+    # TotalProcessorTime, so it takes two samples spaced apart to turn into
+    # a percentage. This persists across poll ticks (declared outside the
+    # while loop, in the same runspace the loop itself runs in) rather
+    # than living in $Cache: it's pure intermediate state the UI thread
+    # never needs to see, only this tick's computed CpuPercent result does.
+    $prevCpuSamples = @{}
+
     while (-not $Cache.StopRequested) {
         try {
             $conns = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
@@ -633,12 +641,15 @@ $script:BackgroundPollScript = {
             }
 
             $result = @{}
+            $nowUtc = [DateTime]::UtcNow
+            $nextCpuSamples = @{}
             foreach ($key in $byPort.Keys) {
                 $c = $byPort[$key]
                 $procId = [int]$c.OwningProcess
-                $procName = $null
-                try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch {}
-                if (-not $procName) { continue }
+                $proc = $null
+                try { $proc = Get-Process -Id $procId -ErrorAction Stop } catch {}
+                if (-not $proc) { continue }
+                $procName = $proc.ProcessName
 
                 # System-owned processes (System/svchost/lsass/...) never get a
                 # cwd/package.json probe - it's wasted work (they have no
@@ -654,6 +665,37 @@ $script:BackgroundPollScript = {
                     $commandLine = Get-ProcessCommandLine -ProcId $procId
                 }
 
+                $memMB = $null
+                try { $memMB = [Math]::Round($proc.WorkingSet64 / 1MB, 0) } catch {}
+
+                # $null (not 0) until a second sample exists - "0%" and
+                # "not measured yet" are different facts, and the grid
+                # renders $null as blank rather than a misleading 0%.
+                #
+                # Deliberately NOT normalized by ProcessorCount (the
+                # "% of total system capacity" convention modern Task
+                # Manager defaults to) - on a high core-count machine that
+                # makes a single-threaded dev server maxing out its one
+                # thread read as a barely-visible few percent, which
+                # defeats the point of this column (spotting what's
+                # actually busy). 100% here means "one full core busy",
+                # the older Task Manager / Process Explorer / htop
+                # convention - can exceed 100% for a genuinely
+                # multi-threaded process, same as those tools.
+                $cpuPercent = $null
+                try {
+                    $cpuNow = $proc.TotalProcessorTime
+                    $nextCpuSamples[$procId] = @{ Time = $nowUtc; Cpu = $cpuNow }
+                    $prev = $prevCpuSamples[$procId]
+                    if ($prev) {
+                        $elapsedMs = ($nowUtc - $prev.Time).TotalMilliseconds
+                        if ($elapsedMs -gt 0) {
+                            $deltaMs = ($cpuNow - $prev.Cpu).TotalMilliseconds
+                            $cpuPercent = [Math]::Max(0, [Math]::Round($deltaMs / $elapsedMs * 100, 1))
+                        }
+                    }
+                } catch {}
+
                 $result[$key] = @{
                     Port        = $key
                     ProcId      = $procId
@@ -663,8 +705,14 @@ $script:BackgroundPollScript = {
                     IsNode      = [bool]$isNode
                     IsSystem    = $isSystem
                     CommandLine = $commandLine
+                    CpuPercent  = $cpuPercent
+                    MemMB       = $memMB
                 }
             }
+            # Only carries forward samples for PIDs actually seen this tick -
+            # otherwise a long session accumulates one stale entry per PID
+            # that's ever briefly listened on a port, forever.
+            $prevCpuSamples = $nextCpuSamples
 
             # Keep the InterfaceAlias alongside each IP (not just the flat
             # address) so the main script can label/sort/flag entries by
@@ -828,6 +876,8 @@ function Build-Rows {
             CustomName  = $customName
             ProcessName = $e.ProcessName
             ProcId      = $e.ProcId
+            Cpu         = $e.CpuPercent
+            Mem         = $e.MemMB
             LocalUrl    = "http://localhost:$key"
             LanUrls     = $lanUrls
             LanEntries  = $lanEntries
@@ -857,6 +907,8 @@ function Build-Rows {
             CustomName  = $customName
             ProcessName = $h.ProcessName
             ProcId      = $null
+            Cpu         = $null
+            Mem         = $null
             LocalUrl    = "http://localhost:$key"
             LanUrls     = ''
             LanEntries  = @()
@@ -912,6 +964,8 @@ function Build-SystemRows {
             CustomName  = $customName
             ProcessName = $e.ProcessName
             ProcId      = $e.ProcId
+            Cpu         = $e.CpuPercent
+            Mem         = $e.MemMB
             LocalUrl    = "http://localhost:$key"
             LanUrls     = $lanUrls
             LanEntries  = $lanEntries
@@ -1672,7 +1726,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.11.0'
+$script:AppVersion = '1.12.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2356,7 +2410,7 @@ Update-ScopeLabel
 # Column layout is identical for the Live and History grids (same order,
 # same indices), so event handlers can address cells by a single shared
 # index map instead of per-grid column objects.
-$script:ColIdx = @{ Status = 0; Port = 1; Pin = 2; CustomName = 3; Process = 4; PID = 5; LocalUrl = 6; LanUrls = 7; ProjectPath = 8; Log = 9; Action = 10 }
+$script:ColIdx = @{ Status = 0; Port = 1; Pin = 2; CustomName = 3; Process = 4; PID = 5; Cpu = 6; Mem = 7; LocalUrl = 8; LanUrls = 9; ProjectPath = 10; Log = 11; Action = 12 }
 $dgvDoubleBufferProp = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
 
 function New-PortsGrid {
@@ -2425,6 +2479,14 @@ function New-PortsGrid {
     $colPid = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPid.Name = 'PID'; $colPid.HeaderText = 'PID'; $colPid.FillWeight = 50; $colPid.MinimumWidth = 46; $colPid.ReadOnly = $true
 
+    $colCpu = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colCpu.Name = 'Cpu'; $colCpu.HeaderText = 'CPU'; $colCpu.FillWeight = 48; $colCpu.MinimumWidth = 46; $colCpu.ReadOnly = $true
+    $colCpu.DefaultCellStyle.Alignment = 'MiddleRight'
+
+    $colMem = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $colMem.Name = 'Mem'; $colMem.HeaderText = 'RAM'; $colMem.FillWeight = 55; $colMem.MinimumWidth = 52; $colMem.ReadOnly = $true
+    $colMem.DefaultCellStyle.Alignment = 'MiddleRight'
+
     $colLocal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colLocal.Name = 'LocalUrl'; $colLocal.HeaderText = 'Local URL'; $colLocal.FillWeight = 110; $colLocal.ReadOnly = $true
 
@@ -2447,7 +2509,7 @@ function New-PortsGrid {
     $colAction.ReadOnly = $true
     $colAction.DefaultCellStyle.Alignment = 'MiddleCenter'
 
-    [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colPin, $colCustomName, $colProc, $colPid, $colLocal, $colLan, $colPath, $colLog, $colAction)
+    [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colPin, $colCustomName, $colProc, $colPid, $colCpu, $colMem, $colLocal, $colLan, $colPath, $colLog, $colAction)
     $g.Columns.AddRange($gridColumns)
     $g.AutoSizeColumnsMode = 'Fill'
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
@@ -2533,7 +2595,12 @@ Update-SystemTabState
 
 function Add-DataRow {
     param($Grid, $r)
-    $idx = $Grid.Rows.Add($r.Status, $r.Port, ([string][char]0xE718), $r.CustomName, $r.ProcessName, $r.ProcId, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
+    # $null (not 0/blank-zero) means "not measured yet" (first poll tick
+    # after a process appears, or a stopped/history row with nothing
+    # running) - shown as a blank cell rather than a misleading "0%"/"0 MB".
+    $cpuText = if ($null -ne $r.Cpu) { "$($r.Cpu)%" } else { '' }
+    $memText = if ($null -ne $r.Mem) { "$($r.Mem) MB" } else { '' }
+    $idx = $Grid.Rows.Add($r.Status, $r.Port, ([string][char]0xE718), $r.CustomName, $r.ProcessName, $r.ProcId, $cpuText, $memText, $r.LocalUrl, $r.LanUrls, $r.ProjectPath, 'Restart', $r.Action)
     $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
@@ -2627,7 +2694,7 @@ function Add-SeparatorRow {
     # (still the 'separator' sentinel every click/double-click/right-click
     # handler already checks for).
     param($Grid, [string]$GroupName = '')
-    $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '', '')
+    $idx = $Grid.Rows.Add('', '', '', '', '', '', '', '', '', '', '', '', '')
     $row = $Grid.Rows[$idx]
     $row.Tag = 'separator'
     $row.HeaderCell.Value = $GroupName
@@ -3517,6 +3584,8 @@ function Show-RowDetail {
         @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
         @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
         @{ Label = 'PID';         Value = [string]$Data.ProcId;      IsVirtual = $false }
+        @{ Label = 'CPU';         Value = if ($null -ne $Data.Cpu) { "$($Data.Cpu)%" } else { '' }; IsVirtual = $false }
+        @{ Label = 'RAM';         Value = if ($null -ne $Data.Mem) { "$($Data.Mem) MB" } else { '' }; IsVirtual = $false }
         @{ Label = 'Local URL';   Value = [string]$Data.LocalUrl;    IsVirtual = $false }
     )
 
@@ -4362,7 +4431,7 @@ function Show-DashboardDialog {
 function Show-ProxyDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Local Domains'
-    $dlg.Size = New-Object System.Drawing.Size(520, 440)
+    $dlg.Size = New-Object System.Drawing.Size(520, 470)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
@@ -4372,7 +4441,7 @@ function Show-ProxyDialog {
     Set-DarkTitleBar -FormControl $dlg
 
     $introLbl = New-Object System.Windows.Forms.Label
-    $introLbl.Text = "Give each running project a friendly address, e.g. http://bodyshop.localhost:$([int]$script:Settings.ProxyPort)/, instead of a raw port. Works from this PC's browser (Chrome/Edge/Firefox resolve *.localhost to loopback on their own) - not from other devices or non-browser tools like curl."
+    $introLbl.Text = "Give each running project a friendly address, e.g. http://my_project.localhost:$([int]$script:Settings.ProxyPort)/, instead of a raw port. Works from this PC's browser (Chrome/Edge/Firefox resolve *.localhost to loopback on their own) - not from other devices or non-browser tools like curl."
     $introLbl.Location = New-Object System.Drawing.Point(15, 15)
     $introLbl.Size = New-Object System.Drawing.Size(475, 56)
     $introLbl.ForeColor = $script:Theme.TextDim
@@ -4412,7 +4481,7 @@ function Show-ProxyDialog {
     $portBox.ForeColor = $script:Theme.TextPrimary
     $portBox.BorderStyle = 'FixedSingle'
 
-    $setupLbl = New-SettingsSectionLabel -Text 'One-time setup (per port, run once as Administrator)' -X 15 -Y 172
+    $setupLbl = New-SettingsSectionLabel -Text 'One-time setup (per port)' -X 15 -Y 172
 
     $cmdBox = New-Object System.Windows.Forms.TextBox
     $cmdBox.Location = New-Object System.Drawing.Point(15, 196)
@@ -4432,14 +4501,14 @@ function Show-ProxyDialog {
     Initialize-ModernButton -Button $copyCmdButton
 
     $setupHintLbl = New-Object System.Windows.Forms.Label
-    $setupHintLbl.Text = "Only needed once per port (loopback-only - no firewall change, nothing reachable from other devices). It just grants permission to bind this port without running elevated every time."
+    $setupHintLbl.Text = "Run this once as Administrator, then re-enable Local Domains here. Loopback-only - no firewall change, nothing reachable from other devices; it just lets this port bind without elevating every time."
     $setupHintLbl.Location = New-Object System.Drawing.Point(15, 226)
-    $setupHintLbl.Size = New-Object System.Drawing.Size(475, 32)
+    $setupHintLbl.Size = New-Object System.Drawing.Size(475, 54)
     $setupHintLbl.ForeColor = $script:Theme.TextDim
     $setupHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
     $statusLbl = New-Object System.Windows.Forms.Label
-    $statusLbl.Location = New-Object System.Drawing.Point(15, 264)
+    $statusLbl.Location = New-Object System.Drawing.Point(15, 288)
     $statusLbl.Size = New-Object System.Drawing.Size(475, 62)
     $statusLbl.ForeColor = $script:Theme.TextDim
     $statusLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
@@ -4459,14 +4528,14 @@ function Show-ProxyDialog {
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'OK'
-    $okButton.Location = New-Object System.Drawing.Point(315, 355)
+    $okButton.Location = New-Object System.Drawing.Point(315, 385)
     $okButton.Size = New-Object System.Drawing.Size(85, 28)
     $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
     Initialize-ModernButton -Button $okButton -Variant Accent
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Cancel'
-    $cancelButton.Location = New-Object System.Drawing.Point(405, 355)
+    $cancelButton.Location = New-Object System.Drawing.Point(405, 385)
     $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
     $cancelButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $cancelButton
@@ -5047,6 +5116,8 @@ function Publish-DashboardRows {
             CustomName  = $_.Row.CustomName
             ProcessName = $_.Row.ProcessName
             ProcId      = $_.Row.ProcId
+            Cpu         = $_.Row.Cpu
+            Mem         = $_.Row.Mem
             LocalUrl    = $_.Row.LocalUrl
             LanUrls     = $_.Row.LanUrls
             LanEntries  = @($_.Row.LanEntries | ForEach-Object { [PSCustomObject]@{ Label = $_.Label; Url = $_.Url } })

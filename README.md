@@ -19,6 +19,10 @@ Grab the latest `LocalhostManager.exe` from the
 - Auto-detects running npm/node dev servers by port, recovering each
   project's real working directory even when the command line alone
   doesn't show it (e.g. `npm start`)
+- **CPU and RAM columns** per running process, right in the grid - see
+  which of your dev servers is actually busy without alt-tabbing to Task
+  Manager (100% = one full core busy, so a single-threaded server maxing
+  its one thread stands out clearly instead of reading as a few percent)
 - Shows local + LAN URLs so you can share a dev server on your network
 - Right-click any row for a compact **Detail** popup — every column's full
   value with a one-click copy button, network addresses broken out one per
