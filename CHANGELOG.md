@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.14.0] - 2026-07-28
+
+### Added
+- **Drag to resize and reorder every column**, in all three tables. The
+  table switched from an auto-fit ("Fill") layout to fixed, explicit
+  starting widths so every column is freely resizable - Fill mode (and
+  the per-column AllCells override the Status column briefly had in
+  v1.13.0) computes width automatically, which silently disables manual
+  dragging entirely. Both the width and the left-to-right order you end
+  up with are saved and restored on restart, and stay in sync across
+  Live/History/System since they're really the same table.
+
+### Fixed
+- Status column resizing, regressed in v1.13.0 by the fix for its
+  width (AllCells auto-sizing, like Fill, doesn't allow manual drag).
+  Superseded by the fixed-width approach above.
+
 ## [1.13.0] - 2026-07-28
 
 ### Added
