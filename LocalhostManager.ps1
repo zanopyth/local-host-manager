@@ -1805,7 +1805,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.14.1'
+$script:AppVersion = '1.14.2'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2717,15 +2717,29 @@ function New-PortsGrid {
     })
 
     # Persist a manual resize/reorder as soon as it happens - Save-ColumnLayout
-    # and the SyncingColumnLayout guard are defined below (after all three
-    # grids exist), but that's fine: these are deferred event handlers,
-    # resolved at the moment the event actually fires, long after the rest
-    # of the script has finished setting up.
+    # is defined below (after all three grids exist), but that's fine: this
+    # scriptblock is only ever invoked later, when the event actually fires.
+    # It fires far more often than an actual user drag, though - notably,
+    # adding a Fill-mode grid to its parent for the first time triggers its
+    # first real layout pass (Fill widths computed against a real size for
+    # the first time), which fires ColumnWidthChanged for every column. See
+    # $script:SyncingColumnLayout, set to $true below before any grid
+    # exists and not released until immediately before Application.Run -
+    # every one of those startup-driven firings needs to be suppressed, or
+    # each one turns into a disk write plus a full Update-ColumnLayout pass
+    # across all three grids, cascading into dozens of redundant writes
+    # during ordinary startup (this is exactly what made the app appear to
+    # hang before this guard covered the whole startup sequence).
     $g.Add_ColumnWidthChanged({ param($s, $e) Save-ColumnLayout -SourceGrid $s })
     $g.Add_ColumnDisplayIndexChanged({ param($s, $e) Save-ColumnLayout -SourceGrid $s })
 
     return $g
 }
+
+# See the long comment on Add_ColumnWidthChanged above for why this has to
+# be set before the very first grid is created, not just around the
+# explicit Update-ColumnLayout calls below.
+$script:SyncingColumnLayout = $true
 
 $liveGrid = New-PortsGrid
 $historyGrid = New-PortsGrid
@@ -2751,15 +2765,19 @@ function Update-ColumnVisibility {
 }
 Update-ColumnVisibility
 
-$script:SyncingColumnLayout = $false
-
 function Update-ColumnLayout {
     # Applies saved fill-weights + display order to all three grids at
     # once - same "every tab stays visually identical" rationale as
     # Update-ColumnVisibility above. Guarded by SyncingColumnLayout so
     # setting .FillWeight/.DisplayIndex here doesn't re-trigger
     # Save-ColumnLayout via the ColumnWidthChanged/ColumnDisplayIndexChanged
-    # handlers wired in New-PortsGrid.
+    # handlers wired in New-PortsGrid. Saves and restores the PREVIOUS
+    # guard value rather than hardcoding it back to $false - during
+    # startup this gets called while the outer, whole-startup guard (see
+    # $script:SyncingColumnLayout = $true above, before the first grid
+    # exists) is already $true, and hardcoding $false here would end that
+    # protection early, right as the very first call returns.
+    $wasSyncingColumnLayout = $script:SyncingColumnLayout
     $script:SyncingColumnLayout = $true
     try {
         foreach ($grid in @($liveGrid, $historyGrid, $systemGrid)) {
@@ -2773,10 +2791,9 @@ function Update-ColumnLayout {
             }
         }
     } finally {
-        $script:SyncingColumnLayout = $false
+        $script:SyncingColumnLayout = $wasSyncingColumnLayout
     }
 }
-Update-ColumnLayout
 
 function Save-ColumnLayout {
     # Fires (possibly several times in a row - dragging one column to a
@@ -2800,6 +2817,15 @@ function Save-ColumnLayout {
     Save-Settings $script:Settings
     Update-ColumnLayout
 }
+
+# Called only now that both Update-ColumnLayout and Save-ColumnLayout
+# exist - setting .DisplayIndex inside Update-ColumnLayout fires
+# ColumnDisplayIndexChanged synchronously (unlike a button click, this
+# runs as part of the script's own top-to-bottom setup, not deferred to
+# after everything has loaded), and that handler calls Save-ColumnLayout.
+# Calling this before Save-ColumnLayout's own "function" statement had
+# been reached yet threw "Save-ColumnLayout is not recognized".
+Update-ColumnLayout
 
 $script:MainTabs = New-CustomTabControl -Labels @('Live', 'History', 'System')
 $script:MainTabs.Root.Anchor = 'Top,Bottom,Left,Right'
@@ -6077,5 +6103,19 @@ if ([bool]$script:Settings.StartMinimized) {
     # it just never becomes visible - straight to the tray icon.
     $form.Add_Shown({ $form.Hide() })
 }
+
+# SyncingColumnLayout is released here, not earlier - see where it's set
+# to $true, just before the grids are first created. Genuine user column
+# drags can only happen once the message loop below is pumping, so
+# holding the guard through the entirety of this synchronous startup
+# sequence costs nothing and is the only boundary that's actually safe:
+# adding the Fill-mode grids to their parent tab pages several hundred
+# lines up triggers WinForms' first real layout pass (Fill-mode columns
+# compute their pixel widths against a real size for the first time),
+# which fires ColumnWidthChanged for every column - each one was calling
+# Save-ColumnLayout (a disk write) which itself called Update-ColumnLayout
+# again, cascading into dozens of redundant writes during ordinary
+# startup and making the app appear to hang.
+$script:SyncingColumnLayout = $false
 
 [System.Windows.Forms.Application]::Run($form)

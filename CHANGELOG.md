@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.14.2] - 2026-07-28
+
+### Fixed
+- Startup crash dialog introduced by 1.14.1 itself: "Exception setting
+  'DisplayIndex': ... 'Save-ColumnLayout' is not recognized...". Setting
+  a column's DisplayIndex during the startup call to Update-ColumnLayout
+  fires ColumnDisplayIndexChanged synchronously - unlike a button click,
+  that startup call runs as part of the script's own top-to-bottom
+  setup, not deferred until everything has finished loading, so it hit
+  the handler (which calls Save-ColumnLayout) before the script had even
+  reached that function's own definition further down. Moved the
+  startup call to after both column-layout functions are defined.
+- The fix above uncovered a second, subtler issue with the same root
+  cause: the compiled app could take a very long time to finish
+  starting (Dashboard/Local Domains never came up, no error shown).
+  Adding the Fill-mode grids to their parent tab pages for the first
+  time triggers WinForms' first real layout pass, which fires
+  ColumnWidthChanged for every column - each firing was calling
+  Save-ColumnLayout (a settings.json write) followed by a full
+  Update-ColumnLayout pass across all three grids, which could itself
+  trigger more firings, cascading into dozens of redundant writes
+  during ordinary startup. The guard that's supposed to suppress
+  exactly this (SyncingColumnLayout) was only held during the explicit
+  Update-ColumnLayout calls, not the whole startup sequence, so this
+  particular firing (from adding the grids to their parent) fell
+  outside it. Now held from before the very first grid is created
+  until immediately before the message loop starts - genuine user
+  drags can't happen before then anyway, so this costs nothing.
+
 ## [1.14.1] - 2026-07-28
 
 ### Fixed
