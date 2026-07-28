@@ -1805,7 +1805,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.14.2'
+$script:AppVersion = '1.14.3'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2716,22 +2716,25 @@ function New-PortsGrid {
         }
     })
 
-    # Persist a manual resize/reorder as soon as it happens - Save-ColumnLayout
-    # is defined below (after all three grids exist), but that's fine: this
-    # scriptblock is only ever invoked later, when the event actually fires.
-    # It fires far more often than an actual user drag, though - notably,
-    # adding a Fill-mode grid to its parent for the first time triggers its
-    # first real layout pass (Fill widths computed against a real size for
-    # the first time), which fires ColumnWidthChanged for every column. See
-    # $script:SyncingColumnLayout, set to $true below before any grid
-    # exists and not released until immediately before Application.Run -
-    # every one of those startup-driven firings needs to be suppressed, or
-    # each one turns into a disk write plus a full Update-ColumnLayout pass
-    # across all three grids, cascading into dozens of redundant writes
-    # during ordinary startup (this is exactly what made the app appear to
-    # hang before this guard covered the whole startup sequence).
-    $g.Add_ColumnWidthChanged({ param($s, $e) Save-ColumnLayout -SourceGrid $s })
-    $g.Add_ColumnDisplayIndexChanged({ param($s, $e) Save-ColumnLayout -SourceGrid $s })
+    # ColumnWidthChanged/ColumnDisplayIndexChanged fire for far more than
+    # an actual user drag - resizing the whole app window recalculates
+    # every Fill-mode column's pixel width against the new available
+    # space (the proportion/FillWeight is unchanged, but .Width still
+    # fires the event), and adding a Fill-mode grid to its parent for the
+    # first time does the same as its very first layout pass. Schedule-
+    # ColumnLayoutSave (defined below, after all three grids exist -
+    # fine, since this scriptblock only actually runs later, whenever the
+    # event fires) doesn't act on these directly; it just notes which
+    # grid changed and (re)starts a short one-shot timer. That both
+    # collapses a whole drag gesture's worth of events into a single
+    # save, and - the reason this has to be deferred at all, not just an
+    # efficiency nicety - avoids writing to .FillWeight while WinForms is
+    # still mid-resize itself, which throws "This operation cannot be
+    # performed while an auto-filled column is being resized." Actually
+    # persisting/propagating that layout happens later, on the timer
+    # tick, once whatever triggered the event has fully settled.
+    $g.Add_ColumnWidthChanged({ param($s, $e) Schedule-ColumnLayoutSave -SourceGrid $s })
+    $g.Add_ColumnDisplayIndexChanged({ param($s, $e) Schedule-ColumnLayoutSave -SourceGrid $s })
 
     return $g
 }
@@ -2796,13 +2799,15 @@ function Update-ColumnLayout {
 }
 
 function Save-ColumnLayout {
-    # Fires (possibly several times in a row - dragging one column to a
-    # new spot shifts every column between the old and new position,
-    # each with its own event) whenever the user resizes or reorders a
-    # column in any of the three grids. Captures that grid's current
-    # state, persists it, and mirrors it onto the other two so every tab
-    # keeps matching - same idea as the Columns popup's ItemCheck handler
-    # (see $columnsCheckedList.Add_ItemCheck), just triggered by the grid
+    # The real work, run only from the debounce timer below (see
+    # Schedule-ColumnLayoutSave) - never called directly from a
+    # ColumnWidthChanged/ColumnDisplayIndexChanged handler itself, since
+    # by the time this runs, whatever triggered those events (a column
+    # drag, a window resize, initial layout) has fully settled. Captures
+    # the source grid's current state, persists it, and mirrors it onto
+    # the other two so every tab keeps matching - same idea as the
+    # Columns popup's ItemCheck handler (see
+    # $columnsCheckedList.Add_ItemCheck), just triggered by the grid
     # itself instead of a popup.
     param($SourceGrid)
     if ($script:SyncingColumnLayout) { return }
@@ -2818,13 +2823,47 @@ function Save-ColumnLayout {
     Update-ColumnLayout
 }
 
-# Called only now that both Update-ColumnLayout and Save-ColumnLayout
-# exist - setting .DisplayIndex inside Update-ColumnLayout fires
-# ColumnDisplayIndexChanged synchronously (unlike a button click, this
-# runs as part of the script's own top-to-bottom setup, not deferred to
-# after everything has loaded), and that handler calls Save-ColumnLayout.
-# Calling this before Save-ColumnLayout's own "function" statement had
-# been reached yet threw "Save-ColumnLayout is not recognized".
+# One-shot debounce: ColumnWidthChanged/ColumnDisplayIndexChanged can
+# fire many times in a row for a single user gesture (dragging one
+# column shifts every column between its old and new position, each
+# with its own event) or for reasons that have nothing to do with the
+# user at all (see the long comment on Add_ColumnWidthChanged in
+# New-PortsGrid). Restarting this timer on every firing and only acting
+# once it goes quiet for 400ms collapses all of that into a single
+# Save-ColumnLayout call, made safely after WinForms has finished
+# whatever resize/layout operation triggered the event in the first
+# place - calling Save-ColumnLayout (which writes .FillWeight) directly
+# from inside the event handler intermittently threw "This operation
+# cannot be performed while an auto-filled column is being resized."
+$script:PendingColumnLayoutGrid = $null
+$script:ColumnLayoutSaveTimer = New-Object System.Windows.Forms.Timer
+$script:ColumnLayoutSaveTimer.Interval = 400
+$script:ColumnLayoutSaveTimer.Add_Tick({
+    $script:ColumnLayoutSaveTimer.Stop()
+    if ($script:PendingColumnLayoutGrid -and -not $script:SyncingColumnLayout) {
+        Save-ColumnLayout -SourceGrid $script:PendingColumnLayoutGrid
+    }
+    $script:PendingColumnLayoutGrid = $null
+})
+
+function Schedule-ColumnLayoutSave {
+    param($SourceGrid)
+    if ($script:SyncingColumnLayout) { return }
+    $script:PendingColumnLayoutGrid = $SourceGrid
+    $script:ColumnLayoutSaveTimer.Stop()
+    $script:ColumnLayoutSaveTimer.Start()
+}
+
+# Called only now that Update-ColumnLayout, Save-ColumnLayout, and
+# Schedule-ColumnLayoutSave all exist - setting .DisplayIndex inside
+# Update-ColumnLayout fires ColumnDisplayIndexChanged synchronously
+# (unlike a button click, this runs as part of the script's own
+# top-to-bottom setup, not deferred until after everything has loaded),
+# and that handler calls Schedule-ColumnLayoutSave. Calling this before
+# that chain's functions had all been reached yet threw "... is not
+# recognized". (In practice $script:SyncingColumnLayout, already $true
+# here, makes this a non-issue regardless of definition order - but the
+# order is kept safe anyway, in case that guard is ever removed.)
 Update-ColumnLayout
 
 $script:MainTabs = New-CustomTabControl -Labels @('Live', 'History', 'System')

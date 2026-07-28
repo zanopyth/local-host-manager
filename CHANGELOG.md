@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.14.3] - 2026-07-28
+
+### Fixed
+- "Exception setting 'FillWeight': This operation cannot be performed
+  while an auto-filled column is being resized." when dragging the app
+  window's own border. Resizing the window recalculates every Fill-mode
+  column's pixel width against the new available space, firing
+  ColumnWidthChanged the same as an actual column drag - but the
+  column-layout code was reacting to that event by immediately writing
+  to .FillWeight to persist/sync it, which WinForms refuses while it's
+  still mid-resize itself. Save/sync is now debounced: a resize or
+  reorder just notes which grid changed and (re)starts a short 400ms
+  timer, and the actual write happens on that timer's tick, safely
+  after whatever triggered the event (a column drag, a window resize)
+  has fully settled. Verified against both a normal resize drag and an
+  aggressive rapid-fire resize burst.
+
 ## [1.14.2] - 2026-07-28
 
 ### Fixed
