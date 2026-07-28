@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.13.0] - 2026-07-28
+
+### Added
+- **Column chooser**: a new toolbar icon (filter glyph, next to Groups)
+  opens a checklist to show/hide the informational columns (Custom Name,
+  Process, PID, CPU, RAM, Local URL, Network URL(s), Project Path) across
+  all three tables at once. Status/Port/Pin/Log/Action stay put - they're
+  either the whole point of the table or a click target, not just info to
+  declutter. CPU is off by default (usually 0% until something's actually
+  busy); RAM stays on (varies row to row even at idle). Persisted, and
+  forward-compatible with future toggleable columns via per-key defaults.
+
+### Changed
+- Status column now sizes to its own content ("ON"/"OFF"/"CRASHED")
+  instead of stretching proportionally with the table's Fill layout,
+  which left a lot of dead padding around a 2-7 character word. Freed
+  width goes to the columns that actually need it.
+
 ## [1.12.1] - 2026-07-28
 
 ### Fixed

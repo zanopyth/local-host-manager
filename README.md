@@ -23,6 +23,10 @@ Grab the latest `LocalhostManager.exe` from the
   which of your dev servers is actually busy without alt-tabbing to Task
   Manager (100% = one full core busy, so a single-threaded server maxing
   its one thread stands out clearly instead of reading as a few percent)
+- **Column chooser**: a toolbar icon next to Groups lets you show/hide
+  the informational columns (Custom Name, Process, PID, CPU, RAM, Local
+  URL, Network URL(s), Project Path) across every tab - CPU is off by
+  default since it's usually 0% until something's actually busy
 - Shows local + LAN URLs so you can share a dev server on your network
 - Right-click any row for a compact **Detail** popup — every column's full
   value with a one-click copy button, network addresses broken out one per

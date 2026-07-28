@@ -215,11 +215,31 @@ function Save-History($history) {
 
 $script:SettingsPath = Join-Path $script:HistoryDir 'settings.json'
 
+function Get-DefaultColumnVisibility {
+    # Only the informational (non-interactive) columns are toggleable at
+    # all - Status/Port/Pin/Log/Action are either the whole point of the
+    # table or a click target, so hiding them would remove functionality,
+    # not just declutter. Defaults favor what's useful even for an idle
+    # process (RAM genuinely varies row to row) over what's usually
+    # uninteresting until something's actually busy (CPU sits at 0% for
+    # an idle dev server almost all the time).
+    return @{
+        CustomName  = $true
+        Process     = $true
+        PID         = $false
+        Cpu         = $false
+        Mem         = $true
+        LocalUrl    = $true
+        LanUrls     = $false
+        ProjectPath = $false
+    }
+}
+
 function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802 }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; ColumnVisibility = (Get-DefaultColumnVisibility) }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -241,6 +261,18 @@ function Load-Settings {
         $groupDividerStyle = if ($raw.PSObject.Properties.Name -contains 'GroupDividerStyle' -and [string]$raw.GroupDividerStyle -in @('Dotted', 'Labeled')) { [string]$raw.GroupDividerStyle } else { 'Hairline' }
         $proxyEnabled = if ($raw.PSObject.Properties.Name -contains 'ProxyEnabled') { [bool]$raw.ProxyEnabled } else { $false }
         $proxyPort = if ($raw.PSObject.Properties.Name -contains 'ProxyPort' -and [int]$raw.ProxyPort -gt 0) { [int]$raw.ProxyPort } else { 2802 }
+        # Merged onto the defaults (not replaced wholesale) so a settings
+        # file saved before a new toggleable column existed still gets
+        # that column's intended default instead of it vanishing/showing
+        # based on an absent key.
+        $columnVisibility = Get-DefaultColumnVisibility
+        if ($raw.PSObject.Properties.Name -contains 'ColumnVisibility' -and $raw.ColumnVisibility) {
+            foreach ($colName in @($columnVisibility.Keys)) {
+                if ($raw.ColumnVisibility.PSObject.Properties.Name -contains $colName) {
+                    $columnVisibility[$colName] = [bool]$raw.ColumnVisibility.$colName
+                }
+            }
+        }
         return @{
             OnlyNode           = [bool]$raw.OnlyNode
             RootDir            = [string]$raw.RootDir
@@ -257,6 +289,7 @@ function Load-Settings {
             ProxyPort          = $proxyPort
             CheckForUpdates    = $checkForUpdates
             GroupDividerStyle  = $groupDividerStyle
+            ColumnVisibility   = $columnVisibility
         }
     } catch { return $defaults }
 }
@@ -1726,7 +1759,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.12.1'
+$script:AppVersion = '1.13.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2320,12 +2353,65 @@ $groupsListHost.Size = $groupsCheckedList.Size
 $groupsListHost.Margin = New-Object System.Windows.Forms.Padding(0)
 $groupsPopup.Items.Add($groupsListHost) | Out-Null
 
+# Column chooser - same "button pops open a checked-list" shape as Groups
+# above, for the same reason (more than one thing can be toggled at once).
+# Only the informational columns are listed - see Get-DefaultColumnVisibility
+# for why Status/Port/Pin/Log/Action aren't offered here.
+$columnsButton = New-Object System.Windows.Forms.Button
+$columnsButton.Location = New-Object System.Drawing.Point(232, 12)
+$columnsButton.Size = New-Object System.Drawing.Size(34, 28)
+
+$columnsPopup = New-Object System.Windows.Forms.ToolStripDropDown
+$columnsPopup.AutoClose = $true
+$columnsPopup.Padding = New-Object System.Windows.Forms.Padding(2)
+Enable-RoundedPopup -Popup $columnsPopup -Radius (Get-ThemedRadius 10)
+
+$script:ColumnToggleList = @(
+    @{ Name = 'CustomName';  Label = 'Custom Name' }
+    @{ Name = 'Process';     Label = 'Process' }
+    @{ Name = 'PID';         Label = 'PID' }
+    @{ Name = 'Cpu';         Label = 'CPU' }
+    @{ Name = 'Mem';         Label = 'RAM' }
+    @{ Name = 'LocalUrl';    Label = 'Local URL' }
+    @{ Name = 'LanUrls';     Label = 'Network URL(s)' }
+    @{ Name = 'ProjectPath'; Label = 'Project Path' }
+)
+
+$columnsCheckedList = New-Object System.Windows.Forms.CheckedListBox
+$columnsCheckedList.CheckOnClick = $true
+$columnsCheckedList.BorderStyle = 'None'
+$columnsCheckedList.IntegralHeight = $false
+$columnsCheckedList.Size = New-Object System.Drawing.Size(180, ($script:ColumnToggleList.Count * 20 + 6))
+$columnsCheckedList.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+$columnsCheckedList.BackColor = $script:Theme.CardBg
+$columnsCheckedList.ForeColor = $script:Theme.TextPrimary
+foreach ($col in $script:ColumnToggleList) {
+    $isChecked = if ($script:Settings.ColumnVisibility.ContainsKey($col.Name)) { [bool]$script:Settings.ColumnVisibility[$col.Name] } else { $true }
+    $columnsCheckedList.Items.Add($col.Label, $isChecked) | Out-Null
+}
+
+$columnsListHost = New-Object System.Windows.Forms.ToolStripControlHost($columnsCheckedList)
+$columnsListHost.AutoSize = $false
+$columnsListHost.Size = $columnsCheckedList.Size
+$columnsListHost.Margin = New-Object System.Windows.Forms.Padding(0)
+$columnsPopup.Items.Add($columnsListHost) | Out-Null
+
 Initialize-ModernButton -Button $refreshButton
 Initialize-ModernButton -Button $groupsButton
 Initialize-ModernButton -Button $startAllButton -Variant Success -Icon Play
 Initialize-ModernButton -Button $stopAllButton -Variant Danger -Icon Square
+# Text must be set before Initialize-ModernButton - it owner-draws from
+# Tag.DisplayText, snapshotted from .Text at init time; the icon font
+# then has to be applied AFTER, since Initialize-ModernButton
+# unconditionally sets .Font to the theme font.
+$columnsButton.Text = [string][char]0xE71C
+Initialize-ModernButton -Button $columnsButton
+$columnsButton.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 11)
+$script:ColumnsButtonTip = New-Object System.Windows.Forms.ToolTip
+$script:ColumnsButtonTip.InitialDelay = 300
+$script:ColumnsButtonTip.SetToolTip($columnsButton, 'Choose columns')
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $startAllButton, $stopAllButton, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $startAllButton, $stopAllButton, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -2396,6 +2482,22 @@ $groupsButton.Add_Click({
     $groupsPopup.Show($groupsButton, (New-Object System.Drawing.Point(0, $groupsButton.Height)))
 })
 
+$columnsCheckedList.Add_ItemCheck({
+    param($s, $e)
+    # Items were added in the same order as $script:ColumnToggleList, so
+    # the event's item index maps straight back to it - no name lookup
+    # through the (visible, translated) label text needed.
+    $colName = $script:ColumnToggleList[$e.Index].Name
+    $isChecked = ($e.NewValue -eq [System.Windows.Forms.CheckState]::Checked)
+    $script:Settings.ColumnVisibility[$colName] = $isChecked
+    Save-Settings $script:Settings
+    Update-ColumnVisibility
+})
+
+$columnsButton.Add_Click({
+    $columnsPopup.Show($columnsButton, (New-Object System.Drawing.Point(0, $columnsButton.Height)))
+})
+
 Update-GroupsButtonText
 
 function Update-ScopeLabel {
@@ -2452,7 +2554,14 @@ function New-PortsGrid {
     $g.AlternatingRowsDefaultCellStyle.SelectionBackColor = $script:Theme.AccentTint
 
     $colStatus = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.FillWeight = 55; $colStatus.MinimumWidth = 58; $colStatus.ReadOnly = $true
+    $colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.MinimumWidth = 58; $colStatus.ReadOnly = $true
+    # AllCells (not the grid's Fill default): its content is always 2-7
+    # characters ("ON"/"OFF"/"CRASHED"), but Fill mode was stretching it
+    # across leftover width by weight regardless, leaving a lot of dead
+    # padding around a short word. Hugging its own content instead frees
+    # that width for columns that actually need it (Fill redistributes
+    # automatically among the columns still left in Fill mode).
+    $colStatus.AutoSizeMode = 'AllCells'
 
     $colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
@@ -2561,6 +2670,19 @@ $systemGrid = New-PortsGrid
 $systemGrid.Columns['Log'].Visible = $false
 $systemGrid.Columns['Action'].Visible = $false
 $systemGrid.Columns['Pin'].Visible = $false
+
+function Update-ColumnVisibility {
+    # Applies the Columns popup's checked state to all three grids at
+    # once - they share the same column set (see New-PortsGrid), so a
+    # toggle should never look different depending on which tab you're on.
+    foreach ($col in $script:ColumnToggleList) {
+        $visible = if ($script:Settings.ColumnVisibility.ContainsKey($col.Name)) { [bool]$script:Settings.ColumnVisibility[$col.Name] } else { $true }
+        foreach ($grid in @($liveGrid, $historyGrid, $systemGrid)) {
+            if ($grid.Columns[$col.Name]) { $grid.Columns[$col.Name].Visible = $visible }
+        }
+    }
+}
+Update-ColumnVisibility
 
 $script:MainTabs = New-CustomTabControl -Labels @('Live', 'History', 'System')
 $script:MainTabs.Root.Anchor = 'Top,Bottom,Left,Right'
