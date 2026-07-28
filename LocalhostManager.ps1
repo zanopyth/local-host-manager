@@ -235,24 +235,25 @@ function Get-DefaultColumnVisibility {
     }
 }
 
-function Get-DefaultColumnWidths {
-    # Starting point only - every column is user-resizable (see
-    # New-PortsGrid/Update-ColumnLayout), so these just need to be
-    # reasonable, not exact.
+function Get-DefaultColumnFillWeights {
+    # Starting point only - every column is user-resizable within the
+    # grid's Fill layout (see New-PortsGrid/Update-ColumnLayout), which
+    # redistributes these weights as the user drags a column border, so
+    # these just need to be reasonable relative to each other, not exact.
     return @{
-        Status      = 66
-        Port        = 50
+        Status      = 40
+        Port        = 45
         Pin         = 34
-        CustomName  = 115
-        Process     = 72
-        PID         = 55
-        Cpu         = 55
-        Mem         = 62
-        LocalUrl    = 150
-        LanUrls     = 190
-        ProjectPath = 180
+        CustomName  = 105
+        Process     = 62
+        PID         = 50
+        Cpu         = 48
+        Mem         = 55
+        LocalUrl    = 110
+        LanUrls     = 170
+        ProjectPath = 162
         Log         = 55
-        Action      = 65
+        Action      = 60
     }
 }
 
@@ -264,7 +265,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnWidths = (Get-DefaultColumnWidths); ColumnOrder = (Get-DefaultColumnOrder) }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnFillWeights = (Get-DefaultColumnFillWeights); ColumnOrder = (Get-DefaultColumnOrder) }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -298,11 +299,11 @@ function Load-Settings {
                 }
             }
         }
-        $columnWidths = Get-DefaultColumnWidths
-        if ($raw.PSObject.Properties.Name -contains 'ColumnWidths' -and $raw.ColumnWidths) {
-            foreach ($colName in @($columnWidths.Keys)) {
-                if ($raw.ColumnWidths.PSObject.Properties.Name -contains $colName) {
-                    $columnWidths[$colName] = [int]$raw.ColumnWidths.$colName
+        $columnFillWeights = Get-DefaultColumnFillWeights
+        if ($raw.PSObject.Properties.Name -contains 'ColumnFillWeights' -and $raw.ColumnFillWeights) {
+            foreach ($colName in @($columnFillWeights.Keys)) {
+                if ($raw.ColumnFillWeights.PSObject.Properties.Name -contains $colName) {
+                    $columnFillWeights[$colName] = [int]$raw.ColumnFillWeights.$colName
                 }
             }
         }
@@ -333,7 +334,7 @@ function Load-Settings {
             CheckForUpdates    = $checkForUpdates
             GroupDividerStyle  = $groupDividerStyle
             ColumnVisibility   = $columnVisibility
-            ColumnWidths       = $columnWidths
+            ColumnFillWeights  = $columnFillWeights
             ColumnOrder        = $columnOrder
         }
     } catch { return $defaults }
@@ -1804,7 +1805,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.14.0'
+$script:AppVersion = '1.14.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2599,10 +2600,10 @@ function New-PortsGrid {
     $g.AlternatingRowsDefaultCellStyle.SelectionBackColor = $script:Theme.AccentTint
 
     $colStatus = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.Width = 66; $colStatus.MinimumWidth = 58; $colStatus.ReadOnly = $true
+    $colStatus.Name = 'Status'; $colStatus.HeaderText = 'Status'; $colStatus.FillWeight = 40; $colStatus.MinimumWidth = 58; $colStatus.ReadOnly = $true
 
     $colPort = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.Width = 50; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
+    $colPort.Name = 'Port'; $colPort.HeaderText = 'Port'; $colPort.FillWeight = 45; $colPort.MinimumWidth = 44; $colPort.ReadOnly = $true
 
     # Icon-only toggle, colored per row (see Add-DataRow) rather than swapped
     # between a "pin"/"unpin" glyph pair, so clicking it can't cause a
@@ -2611,40 +2612,40 @@ function New-PortsGrid {
     # of cell BackColor, which reads fine blended into a white grid but shows
     # up as a stray light-gray box in dark mode.
     $colPin = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colPin.Name = 'Pin'; $colPin.HeaderText = ''; $colPin.Width = 34; $colPin.MinimumWidth = 32
+    $colPin.Name = 'Pin'; $colPin.HeaderText = ''; $colPin.FillWeight = 34; $colPin.MinimumWidth = 32
     $colPin.ReadOnly = $true
     $colPin.DefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe MDL2 Assets', 9.5)
     $colPin.DefaultCellStyle.Alignment = 'MiddleCenter'
     $colPin.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
 
     $colCustomName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colCustomName.Name = 'CustomName'; $colCustomName.HeaderText = 'Custom Name'; $colCustomName.Width = 115; $colCustomName.MinimumWidth = 104; $colCustomName.ReadOnly = $false
+    $colCustomName.Name = 'CustomName'; $colCustomName.HeaderText = 'Custom Name'; $colCustomName.FillWeight = 105; $colCustomName.MinimumWidth = 104; $colCustomName.ReadOnly = $false
 
     $colProc = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colProc.Name = 'Process'; $colProc.HeaderText = 'Process'; $colProc.Width = 72; $colProc.MinimumWidth = 60; $colProc.ReadOnly = $true
+    $colProc.Name = 'Process'; $colProc.HeaderText = 'Process'; $colProc.FillWeight = 62; $colProc.MinimumWidth = 60; $colProc.ReadOnly = $true
 
     $colPid = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colPid.Name = 'PID'; $colPid.HeaderText = 'PID'; $colPid.Width = 55; $colPid.MinimumWidth = 46; $colPid.ReadOnly = $true
+    $colPid.Name = 'PID'; $colPid.HeaderText = 'PID'; $colPid.FillWeight = 50; $colPid.MinimumWidth = 46; $colPid.ReadOnly = $true
 
     $colCpu = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colCpu.Name = 'Cpu'; $colCpu.HeaderText = 'CPU'; $colCpu.Width = 55; $colCpu.MinimumWidth = 46; $colCpu.ReadOnly = $true
+    $colCpu.Name = 'Cpu'; $colCpu.HeaderText = 'CPU'; $colCpu.FillWeight = 48; $colCpu.MinimumWidth = 46; $colCpu.ReadOnly = $true
     $colCpu.DefaultCellStyle.Alignment = 'MiddleRight'
 
     $colMem = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colMem.Name = 'Mem'; $colMem.HeaderText = 'RAM'; $colMem.Width = 62; $colMem.MinimumWidth = 52; $colMem.ReadOnly = $true
+    $colMem.Name = 'Mem'; $colMem.HeaderText = 'RAM'; $colMem.FillWeight = 55; $colMem.MinimumWidth = 52; $colMem.ReadOnly = $true
     $colMem.DefaultCellStyle.Alignment = 'MiddleRight'
 
     $colLocal = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colLocal.Name = 'LocalUrl'; $colLocal.HeaderText = 'Local URL'; $colLocal.Width = 150; $colLocal.MinimumWidth = 60; $colLocal.ReadOnly = $true
+    $colLocal.Name = 'LocalUrl'; $colLocal.HeaderText = 'Local URL'; $colLocal.FillWeight = 110; $colLocal.MinimumWidth = 60; $colLocal.ReadOnly = $true
 
     $colLan = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colLan.Name = 'LanUrls'; $colLan.HeaderText = 'Network URL(s)'; $colLan.Width = 190; $colLan.MinimumWidth = 60; $colLan.ReadOnly = $true
+    $colLan.Name = 'LanUrls'; $colLan.HeaderText = 'Network URL(s)'; $colLan.FillWeight = 170; $colLan.MinimumWidth = 60; $colLan.ReadOnly = $true
 
     $colPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.Width = 180; $colPath.MinimumWidth = 60; $colPath.ReadOnly = $true
+    $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 162; $colPath.MinimumWidth = 60; $colPath.ReadOnly = $true
 
     $colLog = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.Width = 55; $colLog.MinimumWidth = 40
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 55; $colLog.MinimumWidth = 40
     $colLog.ReadOnly = $true
     $colLog.DefaultCellStyle.Alignment = 'MiddleCenter'
     $colLog.DefaultCellStyle.ForeColor = $script:Theme.TextDim
@@ -2652,20 +2653,31 @@ function New-PortsGrid {
     $colLog.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
 
     $colAction = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.Width = 65; $colAction.MinimumWidth = 50
+    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.FillWeight = 60; $colAction.MinimumWidth = 50
     $colAction.ReadOnly = $true
     $colAction.DefaultCellStyle.Alignment = 'MiddleCenter'
 
     [System.Windows.Forms.DataGridViewColumn[]]$gridColumns = @($colStatus, $colPort, $colPin, $colCustomName, $colProc, $colPid, $colCpu, $colMem, $colLocal, $colLan, $colPath, $colLog, $colAction)
     $g.Columns.AddRange($gridColumns)
-    # Fixed, explicit widths (not Fill) so every column is freely
-    # drag-resizable instead of having its width computed automatically -
-    # AutoSizeColumnsMode/AutoSizeMode both take over interactive resize
-    # entirely, which is exactly what silently broke the Status column
-    # once it got its own AllCells override. AllowUserToOrderColumns adds
-    # drag-to-reposition on top. Both survive restart - see
+    # Fill (not None/fixed-width): a v1.14.0 attempt at "every column
+    # freely resizable" switched this to fixed widths, on the mistaken
+    # assumption that Fill mode itself blocked manual resize - it
+    # doesn't (WinForms redistributes FillWeight among Fill-mode columns
+    # as you drag a border, which is real interactive resize; only the
+    # content-based AutoSizeMode Status briefly had actually disabled
+    # it). Fixed widths let the columns' TOTAL width exceed the grid's
+    # own width once the user (or the window) got narrower than that
+    # total, which is what caused both new bugs that fix introduced: a
+    # horizontal scrollbar WinForms can't theme (always white/native,
+    # regardless of app theme), and the hand-drawn group-divider line
+    # (see Draw-GroupDividerRow) being positioned against row bounds
+    # that no longer matched the visible/scrolled area. Fill mode
+    # guarantees columns always exactly fill the grid's width, so
+    # neither problem can occur - and resize still works.
+    # AllowUserToOrderColumns adds drag-to-reposition on top; both
+    # survive restart via FillWeight/DisplayIndex - see
     # Update-ColumnLayout/Save-ColumnLayout.
-    $g.AutoSizeColumnsMode = 'None'
+    $g.AutoSizeColumnsMode = 'Fill'
     $g.AllowUserToResizeColumns = $true
     $g.AllowUserToOrderColumns = $true
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
@@ -2742,18 +2754,18 @@ Update-ColumnVisibility
 $script:SyncingColumnLayout = $false
 
 function Update-ColumnLayout {
-    # Applies saved widths + display order to all three grids at once -
-    # same "every tab stays visually identical" rationale as
+    # Applies saved fill-weights + display order to all three grids at
+    # once - same "every tab stays visually identical" rationale as
     # Update-ColumnVisibility above. Guarded by SyncingColumnLayout so
-    # setting .Width/.DisplayIndex here doesn't re-trigger
+    # setting .FillWeight/.DisplayIndex here doesn't re-trigger
     # Save-ColumnLayout via the ColumnWidthChanged/ColumnDisplayIndexChanged
     # handlers wired in New-PortsGrid.
     $script:SyncingColumnLayout = $true
     try {
         foreach ($grid in @($liveGrid, $historyGrid, $systemGrid)) {
-            foreach ($colName in @($script:Settings.ColumnWidths.Keys)) {
+            foreach ($colName in @($script:Settings.ColumnFillWeights.Keys)) {
                 $col = $grid.Columns[$colName]
-                if ($col) { $col.Width = [Math]::Max($col.MinimumWidth, [int]$script:Settings.ColumnWidths[$colName]) }
+                if ($col) { $col.FillWeight = [Math]::Max(1, [int]$script:Settings.ColumnFillWeights[$colName]) }
             }
             for ($i = 0; $i -lt $script:Settings.ColumnOrder.Count; $i++) {
                 $col = $grid.Columns[$script:Settings.ColumnOrder[$i]]
@@ -2777,13 +2789,13 @@ function Save-ColumnLayout {
     # itself instead of a popup.
     param($SourceGrid)
     if ($script:SyncingColumnLayout) { return }
-    $widths = @{}
+    $weights = @{}
     $order = New-Object System.Collections.Generic.List[string]
     foreach ($col in ($SourceGrid.Columns | Sort-Object DisplayIndex)) {
-        $widths[$col.Name] = $col.Width
+        $weights[$col.Name] = $col.FillWeight
         $order.Add($col.Name)
     }
-    $script:Settings.ColumnWidths = $widths
+    $script:Settings.ColumnFillWeights = $weights
     $script:Settings.ColumnOrder = @($order)
     Save-Settings $script:Settings
     Update-ColumnLayout

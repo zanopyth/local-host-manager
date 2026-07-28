@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.14.1] - 2026-07-28
+
+### Fixed
+- v1.14.0's switch to fixed-width columns (meant to make Status
+  resizable again) let the columns' total width exceed the table's
+  actual width once the window got narrower than that total. That
+  caused two new problems: a horizontal scrollbar WinForms can't theme
+  (always renders white/native regardless of the app's theme), and the
+  hand-drawn group-divider line landing against row bounds that no
+  longer matched the visible/scrolled area, especially while resizing
+  the window. Reverted to the table's Fill layout (which already
+  supports drag-to-resize - dragging a column border redistributes fill
+  weight among the others, and was never actually the problem;
+  Status's old content-based auto-size was), which guarantees columns
+  always exactly fill the table's width, so neither bug can occur.
+  Column widths are now persisted as fill-weight ratios rather than
+  literal pixels; reordering is unaffected.
+
 ## [1.14.0] - 2026-07-28
 
 ### Added
