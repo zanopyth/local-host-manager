@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.15.1] - 2026-07-28
+
+### Added
+- Column resize handles in the table header are now visible - as thin
+  divider lines between header cells - while hovering the header bar,
+  making it obvious where to grab to resize a column. Hidden the rest
+  of the time to keep the normal borderless look; hand-drawn rather
+  than a native border style, which has a documented history of
+  rendering glitches under this app's theme (see the CellBorderStyle
+  comment in New-PortsGrid).
+
+### Fixed
+- The Restart column clipped to "Res..." under the Terminal theme's
+  wider monospace font - its width was a pixel guess tuned for Light/
+  Dark's Segoe UI. Now measured against the theme's actual font
+  (TextRenderer.MeasureText, matching how the cell text is actually
+  rendered) instead of a hardcoded number, so it fits in any theme.
+- Restart's text color was the muted/secondary TextDim - now Success
+  green, matching "ON" status and the Start All button, since it's a
+  live clickable action, not secondary information.
+
 ## [1.15.0] - 2026-07-28
 
 ### Changed

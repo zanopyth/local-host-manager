@@ -1818,7 +1818,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.15.0'
+$script:AppVersion = '1.15.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2666,18 +2666,31 @@ function New-PortsGrid {
     # Save-ColumnLayout/Update-ColumnLayout) - WinForms has no per-column
     # "don't let this be reordered" flag, so that's enforced by snapping
     # them back after the fact rather than blocking the drag itself.
+    #
+    # Width is measured against the theme's actual font rather than a
+    # hardcoded guess - Light/Dark use Segoe UI, Terminal uses the wider
+    # monospace Cascadia Mono, and a width tuned for one clipped "Restart"
+    # to "Res..." under the other. TextRenderer (not Graphics.MeasureString)
+    # to match how the cell's own text is actually rendered.
+    $actionMeasureFont = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    $restartTextWidth = [System.Windows.Forms.TextRenderer]::MeasureText('Restart', $actionMeasureFont).Width
+    $startTextWidth = [System.Windows.Forms.TextRenderer]::MeasureText('Start', $actionMeasureFont).Width
+    $actionMeasureFont.Dispose()
+
     $colLog = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.Width = 62; $colLog.MinimumWidth = 62
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.Width = $restartTextWidth + 22; $colLog.MinimumWidth = $restartTextWidth + 22
     $colLog.AutoSizeMode = 'None'
     $colLog.Resizable = 'False'
     $colLog.ReadOnly = $true
     $colLog.DefaultCellStyle.Alignment = 'MiddleCenter'
-    $colLog.DefaultCellStyle.ForeColor = $script:Theme.TextDim
-    $colLog.DefaultCellStyle.SelectionForeColor = $script:Theme.TextDim
+    # Success (matches "ON" status and the Start All button), not TextDim -
+    # this is a live, clickable action, not a muted secondary label.
+    $colLog.DefaultCellStyle.ForeColor = $script:Theme.Success
+    $colLog.DefaultCellStyle.SelectionForeColor = $script:Theme.Success
     $colLog.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
 
     $colAction = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.Width = 58; $colAction.MinimumWidth = 58
+    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.Width = $startTextWidth + 22; $colAction.MinimumWidth = $startTextWidth + 22
     $colAction.AutoSizeMode = 'None'
     $colAction.Resizable = 'False'
     $colAction.ReadOnly = $true
@@ -2708,6 +2721,43 @@ function New-PortsGrid {
     $g.AllowUserToOrderColumns = $true
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
     $g.Dock = 'Fill'
+
+    # Column-resize handles in the header are invisible by default here
+    # (ColumnHeadersBorderStyle is 'None', same reason as CellBorderStyle
+    # below - the native border styles have a history of rendering
+    # glitches under this app's Windows 11 visual style/theme, e.g. the
+    # leaked vertical lines CellBorderStyle used to produce). Hand-drawn
+    # dividers instead, and only while the mouse is actually over the
+    # header bar, so the normal borderless look is undisturbed the rest
+    # of the time. $g.Tag (unused otherwise - row-level Tag is a
+    # different object, see Add-DataRow/Add-SeparatorRow) tracks hover
+    # state; CellPainting below does the actual drawing.
+    $g.Tag = [PSCustomObject]@{ HeaderHovered = $false }
+    $g.Add_MouseMove({
+        param($s, $e)
+        $overHeader = $e.Y -ge 0 -and $e.Y -lt $s.ColumnHeadersHeight
+        if ($overHeader -ne $s.Tag.HeaderHovered) {
+            $s.Tag.HeaderHovered = $overHeader
+            $s.Invalidate((New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.ColumnHeadersHeight)))
+        }
+    })
+    $g.Add_MouseLeave({
+        param($s, $e)
+        if ($s.Tag.HeaderHovered) {
+            $s.Tag.HeaderHovered = $false
+            $s.Invalidate((New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.ColumnHeadersHeight)))
+        }
+    })
+    $g.Add_CellPainting({
+        param($s, $e)
+        if ($e.RowIndex -ne -1 -or $e.ColumnIndex -lt 0 -or -not $s.Tag.HeaderHovered) { return }
+        $e.Paint($e.ClipBounds, $e.PaintParts)
+        $pen = New-Object System.Drawing.Pen($script:Theme.Border, 1)
+        $x = $e.CellBounds.Right - 1
+        $e.Graphics.DrawLine($pen, $x, ($e.CellBounds.Top + 6), $x, ($e.CellBounds.Bottom - 6))
+        $pen.Dispose()
+        $e.Handled = $true
+    })
 
     # Replaces the native CellBorderStyle border this column used to draw
     # (removed above) — a single flat line under each real row, no verticals.
