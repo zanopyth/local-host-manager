@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.15.0] - 2026-07-28
+
+### Changed
+- The Restart and Stop/Start columns are now fixed-width and
+  un-resizable, and always stay the last two (right-most) columns in
+  the table regardless of window size or drag-to-reorder - they're
+  click targets, not information to rebalance, so they no longer grow,
+  shrink, or drift the way the informational columns are meant to.
+  Since WinForms has no per-column "don't let this be reordered" flag,
+  this is enforced by normalizing the saved column order (Log/Action
+  forced to the end) every time a reorder is persisted or restored,
+  rather than by blocking the drag gesture itself.
+
 ## [1.14.3] - 2026-07-28
 
 ### Fixed

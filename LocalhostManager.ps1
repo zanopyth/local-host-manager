@@ -236,10 +236,13 @@ function Get-DefaultColumnVisibility {
 }
 
 function Get-DefaultColumnFillWeights {
-    # Starting point only - every column is user-resizable within the
-    # grid's Fill layout (see New-PortsGrid/Update-ColumnLayout), which
-    # redistributes these weights as the user drags a column border, so
-    # these just need to be reasonable relative to each other, not exact.
+    # Starting point only - every column here is user-resizable within
+    # the grid's Fill layout (see New-PortsGrid/Update-ColumnLayout),
+    # which redistributes these weights as the user drags a column
+    # border, so these just need to be reasonable relative to each
+    # other, not exact. Log and Action (Restart/Stop) are deliberately
+    # NOT listed - they're fixed-width, non-Fill columns (see
+    # New-PortsGrid), so a FillWeight for them wouldn't mean anything.
     return @{
         Status      = 40
         Port        = 45
@@ -252,13 +255,23 @@ function Get-DefaultColumnFillWeights {
         LocalUrl    = 110
         LanUrls     = 170
         ProjectPath = 162
-        Log         = 55
-        Action      = 60
     }
 }
 
 function Get-DefaultColumnOrder {
     return @('Status', 'Port', 'Pin', 'CustomName', 'Process', 'PID', 'Cpu', 'Mem', 'LocalUrl', 'LanUrls', 'ProjectPath', 'Log', 'Action')
+}
+
+function Get-NormalizedColumnOrder {
+    # Restart (Log) and Stop/Start (Action) always stay the last two
+    # columns, right-most in the table - see the comment on
+    # colLog/colAction in New-PortsGrid for why. Applied both when
+    # persisting a user's reorder (Save-ColumnLayout) and when restoring
+    # one (Load-Settings), so neither a live drag nor a stale/hand-edited
+    # settings.json can leave them anywhere else.
+    param([string[]]$Order)
+    $rest = @($Order | Where-Object { $_ -ne 'Log' -and $_ -ne 'Action' })
+    return @($rest + 'Log' + 'Action')
 }
 
 function Load-Settings {
@@ -315,7 +328,7 @@ function Load-Settings {
         $defaultOrder = Get-DefaultColumnOrder
         $columnOrder = if ($raw.PSObject.Properties.Name -contains 'ColumnOrder' -and $raw.ColumnOrder) {
             $savedOrder = @($raw.ColumnOrder | ForEach-Object { [string]$_ })
-            if (@($savedOrder | Sort-Object) -join ',' -eq @($defaultOrder | Sort-Object) -join ',') { $savedOrder } else { $defaultOrder }
+            if (@($savedOrder | Sort-Object) -join ',' -eq @($defaultOrder | Sort-Object) -join ',') { Get-NormalizedColumnOrder $savedOrder } else { $defaultOrder }
         } else { $defaultOrder }
         return @{
             OnlyNode           = [bool]$raw.OnlyNode
@@ -1805,7 +1818,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.14.3'
+$script:AppVersion = '1.15.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2644,8 +2657,19 @@ function New-PortsGrid {
     $colPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colPath.Name = 'ProjectPath'; $colPath.HeaderText = 'Project Path'; $colPath.FillWeight = 162; $colPath.MinimumWidth = 60; $colPath.ReadOnly = $true
 
+    # Restart and Stop/Start are click targets, not information to
+    # rebalance - unlike the informational columns, they stay a fixed
+    # size (AutoSizeMode 'None' opts them out of the grid's Fill
+    # redistribution entirely) and un-resizable, so they never grow,
+    # shrink, or drift as other columns are resized or the window is.
+    # Kept pinned to the last two DisplayIndex slots too (see
+    # Save-ColumnLayout/Update-ColumnLayout) - WinForms has no per-column
+    # "don't let this be reordered" flag, so that's enforced by snapping
+    # them back after the fact rather than blocking the drag itself.
     $colLog = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.FillWeight = 55; $colLog.MinimumWidth = 40
+    $colLog.Name = 'Log'; $colLog.HeaderText = ''; $colLog.Width = 62; $colLog.MinimumWidth = 62
+    $colLog.AutoSizeMode = 'None'
+    $colLog.Resizable = 'False'
     $colLog.ReadOnly = $true
     $colLog.DefaultCellStyle.Alignment = 'MiddleCenter'
     $colLog.DefaultCellStyle.ForeColor = $script:Theme.TextDim
@@ -2653,7 +2677,9 @@ function New-PortsGrid {
     $colLog.DefaultCellStyle.SelectionBackColor = $script:Theme.PanelBg
 
     $colAction = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.FillWeight = 60; $colAction.MinimumWidth = 50
+    $colAction.Name = 'Action'; $colAction.HeaderText = ''; $colAction.Width = 58; $colAction.MinimumWidth = 58
+    $colAction.AutoSizeMode = 'None'
+    $colAction.Resizable = 'False'
     $colAction.ReadOnly = $true
     $colAction.DefaultCellStyle.Alignment = 'MiddleCenter'
 
@@ -2814,11 +2840,15 @@ function Save-ColumnLayout {
     $weights = @{}
     $order = New-Object System.Collections.Generic.List[string]
     foreach ($col in ($SourceGrid.Columns | Sort-Object DisplayIndex)) {
+        # Log/Action (Restart/Stop) are fixed-width, non-Fill columns
+        # (see New-PortsGrid) - .FillWeight on them is meaningless, and
+        # their DisplayIndex gets forced back to last anyway.
+        if ($col.Name -in @('Log', 'Action')) { continue }
         $weights[$col.Name] = $col.FillWeight
         $order.Add($col.Name)
     }
     $script:Settings.ColumnFillWeights = $weights
-    $script:Settings.ColumnOrder = @($order)
+    $script:Settings.ColumnOrder = Get-NormalizedColumnOrder @($order)
     Save-Settings $script:Settings
     Update-ColumnLayout
 }

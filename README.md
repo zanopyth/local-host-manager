@@ -27,9 +27,11 @@ Grab the latest `LocalhostManager.exe` from the
   the informational columns (Custom Name, Process, PID, CPU, RAM, Local
   URL, Network URL(s), Project Path) across every tab - CPU is off by
   default since it's usually 0% until something's actually busy
-- **Fully resizable and reorderable columns** - drag a column border to
+- **Resizable and reorderable columns** - drag a column border to
   resize it, drag a header to move it, on any of the three tables. Both
-  stick across restarts and stay in sync across tabs
+  stick across restarts and stay in sync across tabs. The Restart and
+  Stop/Start columns stay a fixed size at the right edge, since they're
+  click targets rather than information to rebalance
 - Shows local + LAN URLs so you can share a dev server on your network
 - Right-click any row for a compact **Detail** popup — every column's full
   value with a one-click copy button, network addresses broken out one per
