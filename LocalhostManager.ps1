@@ -1726,7 +1726,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.12.0'
+$script:AppVersion = '1.12.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2795,7 +2795,7 @@ function Get-DisplayRowsSplit {
 function Get-DisplayRowsSignature {
     param($Display)
     return ($Display | ForEach-Object {
-        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)|$([bool]$_.Row.Pinned)"
+        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)|$([bool]$_.Row.Pinned)|$($_.Row.Cpu)|$($_.Row.Mem)"
     }) -join "`n"
 }
 

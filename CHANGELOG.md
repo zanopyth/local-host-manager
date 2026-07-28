@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.12.1] - 2026-07-28
+
+### Fixed
+- CPU/RAM columns never actually updated after their first paint. The
+  grid only repaints when a row-data "signature" changes (to avoid
+  flickering every refresh tick), and that signature didn't include
+  Cpu/Mem - so a row's other fields staying the same (the normal,
+  steady-state case) meant the grid kept showing whatever it painted on
+  the very first tick, which is always blank (no CPU sample exists yet
+  that early). Added Cpu/Mem to the signature.
+
 ## [1.12.0] - 2026-07-28
 
 ### Added
