@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.15.2] - 2026-07-28
+
+### Added
+- The table's scrollbars now render in Windows' native dark mode
+  (Dark/Terminal themes only) instead of the plain white/light native
+  bar - most visible on the horizontal one, which previously stood out
+  starkly regardless of the app's theme. Not a pixel-exact Catppuccin
+  Mocha match (there's no managed API to recolor a native ScrollBar
+  control to arbitrary colors - Windows renders its own fixed dark
+  gray for this), but real dark-mode rendering rather than jarring
+  white. Re-applied on resize and after the table's rows change, since
+  the scrollbar's underlying window isn't created until one is
+  actually needed for the first time.
+
 ## [1.15.1] - 2026-07-28
 
 ### Added

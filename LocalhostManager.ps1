@@ -115,6 +115,48 @@ function Set-DarkTitleBar {
     } catch {}
 }
 
+Add-Type -Name ScrollBarTheme -Namespace LocalhostManager -MemberDefinition @"
+[DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+public static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+
+public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+
+[DllImport("user32.dll")]
+public static extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam);
+
+[DllImport("user32.dll", CharSet = CharSet.Auto)]
+public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+"@
+
+# The DataGridView's scrollbars (the horizontal one is the visible offender
+# - a plain white/light native bar no matter the app's theme, since
+# there's no managed API to recolor a native ScrollBar control) are real
+# child ScrollBar windows, not owner-drawn. SetWindowTheme's undocumented
+# but long-stable "DarkMode_Explorer" subapp name is what Windows' own
+# dark mode uses for exactly this class - not a pixel-exact Catppuccin
+# Mocha match (Windows renders its own fixed dark gray, not our theme's
+# specific hues), but a real dark scrollbar instead of a jarring white
+# one. Has to be re-run whenever a scrollbar could have newly appeared,
+# not just once at grid creation - DataGridView doesn't create the
+# ScrollBar child window until a scrollbar first actually becomes
+# necessary, so an earlier EnumChildWindows pass simply won't find it yet.
+function Set-DarkScrollBars {
+    param($Control)
+    if (-not $script:Theme.IsDark) { return }
+    try {
+        $callback = {
+            param($hWnd, $lParam)
+            $sb = New-Object System.Text.StringBuilder 256
+            [LocalhostManager.ScrollBarTheme]::GetClassName($hWnd, $sb, 256) | Out-Null
+            if ($sb.ToString() -eq 'ScrollBar') {
+                [LocalhostManager.ScrollBarTheme]::SetWindowTheme($hWnd, 'DarkMode_Explorer', $null) | Out-Null
+            }
+            return $true
+        }
+        [LocalhostManager.ScrollBarTheme]::EnumChildWindows($Control.Handle, $callback, [IntPtr]::Zero) | Out-Null
+    } catch {}
+}
+
 # Recolors MenuStrip/ContextMenuStrip chrome (dropdown background, image
 # margin, hover/press highlight, borders) for the dark theme — the default
 # ProfessionalColorTable is hardcoded light and would otherwise paint a
@@ -1818,7 +1860,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.15.1'
+$script:AppVersion = '1.15.2'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2721,6 +2763,8 @@ function New-PortsGrid {
     $g.AllowUserToOrderColumns = $true
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
     $g.Dock = 'Fill'
+    Set-DarkScrollBars -Control $g
+    $g.Add_Resize({ param($s, $e) Set-DarkScrollBars -Control $s })
 
     # Column-resize handles in the header are invisible by default here
     # (ColumnHeadersBorderStyle is 'None', same reason as CellBorderStyle
@@ -3198,6 +3242,10 @@ function Render-Grid {
     } finally {
         $Grid.ResumeLayout()
     }
+    # A row-count/content change can introduce or remove a scrollbar just
+    # like a resize can - see Set-DarkScrollBars for why this has to be
+    # re-run rather than done once.
+    Set-DarkScrollBars -Control $Grid
 }
 
 function Update-TabHeaders {
