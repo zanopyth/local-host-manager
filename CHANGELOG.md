@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] - 2026-07-28
+
+### Added
+- **Local Domains**: an opt-in reverse proxy (new "Local Domains" menu, off
+  by default) that gives every running project a friendly address -
+  `http://bodyshop.localhost:2802/` instead of `http://localhost:5100/` -
+  routed by hostname to whichever port that project actually happens to be
+  on. Works in Chrome/Edge/Firefox, which resolve `*.localhost` to loopback
+  on their own; doesn't work from curl/Postman/other non-browser tools,
+  since Windows' own DNS resolver doesn't do that resolution. Requires a
+  one-time `netsh http add urlacl` grant per port (shown, with a Copy
+  button, right in the Local Domains dialog) - loopback-only, no firewall
+  change. The friendly address also shows up in each running project's
+  Detail popup ("Local Domain", clickable) once it's live.
+- Visiting the bare proxy address (no project name) shows a small index
+  page listing every currently-running project's `*.localhost` address.
+
 ## [1.10.0] - 2026-07-27
 
 ### Added

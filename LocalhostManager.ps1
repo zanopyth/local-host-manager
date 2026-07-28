@@ -219,7 +219,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline' }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802 }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -239,6 +239,8 @@ function Load-Settings {
         $crashNotifications = if ($raw.PSObject.Properties.Name -contains 'CrashNotifications') { [bool]$raw.CrashNotifications } else { $true }
         $checkForUpdates = if ($raw.PSObject.Properties.Name -contains 'CheckForUpdates') { [bool]$raw.CheckForUpdates } else { $true }
         $groupDividerStyle = if ($raw.PSObject.Properties.Name -contains 'GroupDividerStyle' -and [string]$raw.GroupDividerStyle -in @('Dotted', 'Labeled')) { [string]$raw.GroupDividerStyle } else { 'Hairline' }
+        $proxyEnabled = if ($raw.PSObject.Properties.Name -contains 'ProxyEnabled') { [bool]$raw.ProxyEnabled } else { $false }
+        $proxyPort = if ($raw.PSObject.Properties.Name -contains 'ProxyPort' -and [int]$raw.ProxyPort -gt 0) { [int]$raw.ProxyPort } else { 2802 }
         return @{
             OnlyNode           = [bool]$raw.OnlyNode
             RootDir            = [string]$raw.RootDir
@@ -251,6 +253,8 @@ function Load-Settings {
             LaunchAtStartup    = $launchAtStartup
             StartMinimized     = $startMinimized
             CrashNotifications = $crashNotifications
+            ProxyEnabled       = $proxyEnabled
+            ProxyPort          = $proxyPort
             CheckForUpdates    = $checkForUpdates
             GroupDividerStyle  = $groupDividerStyle
         }
@@ -521,6 +525,23 @@ $script:DashboardCache = [hashtable]::Synchronized(@{
     Port          = 0
     Addresses     = @()
     BoundWildcard = $false
+    Listening     = $false
+    ListenError   = ''
+})
+
+# ---------------------------------------------------------------------------
+# Reverse proxy cache. Same shape/role as DashboardCache above, for the
+# "Local Domains" feature: the UI thread republishes RouteMap (hostname
+# slug -> {Port, Label, ProjectPath}) on every refresh cycle, and the
+# HttpListener runspace only ever reads it to decide where to relay each
+# request - no Actions/Results queue needed here since the proxy has
+# nothing to report back (it only forwards HTTP, it doesn't start/stop
+# anything).
+# ---------------------------------------------------------------------------
+$script:ProxyCache = [hashtable]::Synchronized(@{
+    RouteMap      = @{}
+    Port          = 0
+    StopRequested = $false
     Listening     = $false
     ListenError   = ''
 })
@@ -1651,7 +1672,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.10.0'
+$script:AppVersion = '1.11.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2044,6 +2065,9 @@ $menuSettings.DropDownItems.AddRange($menuSettingsItems)
 $menuDashboard = New-Object System.Windows.Forms.ToolStripMenuItem('Dashboard')
 $menuDashboard.Add_Click({ Show-DashboardDialog })
 
+$menuLocalDomains = New-Object System.Windows.Forms.ToolStripMenuItem('Local Domains')
+$menuLocalDomains.Add_Click({ Show-ProxyDialog })
+
 $menuHelp = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 $menuHelpUpdate = New-Object System.Windows.Forms.ToolStripMenuItem('Check for Updates...')
 $menuHelpUpdate.Add_Click({ Show-UpdateCheckDialog })
@@ -2052,7 +2076,7 @@ $menuHelpAbout.Add_Click({ Show-AboutDialog })
 [System.Windows.Forms.ToolStripItem[]]$menuHelpItems = @($menuHelpUpdate, (New-Object System.Windows.Forms.ToolStripSeparator), $menuHelpAbout)
 $menuHelp.DropDownItems.AddRange($menuHelpItems)
 
-[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuHelp)
+[System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuLocalDomains, $menuHelp)
 $menuStrip.Items.AddRange($menuTopItems)
 $form.MainMenuStrip = $menuStrip
 # File and Help have no checkable/iconed items, so the ~25px gutter every
@@ -2617,6 +2641,57 @@ function Add-SeparatorRow {
     }
 }
 
+function Get-ProxySlug {
+    # DNS-label-safe hostname piece for the reverse proxy: lowercase,
+    # non-alphanumeric runs collapsed to a single hyphen, trimmed. Empty
+    # input (a name that's all symbols, or none at all) falls back to the
+    # port itself so every running project still gets a usable address.
+    param([string]$Label, [string]$Port)
+    $slug = ([string]$Label).ToLowerInvariant() -replace '[^a-z0-9]+', '-'
+    $slug = $slug.Trim('-')
+    if (-not $slug) { $slug = "port-$Port" }
+    return $slug
+}
+
+function Get-ProxyUrlForPort {
+    # Reverse lookup (Port -> slug) for the Detail popup - the RouteMap
+    # itself is keyed by slug since that's what the listener needs to
+    # route incoming requests, but the grid only ever knows a row's port.
+    param([string]$Port)
+    if (-not $script:Settings.ProxyEnabled -or -not $script:ProxyCache.Listening -or -not $Port) { return $null }
+    foreach ($slug in $script:ProxyCache.RouteMap.Keys) {
+        if ([string]$script:ProxyCache.RouteMap[$slug].Port -eq [string]$Port) {
+            return "http://$slug.localhost:$($script:ProxyCache.Port)/"
+        }
+    }
+    return $null
+}
+
+function Update-ProxyRouteMap {
+    # Rebuilt every refresh cycle (see Get-DisplayRowsSplit) from whatever
+    # is currently ON - same cadence/lifetime as Publish-DashboardRows, and
+    # for the same reason: cheap, and "a few seconds stale" is fine for a
+    # route table nobody but this machine's browser ever reads.
+    param($Display)
+    if (-not $script:ProxyCache) { return }
+    $routes = @{}
+    $used = @{}
+    foreach ($entry in $Display) {
+        $row = $entry.Row
+        if ($row.Status -ne 'ON' -or -not $row.Port) { continue }
+        $label = if ($row.CustomName) { [string]$row.CustomName } elseif ($row.ProjectPath) { Split-Path -Leaf $row.ProjectPath } else { '' }
+        $slug = Get-ProxySlug -Label $label -Port $row.Port
+        # Two different projects can sanitize to the same slug (e.g. two
+        # custom names that only differ in punctuation) - the port makes
+        # the second one collision-free instead of silently shadowing the
+        # first.
+        if ($used.ContainsKey($slug)) { $slug = "$slug-$($row.Port)" }
+        $used[$slug] = $true
+        $routes[$slug] = @{ Port = [int]$row.Port; Label = $(if ($label) { $label } else { "port $($row.Port)" }); ProjectPath = [string]$row.ProjectPath }
+    }
+    $script:ProxyCache.RouteMap = $routes
+}
+
 function Get-DisplayRows {
     # Use Groups active: the selected group(s) define exactly what's shown,
     # and they always stay visible even if Dev-Servers-Only or the root-dir
@@ -2641,6 +2716,7 @@ function Get-DisplayRowsSplit {
     # live cache regardless, so this is purely a display-time gate).
     $display = @(Get-DisplayRows)
     Publish-DashboardRows -Display $display
+    Update-ProxyRouteMap -Display $display
     $systemRows = if ([bool]$script:Settings.ShowSystemPorts) { @(Build-SystemRows) } else { @() }
     return @{
         Live    = @($display | Where-Object { $_.Row.Status -eq 'ON' })
@@ -3444,6 +3520,11 @@ function Show-RowDetail {
         @{ Label = 'Local URL';   Value = [string]$Data.LocalUrl;    IsVirtual = $false }
     )
 
+    $proxyUrl = if ($Data.Status -eq 'ON') { Get-ProxyUrlForPort -Port $Data.Port } else { $null }
+    if ($proxyUrl) {
+        $fields += @{ Label = 'Local Domain'; Value = $proxyUrl; IsVirtual = $false }
+    }
+
     # One row per network URL (already labeled/sorted by adapter type in
     # Build-Rows), so each address gets its own copy button and its own
     # "layer" label instead of a generic "Network URL N".
@@ -3505,7 +3586,7 @@ function Show-RowDetail {
         # "Local URL" opens in the default browser on click - the only field
         # that's always a real, reachable http(s) URL (network entries can
         # be virtual-adapter/unreachable addresses, so those stay plain text).
-        if ($f.Label -eq 'Local URL' -and $f.Value -match '^https?://') {
+        if ($f.Label -in @('Local URL', 'Local Domain') -and $f.Value -match '^https?://') {
             $valueLbl = New-Object System.Windows.Forms.LinkLabel
             $valueLbl.LinkColor = $script:Theme.Accent
             $valueLbl.ActiveLinkColor = $script:Theme.AccentDark
@@ -4278,6 +4359,143 @@ function Show-DashboardDialog {
     }
 }
 
+function Show-ProxyDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Local Domains'
+    $dlg.Size = New-Object System.Drawing.Size(520, 440)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $introLbl = New-Object System.Windows.Forms.Label
+    $introLbl.Text = "Give each running project a friendly address, e.g. http://bodyshop.localhost:$([int]$script:Settings.ProxyPort)/, instead of a raw port. Works from this PC's browser (Chrome/Edge/Firefox resolve *.localhost to loopback on their own) - not from other devices or non-browser tools like curl."
+    $introLbl.Location = New-Object System.Drawing.Point(15, 15)
+    $introLbl.Size = New-Object System.Drawing.Size(475, 56)
+    $introLbl.ForeColor = $script:Theme.TextDim
+
+    $enableSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.ProxyEnabled)
+    $enableSwitch.Location = New-Object System.Drawing.Point(15, 78)
+
+    $enableLbl = New-Object System.Windows.Forms.Label
+    $enableLbl.Text = 'Enable Local Domains'
+    $enableLbl.Location = New-Object System.Drawing.Point(60, 78)
+    $enableLbl.Size = New-Object System.Drawing.Size(250, 20)
+    $enableLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $enableSwitch -Label $enableLbl
+
+    $offByDefaultLbl = New-Object System.Windows.Forms.Label
+    $offByDefaultLbl.Text = 'Off by default. Nothing listens on any port until you enable it here.'
+    $offByDefaultLbl.Location = New-Object System.Drawing.Point(15, 104)
+    $offByDefaultLbl.Size = New-Object System.Drawing.Size(475, 20)
+    $offByDefaultLbl.ForeColor = $script:Theme.TextDim
+    $offByDefaultLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+
+    $portLbl = New-Object System.Windows.Forms.Label
+    $portLbl.Text = 'Port:'
+    $portLbl.Location = New-Object System.Drawing.Point(15, 138)
+    $portLbl.Size = New-Object System.Drawing.Size(55, 24)
+    $portLbl.ForeColor = $script:Theme.TextPrimary
+    $portLbl.TextAlign = 'MiddleLeft'
+
+    $portBox = New-Object System.Windows.Forms.NumericUpDown
+    $portBox.Location = New-Object System.Drawing.Point(75, 136)
+    $portBox.Size = New-Object System.Drawing.Size(90, 24)
+    $portBox.Minimum = 1024
+    $portBox.Maximum = 65535
+    $portBox.Value = [Math]::Max(1024, [Math]::Min(65535, [int]$script:Settings.ProxyPort))
+    $portBox.Enabled = [bool]$script:Settings.ProxyEnabled
+    $portBox.BackColor = $script:Theme.CardBg
+    $portBox.ForeColor = $script:Theme.TextPrimary
+    $portBox.BorderStyle = 'FixedSingle'
+
+    $setupLbl = New-SettingsSectionLabel -Text 'One-time setup (per port, run once as Administrator)' -X 15 -Y 172
+
+    $cmdBox = New-Object System.Windows.Forms.TextBox
+    $cmdBox.Location = New-Object System.Drawing.Point(15, 196)
+    $cmdBox.Size = New-Object System.Drawing.Size(390, 24)
+    $cmdBox.ReadOnly = $true
+    $cmdBox.BackColor = $script:Theme.CardBg
+    $cmdBox.ForeColor = $script:Theme.TextPrimary
+    $cmdBox.BorderStyle = 'FixedSingle'
+    $cmdBox.Text = "netsh http add urlacl url=http://+:$([int]$portBox.Value)/ user=Everyone"
+    $portBox.Add_ValueChanged({ $cmdBox.Text = "netsh http add urlacl url=http://+:$([int]$portBox.Value)/ user=Everyone" }.GetNewClosure())
+
+    $copyCmdButton = New-Object System.Windows.Forms.Button
+    $copyCmdButton.Text = 'Copy'
+    $copyCmdButton.Location = New-Object System.Drawing.Point(410, 195)
+    $copyCmdButton.Size = New-Object System.Drawing.Size(80, 26)
+    $copyCmdButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($cmdBox.Text) }.GetNewClosure())
+    Initialize-ModernButton -Button $copyCmdButton
+
+    $setupHintLbl = New-Object System.Windows.Forms.Label
+    $setupHintLbl.Text = "Only needed once per port (loopback-only - no firewall change, nothing reachable from other devices). It just grants permission to bind this port without running elevated every time."
+    $setupHintLbl.Location = New-Object System.Drawing.Point(15, 226)
+    $setupHintLbl.Size = New-Object System.Drawing.Size(475, 32)
+    $setupHintLbl.ForeColor = $script:Theme.TextDim
+    $setupHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+
+    $statusLbl = New-Object System.Windows.Forms.Label
+    $statusLbl.Location = New-Object System.Drawing.Point(15, 264)
+    $statusLbl.Size = New-Object System.Drawing.Size(475, 62)
+    $statusLbl.ForeColor = $script:Theme.TextDim
+    $statusLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+    if ($script:Settings.ProxyEnabled -and $script:ProxyCache.Listening) {
+        $statusLbl.Text = "Currently running on port $($script:ProxyCache.Port). Open the Detail popup on any running project's row for its exact *.localhost address."
+    } elseif ($script:Settings.ProxyEnabled -and $script:ProxyCache.ListenError) {
+        $statusLbl.Text = "Enabled but failed to start: $($script:ProxyCache.ListenError)`nMost likely cause: the one-time setup command above hasn't been run yet for this port."
+    } elseif ($script:Settings.ProxyEnabled) {
+        $statusLbl.Text = 'Enabled, starting...'
+    } else {
+        $statusLbl.Text = 'Not running.'
+    }
+
+    Set-ToggleOnChange -Switch $enableSwitch -Handler {
+        $portBox.Enabled = Get-ToggleChecked $enableSwitch
+    }.GetNewClosure()
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = 'OK'
+    $okButton.Location = New-Object System.Drawing.Point(315, 355)
+    $okButton.Size = New-Object System.Drawing.Size(85, 28)
+    $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
+    Initialize-ModernButton -Button $okButton -Variant Accent
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Cancel'
+    $cancelButton.Location = New-Object System.Drawing.Point(405, 355)
+    $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
+    $cancelButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $cancelButton
+
+    [System.Windows.Forms.Control[]]$dlgControls = @($introLbl, $enableSwitch, $enableLbl, $offByDefaultLbl, $portLbl, $portBox, $setupLbl, $cmdBox, $copyCmdButton, $setupHintLbl, $statusLbl, $okButton, $cancelButton)
+    $dlg.Controls.AddRange($dlgControls)
+    $dlg.AcceptButton = $okButton
+    $dlg.ShowDialog($form) | Out-Null
+
+    if ($dlg.Tag -eq 'OK') {
+        $newEnabled = Get-ToggleChecked $enableSwitch
+        $newPort = [int]$portBox.Value
+        $wasEnabled = [bool]$script:Settings.ProxyEnabled
+        $portChanged = $newPort -ne [int]$script:Settings.ProxyPort
+
+        $script:Settings.ProxyEnabled = $newEnabled
+        $script:Settings.ProxyPort = $newPort
+        Save-Settings $script:Settings
+
+        if ($newEnabled -and -not $wasEnabled) {
+            Start-ProxyServer -Port $newPort
+        } elseif (-not $newEnabled -and $wasEnabled) {
+            Stop-ProxyServer
+        } elseif ($newEnabled -and $wasEnabled -and $portChanged) {
+            Restart-ProxyServer -Port $newPort
+        }
+    }
+}
+
 function Get-KnownProjects {
     param([bool]$OnlyNode = $true)
     $allRows = @(Build-Rows -OnlyNode $OnlyNode -RootDir '')
@@ -4772,6 +4990,7 @@ $form.Add_FormClosing({
         $notifyIcon.Visible = $false
         Stop-BackgroundPoller
         Stop-WebDashboard
+        Stop-ProxyServer
     }
 })
 
@@ -5263,6 +5482,261 @@ $script:DashboardActionTimer.Add_Tick({
 })
 $script:DashboardActionTimer.Start()
 
+# ---------------------------------------------------------------------------
+# Reverse proxy ("Local Domains") — routes http://<name>.localhost:<port>/
+# to whichever real port that project is currently running on, keyed by
+# ProxyCache.RouteMap (rebuilt every refresh cycle, see Update-ProxyRouteMap).
+# Same background-runspace/HttpListener shape as the Web Dashboard above,
+# minus an Actions queue: this listener only ever relays HTTP, it never
+# needs to call back into UI-thread state.
+#
+# Unlike the dashboard, there's no useful "bind to literal localhost"
+# fallback here if the wildcard bind fails - a listener bound to just
+# "http://localhost:<port>/" only ever matches requests whose Host header
+# is literally "localhost", never "<name>.localhost", so it couldn't route
+# anything. Wildcard (and therefore the one-time urlacl grant - see
+# Show-ProxyDialog) is the only mode that works for this feature.
+# ---------------------------------------------------------------------------
+# One HTTP request per PowerShell instance, run against a pooled runspace -
+# extracted to its own scriptblock (rather than inlined in the accept loop
+# below) because a real page load fires several requests in parallel
+# (document + JS + CSS + favicon + ...), and handling them one at a time
+# was the very first thing that broke in testing: a synchronous
+# accept-process-accept loop left HTTP.SYS's own backlog queue rejecting
+# the 3rd/4th concurrent asset with a bare 503 while request #1 was still
+# being relayed. A small RunspacePool (see Start-ProxyServer) gives each
+# accepted connection its own thread so the accept loop is never blocked
+# on an in-flight relay.
+$script:ProxyHandleRequestScript = {
+    param($Context, $Cache)
+
+    function Get-ProxyIndexHtml {
+        param($RouteMap, [int]$Port, [string]$RequestedSlug)
+        $rows = ($RouteMap.Keys | Sort-Object | ForEach-Object {
+            $r = $RouteMap[$_]
+            $addr = "$_.localhost`:$Port"
+            "<tr><td><a href='http://$addr/'>$addr</a></td><td>$([System.Net.WebUtility]::HtmlEncode($r.Label))</td><td>$($r.Port)</td></tr>"
+        }) -join "`n"
+        if (-not $rows) { $rows = "<tr><td colspan='3'>Nothing is running right now.</td></tr>" }
+        $notice = if ($RequestedSlug) {
+            "<p class='err'>No running project matches '<b>$([System.Net.WebUtility]::HtmlEncode($RequestedSlug)).localhost</b>'.</p>"
+        } else { '' }
+        return @"
+<!doctype html><html><head><meta charset='utf-8'><title>Local Domains</title>
+<style>
+body{font-family:Segoe UI,sans-serif;background:#1e1f22;color:#ddd;padding:24px}
+table{border-collapse:collapse;width:100%;max-width:640px}
+td,th{padding:6px 10px;text-align:left;border-bottom:1px solid #444}
+a{color:#7aa2f7} .err{color:#e06c75}
+</style></head><body>
+<h2>Localhost Manager - Local Domains</h2>
+$notice
+<table><tr><th>Address</th><th>Project</th><th>Port</th></tr>$rows</table>
+</body></html>
+"@
+    }
+
+    $req = $Context.Request
+    $res = $Context.Response
+    # HTTP/1.1 only allows one in-flight response per connection at a time,
+    # in request order - a keep-alive connection the browser reuses/
+    # pipelines across several of the pooled runspaces above (see
+    # ProxyListenScript) can finish out of order, and HttpListener reacts to
+    # that by failing the connection with a bare 503 (this is exactly what
+    # broke concurrent asset loads in testing - a real SPA's JS/CSS came
+    # back 503 once fetched alongside its other assets). Closing every
+    # connection after one response removes the shared-connection ordering
+    # constraint entirely: each request gets its own connection, so nothing
+    # is ever waiting on response order again.
+    $res.KeepAlive = $false
+    try {
+        $rawHost = $req.Url.Host
+        $slug = if ($rawHost -match '(?i)^(localhost|127\.0\.0\.1|\[?::1\]?)$') { '' } else { ($rawHost -replace '(?i)\.localhost$', '').ToLowerInvariant() }
+        $route = if ($slug) { $Cache.RouteMap[$slug] } else { $null }
+
+        if (-not $route) {
+            $res.StatusCode = if ($slug) { 404 } else { 200 }
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ProxyIndexHtml $Cache.RouteMap $Cache.Port $slug))
+            $res.ContentType = 'text/html; charset=utf-8'
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        } else {
+            $fwd = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$($route.Port)$($req.Url.PathAndQuery)")
+            $fwd.Method = $req.HttpMethod
+            $fwd.AllowAutoRedirect = $false
+            $fwd.Timeout = 30000
+            $fwd.KeepAlive = $false
+            foreach ($key in $req.Headers.AllKeys) {
+                if (-not $key) { continue }
+                switch -Regex ($key) {
+                    # Origin dropped, not just left alone: the browser sends
+                    # it (CORS-mode fetches - module scripts, stylesheets,
+                    # ...) as http://<name>.localhost:<proxyPort>, which is
+                    # not the backend's real origin. Forwarding it verbatim
+                    # is exactly what broke a real app in testing - its own
+                    # origin-check middleware saw a foreign Origin and threw
+                    # a 500 for every asset fetched that way (module JS,
+                    # CSS), while plain navigations/fetches with no Origin
+                    # header sailed through fine. Dropping it makes the
+                    # backend see the same kind of request it always has:
+                    # same-origin, no CORS header to second-guess.
+                    '^(Host|Content-Length|Connection|Transfer-Encoding|Expect|Proxy-Connection|Keep-Alive|Date|If-Modified-Since|Range|Origin)$' { continue }
+                    '^Accept$'       { $fwd.Accept = $req.Headers[$key]; continue }
+                    '^Content-Type$' { $fwd.ContentType = $req.Headers[$key]; continue }
+                    '^User-Agent$'   { $fwd.UserAgent = $req.Headers[$key]; continue }
+                    '^Referer$'      { $fwd.Referer = $req.Headers[$key]; continue }
+                    default { try { $fwd.Headers.Add($key, $req.Headers[$key]) } catch {} }
+                }
+            }
+            if ($req.HasEntityBody) {
+                $fwd.ContentLength = $req.ContentLength64
+                $reqStream = $fwd.GetRequestStream()
+                $req.InputStream.CopyTo($reqStream)
+                $reqStream.Close()
+            } else {
+                $fwd.ContentLength = 0
+            }
+
+            $fwdRes = $null
+            try {
+                $fwdRes = $fwd.GetResponse()
+            } catch [System.Net.WebException] {
+                # A backend returning 4xx/5xx lands here too (GetResponse
+                # throws on any non-2xx status) - .Response is still the
+                # real upstream response in that case, only $null when
+                # the connection itself failed (backend gone/refused).
+                $fwdRes = $_.Exception.Response
+            }
+
+            if ($fwdRes) {
+                $res.StatusCode = [int]$fwdRes.StatusCode
+                foreach ($hKey in $fwdRes.Headers.AllKeys) {
+                    if ($hKey -in @('Transfer-Encoding', 'Connection', 'Content-Length', 'Keep-Alive')) { continue }
+                    try { $res.Headers.Add($hKey, $fwdRes.Headers[$hKey]) } catch {}
+                }
+                if ($fwdRes.ContentType) { $res.ContentType = $fwdRes.ContentType }
+                if ($fwdRes.ContentLength -ge 0) {
+                    $res.ContentLength64 = $fwdRes.ContentLength
+                } else {
+                    $res.SendChunked = $true
+                }
+                $respStream = $fwdRes.GetResponseStream()
+                $respStream.CopyTo($res.OutputStream)
+                $respStream.Close()
+                $fwdRes.Close()
+            } else {
+                $res.StatusCode = 502
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes("<h3>502 - couldn't reach $([System.Net.WebUtility]::HtmlEncode($route.Label)) on port $($route.Port)</h3>")
+                $res.ContentType = 'text/html; charset=utf-8'
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+            }
+        }
+    } catch {
+        try { $res.StatusCode = 502 } catch {}
+    } finally {
+        try { $res.OutputStream.Close() } catch {}
+    }
+}
+
+$script:ProxyListenScript = {
+    param($Cache, $HandleRequestScript)
+
+    $listener = New-Object System.Net.HttpListener
+    $boundOk = $false
+    try {
+        $listener.Prefixes.Add("http://+:$($Cache.Port)/")
+        $listener.Start()
+        $boundOk = $true
+    } catch {
+        $Cache.ListenError = $_.Exception.Message
+        $boundOk = $false
+    }
+    $Cache.Listening = $boundOk
+    if (-not $boundOk) { return }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, 8)
+    $pool.Open()
+    # Each entry is one accepted connection currently being relayed on the
+    # pool - reaped (Disposed) once its BeginInvoke completes, checked once
+    # per accept-loop iteration below. Nothing here ever waits on this list;
+    # it only exists so completed instances get cleaned up instead of
+    # leaking a PowerShell instance per request.
+    $inFlight = New-Object System.Collections.Generic.List[object]
+
+    while (-not $Cache.StopRequested) {
+        for ($i = $inFlight.Count - 1; $i -ge 0; $i--) {
+            if ($inFlight[$i].Handle.IsCompleted) {
+                try { $inFlight[$i].Shell.EndInvoke($inFlight[$i].Handle) } catch {}
+                try { $inFlight[$i].Shell.Dispose() } catch {}
+                $inFlight.RemoveAt($i)
+            }
+        }
+
+        $context = $null
+        try {
+            $asyncResult = $listener.BeginGetContext($null, $null)
+            while (-not $asyncResult.AsyncWaitHandle.WaitOne(500)) {
+                if ($Cache.StopRequested) {
+                    try { $listener.Stop() } catch {}
+                    foreach ($inf in $inFlight) { try { $inf.Shell.Dispose() } catch {} }
+                    try { $pool.Close() } catch {}
+                    return
+                }
+            }
+            $context = $listener.EndGetContext($asyncResult)
+        } catch {
+            if ($Cache.StopRequested) { return }
+            continue
+        }
+        if (-not $context) { continue }
+
+        $sh = [powershell]::Create()
+        $sh.RunspacePool = $pool
+        [void]$sh.AddScript($HandleRequestScript).AddArgument($context).AddArgument($Cache)
+        $handle = $sh.BeginInvoke()
+        $inFlight.Add(@{ Shell = $sh; Handle = $handle })
+    }
+    foreach ($inf in $inFlight) { try { $inf.Shell.Dispose() } catch {} }
+    try { $pool.Close() } catch {}
+    try { $listener.Stop() } catch {}
+    try { $listener.Close() } catch {}
+}
+
+function Start-ProxyServer {
+    param([int]$Port)
+    $script:ProxyCache.StopRequested = $false
+    $script:ProxyCache.Port = $Port
+    $script:ProxyCache.Listening = $false
+    $script:ProxyCache.ListenError = ''
+
+    $script:ProxyRunspace = [runspacefactory]::CreateRunspace()
+    $script:ProxyRunspace.ApartmentState = 'MTA'
+    $script:ProxyRunspace.ThreadOptions = 'ReuseThread'
+    $script:ProxyRunspace.Open()
+
+    $script:ProxyShell = [powershell]::Create()
+    $script:ProxyShell.Runspace = $script:ProxyRunspace
+    [void]$script:ProxyShell.AddScript($script:ProxyListenScript).AddArgument($script:ProxyCache).AddArgument($script:ProxyHandleRequestScript)
+    $script:ProxyHandle = $script:ProxyShell.BeginInvoke()
+}
+
+function Stop-ProxyServer {
+    if (-not $script:ProxyShell) { return }
+    $script:ProxyCache.StopRequested = $true
+    try { $script:ProxyShell.Stop() } catch {}
+    try { $script:ProxyShell.Dispose() } catch {}
+    try { $script:ProxyRunspace.Close() } catch {}
+    $script:ProxyShell = $null
+    $script:ProxyRunspace = $null
+}
+
+function Restart-ProxyServer {
+    param([int]$Port)
+    Stop-ProxyServer
+    Start-ProxyServer -Port $Port
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 4000
 $timer.Add_Tick({ Invoke-PeriodicRefresh })
@@ -5276,6 +5750,9 @@ try {
     Refresh-Grid
     if ($script:Settings.DashboardEnabled) {
         Start-WebDashboard -Port ([int]$script:Settings.WebPort)
+    }
+    if ($script:Settings.ProxyEnabled) {
+        Start-ProxyServer -Port ([int]$script:Settings.ProxyPort)
     }
     Update-DashboardPill
     Start-UpdateCheck

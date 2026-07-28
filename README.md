@@ -39,6 +39,42 @@ Grab the latest `LocalhostManager.exe` from the
   live status pill in the toolbar showing whether it's running
 - Single-instance protection — launching the app while it's already
   running just shows a message instead of opening a duplicate window
+- **Local Domains** (new in v1.11, opt-in — off until you enable it from
+  the **Local Domains** menu): a reverse proxy that gives each running
+  project a friendly address, e.g. `http://bodyshop.localhost:2802/`
+  instead of a raw port - routed by hostname to whatever port that project
+  is actually on. Browser-only (Chrome/Edge/Firefox resolve `*.localhost`
+  to loopback themselves; curl/Postman/etc. can't). One-time setup, shown
+  in the dialog with a Copy button
+
+## Local Domains
+
+Give each running project a name-based address instead of a raw port -
+`http://bodyshop.localhost:2802/` reads better than `http://localhost:5100/`,
+and it doesn't change out from under you if the port does. Enable it from
+the **Local Domains** menu, pick a port (default `2802`), and toggle it on.
+
+It only works from a browser: Chrome, Edge, and Firefox all resolve any
+`*.localhost` address to loopback on their own, without needing a DNS entry
+or hosts-file edit - but Windows' own DNS resolver doesn't do that, so
+non-browser tools (curl, Postman, one service calling another) can't use
+these addresses.
+
+Routing by hostname on one shared port needs a wildcard `HttpListener`
+binding, which needs a one-time, per-port permission grant (loopback-only -
+no firewall change, nothing reachable from another device):
+
+```powershell
+netsh http add urlacl url=http://+:2802/ user=Everyone
+```
+
+The Local Domains dialog shows this command (with the port you actually
+picked) and a Copy button. Run it once as Administrator, then re-enable
+(or restart) Local Domains from the dialog. Once it's running, each
+project's address shows up in its row's Detail popup as **Local Domain**,
+next to Local URL - and visiting the bare proxy address with no project
+name (e.g. `http://localhost:2802/`) lists every currently-running
+project's address.
 
 ## Web dashboard
 
