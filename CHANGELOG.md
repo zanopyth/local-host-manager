@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.16.0] - 2026-07-29
+
+### Added
+- The rule between grouped rows is now a subtle muted hairline by
+  default instead of a bold accent-colored bar, which read more like a
+  warning stripe than a section break. Two alternative styles - dotted,
+  and labeled (names the group starting below it) - are available in
+  Settings → Appearance.
+- A small busy indicator in the toolbar (below the column-chooser
+  button) blinks red/green for the duration of any Start/Stop/Restart
+  action, using the same ring-and-dot look as the dashboard status
+  pill.
+
+### Fixed
+- Restarting, stopping, or starting a project could make the whole
+  window appear "Not Responding" for several seconds - every step
+  (confirm dialogs, killing the old process, waiting for the port to
+  free up, starting the new one) ran fully blocking on the UI thread.
+  These now keep pumping the window's message loop while they wait,
+  and a re-entrancy guard ignores a second click while one is already
+  in flight.
+- Launching the app while it was already running correctly showed
+  "Localhost Manager is already running" - but the duplicate process
+  never actually exited afterward, leaving an invisible, windowless
+  copy running in the background with no taskbar entry and no tray
+  icon. Enough repeated duplicate launches could make the real
+  instance seem to have vanished entirely. `exit` only unwound the
+  script; the duplicate's process now hard-exits for real.
+- Start All/Stop All, and every other owner-drawn button, rendered
+  their icon+text a couple of pixels off-center - the text was
+  measured with one text-rendering engine (GDI) and painted with
+  another (GDI+), which don't agree on metrics.
+- Two Settings dialog labels cleaned up: the crash-notification
+  toggle's label wrapped and clipped mid-word, and the root-directory
+  label was tightened up.
+
 ## [1.15.2] - 2026-07-28
 
 ### Added

@@ -1126,7 +1126,15 @@ $script:SingleInstanceCreatedNew = $false
 $script:SingleInstanceMutex = New-Object System.Threading.Mutex($true, 'LocalhostManager_SingleInstance_Mutex', [ref]$script:SingleInstanceCreatedNew)
 if (-not $script:SingleInstanceCreatedNew) {
     [System.Windows.Forms.MessageBox]::Show('Localhost Manager is already running. Check your system tray.', 'Localhost Manager', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-    exit
+    # Plain `exit` only unwinds the PowerShell pipeline - in the ps2exe-
+    # compiled .exe it does not reliably tear down the host process this
+    # early (before Application.Run ever starts), leaving a windowless,
+    # tray-icon-less zombie behind after the dialog is dismissed. Every
+    # duplicate launch left one of these running invisibly, which is what
+    # made the real instance look like it had vanished from both the
+    # taskbar and the tray. Environment.Exit terminates the process
+    # unconditionally, regardless of how it was hosted.
+    [System.Environment]::Exit(0)
 }
 
 # Loaded here (ahead of everything else that used to load it further down)
@@ -1734,6 +1742,13 @@ $script:SelectedGroups = @($script:Settings.SelectedGroups | Where-Object { $scr
 # wrapper) — separate from the PID discovered via TCP scanning below, which
 # is often a few process-tree hops downstream of this one.
 $script:ManagedProcesses = @{}
+# Guards Invoke-Restart/Invoke-ToggleAction against re-entrancy: both now
+# pump the UI message loop (Wait-UiResponsive) while they wait on kills/
+# starts instead of blocking it outright, which keeps the window responsive
+# but also means a click on another action button mid-flight would normally
+# reach its handler. One action at a time app-wide is simpler and safer than
+# reasoning about interleaved starts/stops.
+$script:ActionBusy = $false
 $script:LogCap = 1000
 $script:LogDir = Join-Path $script:HistoryDir 'logs'
 $script:LogDiskCap = 2000
@@ -1860,7 +1875,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.15.2'
+$script:AppVersion = '1.16.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2151,6 +2166,70 @@ function New-DashboardPill {
     return $pill
 }
 
+function New-ActionBusyIndicator {
+    # Same ring+dot look as the dashboard pill above (square in Terminal
+    # theme, rounded otherwise - both just read $script:Theme.Radius),
+    # repurposed as a busy light: hidden at rest, shown and blinking
+    # red/green for the duration of a Start/Stop/Restart action so a
+    # Wait-UiResponsive pause reads as "working" instead of "frozen".
+    $ind = New-Object System.Windows.Forms.Panel
+    $ind.Size = New-Object System.Drawing.Size(34, 28)
+    $ind.Tag = [PSCustomObject]@{ Lit = $false }
+    $ind.Visible = $false
+    $ind.Cursor = [System.Windows.Forms.Cursors]::Default
+
+    $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+    $dbProp.SetValue($ind, $true, $null)
+
+    $ind.Add_Paint({
+        param($s, $e)
+        $t = $s.Tag
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
+        $g.Clear($parentColor)
+
+        $size = 20
+        $rect = New-Object System.Drawing.Rectangle((($s.Width - $size) / 2), (($s.Height - $size) / 2), $size, $size)
+        $d = $rect.Height
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        if ($script:Theme.Radius -le 0) {
+            $path.AddRectangle($rect)
+        } else {
+            $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
+            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
+            $path.CloseFigure()
+        }
+
+        $ringColor = if ($t.Lit) { $script:Theme.Success } else { $script:Theme.Danger }
+        $fillColor = if ($t.Lit) { $script:Theme.SuccessTint } else { $script:Theme.DangerTint }
+
+        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+        $g.FillPath($fillBrush, $path)
+        $fillBrush.Dispose()
+
+        $borderPen = New-Object System.Drawing.Pen($ringColor, 1)
+        $g.DrawPath($borderPen, $path)
+        $borderPen.Dispose()
+
+        $dotSize = 8.0
+        $cx = $rect.X + ($rect.Width / 2.0)
+        $cy = $rect.Y + ($rect.Height / 2.0)
+        $dotRect = New-Object System.Drawing.RectangleF(($cx - $dotSize / 2.0), ($cy - $dotSize / 2.0), $dotSize, $dotSize)
+        $dotBrush = New-Object System.Drawing.SolidBrush($ringColor)
+        if ($script:Theme.Radius -le 0) {
+            $g.FillRectangle($dotBrush, $dotRect.X, $dotRect.Y, $dotRect.Width, $dotRect.Height)
+        } else {
+            $g.FillEllipse($dotBrush, $dotRect)
+        }
+        $dotBrush.Dispose()
+
+        $path.Dispose()
+    })
+
+    return $ind
+}
+
 function Update-DashboardPill {
     if (-not $script:DashboardPill) { return }
     $t = $script:DashboardPill.Tag
@@ -2369,6 +2448,36 @@ $script:DashboardPill = New-DashboardPill
 $script:DashboardPill.Location = New-Object System.Drawing.Point(908, 16)
 $script:DashboardPill.Anchor = 'Top,Right'
 
+# Busy light for Start/Stop/Restart - sits directly under the column-chooser
+# ("filter") button, since that's the one free spot in row 2 between Stop
+# All and the divider.
+$script:ActionBusyIndicator = New-ActionBusyIndicator
+$script:ActionBusyIndicator.Location = New-Object System.Drawing.Point(232, 48)
+$script:ActionBusyTip = New-Object System.Windows.Forms.ToolTip
+$script:ActionBusyTip.InitialDelay = 300
+$script:ActionBusyTip.SetToolTip($script:ActionBusyIndicator, 'Working...')
+
+$script:ActionBusyTimer = New-Object System.Windows.Forms.Timer
+$script:ActionBusyTimer.Interval = 350
+$script:ActionBusyTimer.Add_Tick({
+    $t = $script:ActionBusyIndicator.Tag
+    $t.Lit = -not $t.Lit
+    $script:ActionBusyIndicator.Invalidate()
+})
+
+function Start-ActionBusyIndicator {
+    if ($script:ActionBusyTimer.Enabled) { return }
+    $script:ActionBusyIndicator.Tag.Lit = $true
+    $script:ActionBusyIndicator.Visible = $true
+    $script:ActionBusyIndicator.Invalidate()
+    $script:ActionBusyTimer.Start()
+}
+
+function Stop-ActionBusyIndicator {
+    $script:ActionBusyTimer.Stop()
+    $script:ActionBusyIndicator.Visible = $false
+}
+
 $useGroupsSwitch = New-ToggleSwitch -Checked $script:Settings.ShowGroups
 $useGroupsSwitch.Location = New-Object System.Drawing.Point(310, 16)
 
@@ -2512,7 +2621,7 @@ $script:ColumnsButtonTip = New-Object System.Windows.Forms.ToolTip
 $script:ColumnsButtonTip.InitialDelay = 300
 $script:ColumnsButtonTip.SetToolTip($columnsButton, 'Choose columns')
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $startAllButton, $stopAllButton, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $startAllButton, $stopAllButton, $script:ActionBusyIndicator, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -3457,6 +3566,36 @@ function Start-ProjectAtPath {
     }
 }
 
+function Wait-UiResponsive {
+    # Sleeps for the given duration while still pumping the WinForms message
+    # loop, so the window keeps repainting/accepting input instead of
+    # Windows flagging it "Not Responding" the way a plain Start-Sleep would
+    # during a Restart/Stop/Start action - the whole point being that a
+    # bounded pause should read as "busy" (see Start-/Stop-ActionBusyIndicator),
+    # never as "hung".
+    param([int]$Milliseconds)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 30
+    }
+}
+
+function Wait-ProcessExitUiResponsive {
+    # Same idea as Wait-UiResponsive, but bounded on a specific process
+    # exiting (used for the taskkill wrapper) instead of a fixed duration.
+    # Returns $true if it exited within the timeout, $false if still running
+    # when we gave up - callers already treat that as "move on, the safety
+    # net below still has a shot at it", same as the old WaitForExit(3000).
+    param($Process, [int]$TimeoutMilliseconds)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while (-not $Process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 30
+    }
+    return $Process.HasExited
+}
+
 function Stop-ProjectById {
     param([int]$ProcId, [string]$ProjectPath)
 
@@ -3478,7 +3617,7 @@ function Stop-ProjectById {
             # the whole app for an hour after a phone-hub restart. If it
             # doesn't finish in time we just move on; taskkill keeps running
             # independently and the safety net below still has a shot at it.
-            if (-not $killProc.WaitForExit(3000)) {
+            if (-not (Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000)) {
                 Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($managed.Proc.Id) ($ProjectPath) - continuing without waiting" -Level Warning
             }
         } catch {}
@@ -3607,7 +3746,7 @@ function Test-PortCollision {
         $killProc.StartInfo.UseShellExecute = $false
         $killProc.StartInfo.CreateNoWindow = $true
         [void]$killProc.Start()
-        if (-not $killProc.WaitForExit(3000)) {
+        if (-not (Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000)) {
             Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($info.ProcId) (port $Port) - continuing without waiting" -Level Warning
         }
     } catch {}
@@ -3616,43 +3755,50 @@ function Test-PortCollision {
             Stop-Process -Id $info.ProcId -Force -ErrorAction SilentlyContinue
         }
     } catch {}
-    Start-Sleep -Milliseconds 400
+    Wait-UiResponsive -Milliseconds 400
     return $true
 }
 
 function Invoke-ToggleAction {
     param($data)
-
-    if ($data.Status -eq 'ON') {
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Stop $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
-            'Confirm Stop', 'YesNo', 'Warning')
-        if ($confirm -ne 'Yes') { return }
-        if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
-            [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+    if ($script:ActionBusy) { return }
+    $script:ActionBusy = $true
+    try {
+        if ($data.Status -eq 'ON') {
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "Stop $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
+                'Confirm Stop', 'YesNo', 'Warning')
+            if ($confirm -ne 'Yes') { return }
+            Start-ActionBusyIndicator
+            if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
+                [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+            }
+        } else {
+            if (-not $data.ProjectPath) {
+                [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Start', 'OK', 'Warning') | Out-Null
+                return
+            }
+            if (-not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
+                [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
+                return
+            }
+            Start-ActionBusyIndicator
+            $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
+            if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
+            if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
+                [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
+            }
         }
-    } else {
-        if (-not $data.ProjectPath) {
-            [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Start', 'OK', 'Warning') | Out-Null
-            return
-        }
-        if (-not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-            [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
-            return
-        }
-        $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
-        if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
-        if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-            [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
-        }
+        Wait-UiResponsive -Milliseconds 800
+        Refresh-Grid
+    } finally {
+        $script:ActionBusy = $false
+        Stop-ActionBusyIndicator
     }
-    Start-Sleep -Milliseconds 800
-    Refresh-Grid
 }
 
 function Invoke-Restart {
     param($data)
-
     if (-not $data.ProjectPath) {
         [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Restart', 'OK', 'Warning') | Out-Null
         return
@@ -3661,27 +3807,35 @@ function Invoke-Restart {
         [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
         return
     }
-
-    if ($data.Status -eq 'ON') {
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Restart $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
-            'Confirm Restart', 'YesNo', 'Warning')
-        if ($confirm -ne 'Yes') { return }
-        if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
-            [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
-            return
+    if ($script:ActionBusy) { return }
+    $script:ActionBusy = $true
+    try {
+        if ($data.Status -eq 'ON') {
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "Restart $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
+                'Confirm Restart', 'YesNo', 'Warning')
+            if ($confirm -ne 'Yes') { return }
+            Start-ActionBusyIndicator
+            if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
+                [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+                return
+            }
+            Wait-UiResponsive -Milliseconds 800
         }
-        Start-Sleep -Milliseconds 800
-    }
 
-    $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
-    if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
+        Start-ActionBusyIndicator
+        $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
+        if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
 
-    if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-        [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
+        if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
+            [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
+        }
+        Wait-UiResponsive -Milliseconds 800
+        Refresh-Grid
+    } finally {
+        $script:ActionBusy = $false
+        Stop-ActionBusyIndicator
     }
-    Start-Sleep -Milliseconds 800
-    Refresh-Grid
 }
 
 function Show-LogViewer {
