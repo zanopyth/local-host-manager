@@ -243,6 +243,7 @@ function Load-History {
                 ProjectPath = $prop.Value.ProjectPath
                 ProcessName = $prop.Value.ProcessName
                 Pinned      = if ($prop.Value.PSObject.Properties.Name -contains 'Pinned') { [bool]$prop.Value.Pinned } else { $false }
+                AutoRestart = if ($prop.Value.PSObject.Properties.Name -contains 'AutoRestart') { [bool]$prop.Value.AutoRestart } else { $false }
                 CommandLine = if ($prop.Value.PSObject.Properties.Name -contains 'CommandLine') { [string]$prop.Value.CommandLine } else { $null }
             }
         }
@@ -537,6 +538,47 @@ function Get-NormalizedPath {
     param([string]$Path)
     if (-not $Path) { return '' }
     return $Path.TrimEnd('\').ToLowerInvariant()
+}
+
+# ---------------------------------------------------------------------------
+# Build & Deploy - a per-project "build then mirror dist/ into a server's
+# public/" recipe (originally written for the Jewelry Store frontend/server
+# split, generalized so any tracked project can define one). Keyed by
+# normalized project path, same convention as CustomNames.
+# ---------------------------------------------------------------------------
+$script:DeployDefsPath = Join-Path $script:HistoryDir 'deploydefs.json'
+
+function Load-DeployDefs {
+    if (-not (Test-Path $script:DeployDefsPath)) { return @{} }
+    try {
+        $raw = Get-Content $script:DeployDefsPath -Raw | ConvertFrom-Json
+        $h = @{}
+        foreach ($prop in $raw.PSObject.Properties) {
+            # TargetDirs (plural, array) is current; TargetDir (singular
+            # string) is the pre-multi-target shape - wrap it into a
+            # one-element array so old saved recipes (including the
+            # Jewelry Store one saved before this existed) keep working.
+            $targets = if ($prop.Value.PSObject.Properties.Name -contains 'TargetDirs') {
+                @($prop.Value.TargetDirs | ForEach-Object { [string]$_ })
+            } elseif ($prop.Value.PSObject.Properties.Name -contains 'TargetDir' -and $prop.Value.TargetDir) {
+                @([string]$prop.Value.TargetDir)
+            } else {
+                @()
+            }
+            $h[$prop.Name] = @{
+                BuildCommand = [string]$prop.Value.BuildCommand
+                WorkingDir   = [string]$prop.Value.WorkingDir
+                SourceDir    = [string]$prop.Value.SourceDir
+                TargetDirs   = $targets
+            }
+        }
+        return $h
+    } catch { return @{} }
+}
+
+function Save-DeployDefs($defs) {
+    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+    $defs | ConvertTo-Json | Set-Content -Path $script:DeployDefsPath -Encoding UTF8
 }
 
 $script:GroupsPath = Join-Path $script:HistoryDir 'groups.json'
@@ -963,8 +1005,9 @@ function Build-Rows {
         $e = $live[$key]
         if ($e.IsSystem) { continue }
         $pinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
-        if ($e.IsNode -or $pinned) {
-            $history[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName; Pinned = $pinned; CommandLine = $e.CommandLine }
+        $autoRestart = $history.ContainsKey($key) -and [bool]$history[$key].AutoRestart
+        if ($e.IsNode -or $pinned -or $autoRestart) {
+            $history[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName; Pinned = $pinned; AutoRestart = $autoRestart; CommandLine = $e.CommandLine }
         }
     }
     Save-History $history
@@ -976,6 +1019,7 @@ function Build-Rows {
         $e = $live[$key]
         if ($e.IsSystem) { continue }
         $pinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
+        $autoRestart = $history.ContainsKey($key) -and [bool]$history[$key].AutoRestart
         # Pinning bypasses Dev-Servers-Only too - same "stays visible
         # regardless of the filter" idea Use Groups already gets.
         if ($OnlyNode -and -not $e.IsNode -and -not $pinned) { continue }
@@ -1019,6 +1063,7 @@ function Build-Rows {
             Action      = 'Stop'
             HasLog      = [bool]$managed
             Pinned      = $pinned
+            AutoRestart = $autoRestart
             CommandLine = $e.CommandLine
         }
     }
@@ -1050,6 +1095,7 @@ function Build-Rows {
             Action      = 'Start'
             HasLog      = [bool]$managed
             Pinned      = [bool]$h.Pinned
+            AutoRestart = [bool]$h.AutoRestart
             CommandLine = $h.CommandLine
         }
     }
@@ -1282,6 +1328,17 @@ function Draw-ToolbarIcon {
             $Graphics.DrawLine($pen, $Rect.Left, $Rect.Top, $Rect.Right, $Rect.Bottom)
             $Graphics.DrawLine($pen, $Rect.Right, $Rect.Top, $Rect.Left, $Rect.Bottom)
         }
+        'Deploy' {
+            # Plain up-arrow (shaft + chevron head) - reads as "push/build
+            # and ship" without needing an icon-font glyph (see the
+            # Columns/"filter" button confusion - a missing font glyph
+            # renders blank with no obvious cause, a hand-drawn vector never
+            # can).
+            $midX = $Rect.Left + $Rect.Width / 2.0
+            $Graphics.DrawLine($pen, $midX, $Rect.Bottom, $midX, $Rect.Top)
+            $Graphics.DrawLine($pen, $Rect.Left, ($Rect.Top + $Rect.Height * 0.42), $midX, $Rect.Top)
+            $Graphics.DrawLine($pen, $Rect.Right, ($Rect.Top + $Rect.Height * 0.42), $midX, $Rect.Top)
+        }
     }
     $pen.Dispose()
 }
@@ -1291,7 +1348,9 @@ function Draw-ButtonLayer {
     # $YOffset and faded by $Alpha — the two knobs Draw-ButtonContent needs
     # to crossfade an old layer out and a new one in during a morph.
     param($Graphics, [System.Drawing.RectangleF]$Rect, [string]$Icon, [string]$Text, $Font, [System.Drawing.Color]$Color, [float]$Alpha, [float]$YOffset)
-    if ($Alpha -le 0.01 -or -not $Text) { return }
+    $hasIcon = [bool]$Icon
+    $hasText = [bool]$Text
+    if ($Alpha -le 0.01 -or (-not $hasIcon -and -not $hasText)) { return }
     $iconSize = 12
     $gap = 6
     # Measure with the same StringFormat we draw with (GenericTypographic,
@@ -1301,21 +1360,22 @@ function Draw-ButtonLayer {
     # string with extra leading space GDI's measurement doesn't know about,
     # so the centered group rendered a few px right of true center.
     $sf = [System.Drawing.StringFormat]::GenericTypographic
-    $textSize = $Graphics.MeasureString($Text, $Font, [System.Drawing.PointF]::Empty, $sf)
-    $hasIcon = [bool]$Icon
-    $totalW = $textSize.Width + $(if ($hasIcon) { $iconSize + $gap } else { 0 })
+    $textSize = if ($hasText) { $Graphics.MeasureString($Text, $Font, [System.Drawing.PointF]::Empty, $sf) } else { [System.Drawing.SizeF]::Empty }
+    $totalW = $textSize.Width + $(if ($hasIcon -and $hasText) { $iconSize + $gap } elseif ($hasIcon) { $iconSize } else { 0 })
     $startX = $Rect.X + ($Rect.Width - $totalW) / 2.0
     $centerY = $Rect.Y + $Rect.Height / 2.0 + $YOffset
 
     if ($hasIcon) {
         $iconRect = New-Object System.Drawing.RectangleF($startX, ($centerY - $iconSize / 2.0), $iconSize, $iconSize)
         Draw-ToolbarIcon -Graphics $Graphics -Icon $Icon -Rect $iconRect -Color $Color -Alpha $Alpha
-        $startX += $iconSize + $gap
+        $startX += $iconSize + $(if ($hasText) { $gap } else { 0 })
     }
-    $textColor = [System.Drawing.Color]::FromArgb([int](255 * $Alpha), $Color)
-    $brush = New-Object System.Drawing.SolidBrush($textColor)
-    $Graphics.DrawString($Text, $Font, $brush, $startX, ($centerY - $textSize.Height / 2.0), $sf)
-    $brush.Dispose()
+    if ($hasText) {
+        $textColor = [System.Drawing.Color]::FromArgb([int](255 * $Alpha), $Color)
+        $brush = New-Object System.Drawing.SolidBrush($textColor)
+        $Graphics.DrawString($Text, $Font, $brush, $startX, ($centerY - $textSize.Height / 2.0), $sf)
+        $brush.Dispose()
+    }
 }
 
 function Draw-ButtonContent {
@@ -1733,6 +1793,7 @@ function Enable-RoundedPopup {
 
 $script:RootDir = $script:Settings.RootDir
 $script:CustomNames = Load-CustomNames
+$script:DeployDefs = Load-DeployDefs
 $script:Groups = Load-Groups
 $script:SelectedGroups = @($script:Settings.SelectedGroups | Where-Object { $script:Groups.ContainsKey($_) })
 
@@ -1742,6 +1803,15 @@ $script:SelectedGroups = @($script:Settings.SelectedGroups | Where-Object { $scr
 # wrapper) — separate from the PID discovered via TCP scanning below, which
 # is often a few process-tree hops downstream of this one.
 $script:ManagedProcesses = @{}
+# Rolling-window auto-restart attempt timestamps, keyed by normalized
+# project path - deliberately NOT stored on a $script:ManagedProcesses
+# entry, since Start-ProjectAtPath replaces that entry outright on every
+# (re)start, which would reset an attempt counter kept there back to zero
+# after a single successful restart and defeat the whole point of capping
+# a crash loop. This dictionary outlives any one process's entry.
+$script:AutoRestartAttempts = @{}
+$script:AutoRestartMaxAttempts = 5
+$script:AutoRestartWindowMinutes = 5
 # Guards Invoke-Restart/Invoke-ToggleAction against re-entrancy: both now
 # pump the UI message loop (Wait-UiResponsive) while they wait on kills/
 # starts instead of blocking it outright, which keeps the window responsive
@@ -1875,7 +1945,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.16.0'
+$script:AppVersion = '1.17.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2448,11 +2518,14 @@ $script:DashboardPill = New-DashboardPill
 $script:DashboardPill.Location = New-Object System.Drawing.Point(908, 16)
 $script:DashboardPill.Anchor = 'Top,Right'
 
-# Busy light for Start/Stop/Restart - sits directly under the column-chooser
-# ("filter") button, since that's the one free spot in row 2 between Stop
-# All and the divider.
+# Busy light for Start/Stop/Restart - stacked directly under the dashboard
+# status pill (both Top,Right-anchored so they move together on resize),
+# resized down to match its compact 20x20 footprint instead of the 34x28
+# toolbar-button size it used before the Deploy button took that slot.
 $script:ActionBusyIndicator = New-ActionBusyIndicator
-$script:ActionBusyIndicator.Location = New-Object System.Drawing.Point(232, 48)
+$script:ActionBusyIndicator.Size = New-Object System.Drawing.Size(20, 20)
+$script:ActionBusyIndicator.Location = New-Object System.Drawing.Point(908, 44)
+$script:ActionBusyIndicator.Anchor = 'Top,Right'
 $script:ActionBusyTip = New-Object System.Windows.Forms.ToolTip
 $script:ActionBusyTip.InitialDelay = 300
 $script:ActionBusyTip.SetToolTip($script:ActionBusyIndicator, 'Working...')
@@ -2606,6 +2679,16 @@ $columnsListHost.Size = $columnsCheckedList.Size
 $columnsListHost.Margin = New-Object System.Windows.Forms.Padding(0)
 $columnsPopup.Items.Add($columnsListHost) | Out-Null
 
+# Build & Deploy - sits directly under the column-chooser button (same
+# 34x28 footprint), opening the full Deploy Manager picker
+# (Show-DeployManagerDialog, defined further down): every tracked port,
+# filterable by group or port range, with Deploy/Configure actions -
+# not just the projects that already have a saved recipe.
+$deployButton = New-Object System.Windows.Forms.Button
+$deployButton.Location = New-Object System.Drawing.Point(232, 48)
+$deployButton.Size = New-Object System.Drawing.Size(34, 28)
+$deployButton.Add_Click({ Show-DeployManagerDialog })
+
 Initialize-ModernButton -Button $refreshButton
 Initialize-ModernButton -Button $groupsButton
 Initialize-ModernButton -Button $startAllButton -Variant Success -Icon Play
@@ -2621,7 +2704,17 @@ $script:ColumnsButtonTip = New-Object System.Windows.Forms.ToolTip
 $script:ColumnsButtonTip.InitialDelay = 300
 $script:ColumnsButtonTip.SetToolTip($columnsButton, 'Choose columns')
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $startAllButton, $stopAllButton, $script:ActionBusyIndicator, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
+# Deploy uses a hand-drawn vector icon (Draw-ToolbarIcon), not a font
+# glyph like Columns above - no text at all, so Draw-ButtonLayer's
+# icon-only path centers it alone.
+$deployButton.Text = ''
+$deployButton.AccessibleName = 'Build & Deploy'
+Initialize-ModernButton -Button $deployButton -Icon 'Deploy'
+$script:DeployButtonTip = New-Object System.Windows.Forms.ToolTip
+$script:DeployButtonTip.InitialDelay = 300
+$script:DeployButtonTip.SetToolTip($deployButton, 'Build & Deploy')
+
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $deployButton, $startAllButton, $stopAllButton, $script:ActionBusyIndicator, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -3553,6 +3646,16 @@ function Start-ProjectAtPath {
             Unregister-Event -SourceIdentifier "${p}_out" -ErrorAction SilentlyContinue
             Unregister-Event -SourceIdentifier "${p}_err" -ErrorAction SilentlyContinue
             Unregister-Event -SourceIdentifier "${p}_exit" -ErrorAction SilentlyContinue
+
+            # Auto-restart runs after the old process's own events are torn
+            # down above, and only for a genuine unattended crash - never
+            # when the user themselves stopped it.
+            if (-not $e.StoppedByUser) {
+                $autoRestart = Get-AutoRestartConfig -ProjectPath $Event.MessageData.ProjectPath
+                if ($autoRestart.Enabled) {
+                    Invoke-CrashAutoRestart -ProjectPath $Event.MessageData.ProjectPath -CommandLine $autoRestart.CommandLine -Label $label
+                }
+            }
         } | Out-Null
 
         [void]$proc.Start()
@@ -3644,23 +3747,107 @@ function Invoke-TogglePin {
     # Pinning writes straight to history.json (keyed by port, same as the
     # rest of history) rather than touching $script:ManagedProcesses or any
     # in-memory row state - Build-Rows re-derives Pinned from that file on
-    # every refresh, so this is the single source of truth for it.
+    # every refresh, so this is the single source of truth for it. Always
+    # merges onto the existing entry (rather than replacing it outright)
+    # so an independent flag on the same record - AutoRestart - never gets
+    # silently wiped by toggling this one.
     param($data)
     $key = [string]$data.Port
     $history = Load-History
-    $isPinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
-
-    if ($isPinned) {
-        $history[$key].Pinned = $false
-    } else {
-        $history[$key] = @{
-            ProjectPath = $data.ProjectPath
-            ProcessName = $data.ProcessName
-            Pinned      = $true
-            CommandLine = $data.CommandLine
-        }
+    $existing = if ($history.ContainsKey($key)) { $history[$key] } else { @{ AutoRestart = $false } }
+    $history[$key] = @{
+        ProjectPath = $data.ProjectPath
+        ProcessName = $data.ProcessName
+        Pinned      = -not [bool]$existing.Pinned
+        AutoRestart = [bool]$existing.AutoRestart
+        CommandLine = $data.CommandLine
     }
     Save-History $history
+    Refresh-Grid
+}
+
+function Invoke-ToggleAutoRestart {
+    # Same merge-onto-existing-entry pattern as Invoke-TogglePin (see its
+    # comment) - AutoRestart and Pinned are independent flags on the same
+    # history.json record, keyed by port.
+    param($data)
+    $key = [string]$data.Port
+    $history = Load-History
+    $existing = if ($history.ContainsKey($key)) { $history[$key] } else { @{ Pinned = $false } }
+    $history[$key] = @{
+        ProjectPath = $data.ProjectPath
+        ProcessName = $data.ProcessName
+        Pinned      = [bool]$existing.Pinned
+        AutoRestart = -not [bool]$existing.AutoRestart
+        CommandLine = $data.CommandLine
+    }
+    Save-History $history
+    Refresh-Grid
+}
+
+function Get-AutoRestartConfig {
+    # AutoRestart lives in history.json keyed by port, but a just-crashed
+    # process is (by definition) no longer listening on one - so this
+    # matches by ProjectPath across every history entry instead of a
+    # direct port lookup. Returns the matching entry's own CommandLine
+    # too (the last observed OS argv for this project, same fallback
+    # Start-ProjectAtPath already understands for non-npm projects) so
+    # the caller doesn't need a second Load-History pass.
+    param([string]$ProjectPath)
+    $result = [PSCustomObject]@{ Enabled = $false; CommandLine = $null }
+    if (-not $ProjectPath) { return $result }
+    $normalized = Get-NormalizedPath $ProjectPath
+    $history = Load-History
+    foreach ($h in $history.Values) {
+        if ($h.ProjectPath -and (Get-NormalizedPath $h.ProjectPath) -eq $normalized -and [bool]$h.AutoRestart) {
+            $result.Enabled = $true
+            $result.CommandLine = $h.CommandLine
+            break
+        }
+    }
+    return $result
+}
+
+function Invoke-CrashAutoRestart {
+    # Capped rolling-window retry so a project that's genuinely
+    # crash-looping (bad code, a permanently-taken port, ...) gets a
+    # handful of real tries and then gives up loudly instead of hammering
+    # forever. The window is tracked in $script:AutoRestartAttempts, keyed
+    # by normalized project path - deliberately NOT on the process's own
+    # $entry, since Start-ProjectAtPath replaces that entry outright on
+    # every (re)start, which would silently reset an attempt counter kept
+    # there back to zero after just one successful restart (see that
+    # variable's declaration).
+    param([string]$ProjectPath, [string]$CommandLine, [string]$Label)
+    $key = Get-NormalizedPath $ProjectPath
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$script:AutoRestartWindowMinutes)
+    $attempts = @($script:AutoRestartAttempts[$key] | Where-Object { $_ -gt $cutoff })
+
+    if ($attempts.Count -ge $script:AutoRestartMaxAttempts) {
+        $script:AutoRestartAttempts[$key] = $attempts
+        Write-AppErrorLog -Context "Auto-restart gave up on $Label - $($script:AutoRestartMaxAttempts) attempts in $($script:AutoRestartWindowMinutes) minutes"
+        try {
+            if ([bool]$script:Settings.CrashNotifications) {
+                $notifyIcon.ShowBalloonTip(5000, 'Localhost Manager', "$Label keeps crashing - gave up auto-restarting after $($script:AutoRestartMaxAttempts) tries. Check its log.", [System.Windows.Forms.ToolTipIcon]::Error)
+            }
+        } catch {}
+        return
+    }
+
+    $attempts += (Get-Date).ToUniversalTime()
+    $script:AutoRestartAttempts[$key] = $attempts
+
+    # Brief pause before relaunching - gives a transient port collision
+    # (the other holder still tearing down, e.g. right after a sleep/wake)
+    # a moment to clear instead of racing straight back into it.
+    Start-Sleep -Milliseconds 1500
+
+    if (-not (Start-ProjectAtPath -ProjectPath $ProjectPath -CommandLine $CommandLine)) {
+        Write-AppErrorLog -Context "Auto-restart failed to relaunch $Label (attempt $($attempts.Count) of $($script:AutoRestartMaxAttempts))"
+    } else {
+        $managed = $script:ManagedProcesses[$key]
+        if ($managed) { Add-ManagedLog -Entry $managed -Text "*** auto-restarted (attempt $($attempts.Count) of $($script:AutoRestartMaxAttempts) in $($script:AutoRestartWindowMinutes) min) ***" }
+    }
     Refresh-Grid
 }
 
@@ -4151,6 +4338,630 @@ function Show-AppErrorLogViewer {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+function Show-DeployConfigDialog {
+    # Add/edit the build+deploy recipe attached to one tracked port -
+    # originally written for the Jewelry Store frontend/server split (npm
+    # run build, then robocopy dist/ into the server's public/),
+    # generalized so any project can have one, and any project can mirror
+    # its build output to more than one place (e.g. a server's public/ AND
+    # a staging copy).
+    #
+    # The recipe is *attached to* $ProjectPath (that's what makes it show
+    # up when browsing from that port in Show-DeployManagerDialog / row
+    # detail) but the working folder the build actually runs in is its own
+    # editable field, not assumed to equal $ProjectPath - the frontend/
+    # server split is exactly the case where they differ: the only thing
+    # that's a *tracked port* is the server, but the build has to run over
+    # in the frontend's folder, which isn't a port at all.
+    param([string]$ProjectPath, [string]$Label)
+
+    $existing = $script:DeployDefs[(Get-NormalizedPath $ProjectPath)]
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Configure Deploy - $Label"
+    $dlg.Size = New-Object System.Drawing.Size(540, 560)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $descFont = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+    $labelMaxWidth = 500
+
+    # AutoSize + MaximumSize (width capped, height 0 = unlimited) instead of
+    # a fixed Size box: this is what a fixed one-line-tall box guessed
+    # under Light/Dark's Segoe UI, then silently clipped to nothing once
+    # Terminal's much wider monospace font pushed the same text onto a
+    # second line the box had no room for ("Project folder (where the
+    # build command runs) - not always this port's..." cut off mid-
+    # sentence). Wrapping labels can never clip this way - worst case they
+    # just wrap and every control below cascades down to match, via each
+    # row's real measured height instead of a guessed fixed gap.
+    # Label.Height isn't reliable immediately after construction - AutoSize
+    # only actually recomputes it once the control has been through a real
+    # layout pass, which normally means being added to a parent first, and
+    # none of these labels are parented until the single AddRange call at
+    # the end of this dialog. Reading .Height before that still returns
+    # the single-line default regardless of MaximumSize/wrapping, which is
+    # exactly what let a two-line label like "Project folder (where the
+    # build command runs):" get its value box positioned over its own
+    # second line. Measuring the wrapped text directly (same approach as
+    # the Restart column's width fix - see New-PortsGrid) sidesteps the
+    # timing entirely: it computes the real wrapped height up front,
+    # independent of when/whether the label has been parented yet.
+    function Get-WrappedLabelHeight {
+        param([string]$Text, [System.Drawing.Font]$LabelFont)
+        $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak
+        return [System.Windows.Forms.TextRenderer]::MeasureText($Text, $LabelFont, (New-Object System.Drawing.Size($labelMaxWidth, 0)), $flags).Height
+    }
+
+    function New-DeployFieldRow {
+        param([string]$LabelText, [int]$Y, [string]$Value, [bool]$Browse)
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $LabelText
+        $lbl.AutoSize = $true
+        $lbl.MaximumSize = New-Object System.Drawing.Size($labelMaxWidth, 0)
+        $lbl.Location = New-Object System.Drawing.Point(15, $Y)
+        $lbl.ForeColor = $script:Theme.TextDim
+        $lbl.Font = $descFont
+
+        $boxY = $Y + (Get-WrappedLabelHeight -Text $LabelText -LabelFont $descFont) + 2
+        $box = New-Object System.Windows.Forms.TextBox
+        $box.Text = $Value
+        $box.Location = New-Object System.Drawing.Point(15, $boxY)
+        $box.Size = New-Object System.Drawing.Size(($(if ($Browse) { 405 } else { 495 })), 24)
+        $box.BorderStyle = 'FixedSingle'
+        $box.BackColor = $script:Theme.CardBg
+        $box.ForeColor = $script:Theme.TextPrimary
+
+        $rowResult = @{ Label = $lbl; Box = $box; Browse = $null; Bottom = ($boxY + 24) }
+        if ($Browse) {
+            $browseBtn = New-Object System.Windows.Forms.Button
+            $browseBtn.Text = '...'
+            $browseBtn.Location = New-Object System.Drawing.Point(425, ($boxY - 1))
+            $browseBtn.Size = New-Object System.Drawing.Size(85, 26)
+            $browseBtn.Add_Click({
+                $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+                if ($box.Text) { $fbd.SelectedPath = $box.Text }
+                if ($fbd.ShowDialog() -eq 'OK') { $box.Text = $fbd.SelectedPath }
+            }.GetNewClosure())
+            Initialize-ModernButton -Button $browseBtn
+            $rowResult.Browse = $browseBtn
+        }
+        return $rowResult
+    }
+
+    $defaultWorkingDir = if ($existing.WorkingDir) { $existing.WorkingDir } else { $ProjectPath }
+    $defaultBuild = if ($existing.BuildCommand) { $existing.BuildCommand } else { 'npm run build' }
+    $defaultSource = if ($existing.SourceDir) { $existing.SourceDir } else { Join-Path $defaultWorkingDir 'dist' }
+
+    $y = 12
+    $workDirRow = New-DeployFieldRow -LabelText 'Project folder (where the build command runs):' -Y $y -Value $defaultWorkingDir -Browse $true
+    $y = $workDirRow.Bottom + 16
+
+    $buildRow = New-DeployFieldRow -LabelText 'Build command:' -Y $y -Value $defaultBuild -Browse $false
+    $y = $buildRow.Bottom + 16
+
+    $sourceRow = New-DeployFieldRow -LabelText 'Build output folder (source):' -Y $y -Value $defaultSource -Browse $true
+    $y = $sourceRow.Bottom + 16
+
+    $targetsLbl = New-Object System.Windows.Forms.Label
+    $targetsLbl.Text = 'Deploy target folder(s) - each is mirrored, old files there get deleted:'
+    $targetsLbl.AutoSize = $true
+    $targetsLbl.MaximumSize = New-Object System.Drawing.Size($labelMaxWidth, 0)
+    $targetsLbl.Location = New-Object System.Drawing.Point(15, $y)
+    $targetsLbl.ForeColor = $script:Theme.TextDim
+    $targetsLbl.Font = $descFont
+    $y += (Get-WrappedLabelHeight -Text $targetsLbl.Text -LabelFont $descFont) + 2
+
+    $targetsList = New-Object System.Windows.Forms.ListBox
+    $targetsList.Location = New-Object System.Drawing.Point(15, $y)
+    $targetsList.Size = New-Object System.Drawing.Size(405, 90)
+    $targetsList.BorderStyle = 'FixedSingle'
+    $targetsList.BackColor = $script:Theme.CardBg
+    $targetsList.ForeColor = $script:Theme.TextPrimary
+    foreach ($t in @($existing.TargetDirs)) { if ($t) { [void]$targetsList.Items.Add($t) } }
+
+    $addTargetBtn = New-Object System.Windows.Forms.Button
+    $addTargetBtn.Text = 'Add...'
+    $addTargetBtn.Location = New-Object System.Drawing.Point(425, $y)
+    $addTargetBtn.Size = New-Object System.Drawing.Size(85, 26)
+    $addTargetBtn.Add_Click({
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        if ($fbd.ShowDialog() -eq 'OK' -and $fbd.SelectedPath -notin $targetsList.Items) {
+            [void]$targetsList.Items.Add($fbd.SelectedPath)
+        }
+    }.GetNewClosure())
+    Initialize-ModernButton -Button $addTargetBtn
+
+    $removeTargetBtn = New-Object System.Windows.Forms.Button
+    $removeTargetBtn.Text = 'Remove'
+    $removeTargetBtn.Location = New-Object System.Drawing.Point(425, ($y + 30))
+    $removeTargetBtn.Size = New-Object System.Drawing.Size(85, 26)
+    $removeTargetBtn.Add_Click({
+        if ($targetsList.SelectedIndex -ge 0) { $targetsList.Items.RemoveAt($targetsList.SelectedIndex) }
+    }.GetNewClosure())
+    Initialize-ModernButton -Button $removeTargetBtn
+    $y += $targetsList.Height + 20
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = 'Save'
+    $okButton.Location = New-Object System.Drawing.Point(340, $y)
+    $okButton.Size = New-Object System.Drawing.Size(85, 28)
+    $okButton.Add_Click({ $dlg.Tag = 'OK'; $dlg.Close() })
+    Initialize-ModernButton -Button $okButton -Variant Accent
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Cancel'
+    $cancelButton.Location = New-Object System.Drawing.Point(430, $y)
+    $cancelButton.Size = New-Object System.Drawing.Size(85, 28)
+    $cancelButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $cancelButton
+    $y += 28 + 20
+    $dlg.ClientSize = New-Object System.Drawing.Size($dlg.ClientSize.Width, $y)
+
+    [System.Windows.Forms.Control[]]$controls = @(
+        $workDirRow.Label, $workDirRow.Box, $workDirRow.Browse,
+        $buildRow.Label, $buildRow.Box,
+        $sourceRow.Label, $sourceRow.Box, $sourceRow.Browse,
+        $targetsLbl, $targetsList, $addTargetBtn, $removeTargetBtn,
+        $okButton, $cancelButton
+    )
+    $dlg.Controls.AddRange($controls)
+    $dlg.AcceptButton = $okButton
+    $dlg.ShowDialog($form) | Out-Null
+
+    if ($dlg.Tag -ne 'OK') { return $null }
+    if (-not $workDirRow.Box.Text -or -not $sourceRow.Box.Text -or $targetsList.Items.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('The project folder, the build output folder, and at least one deploy target folder are all required.', 'Missing Folder', 'OK', 'Warning') | Out-Null
+        return $null
+    }
+
+    $config = @{
+        BuildCommand = $buildRow.Box.Text
+        WorkingDir   = $workDirRow.Box.Text
+        SourceDir    = $sourceRow.Box.Text
+        TargetDirs   = @($targetsList.Items)
+    }
+    $script:DeployDefs[(Get-NormalizedPath $ProjectPath)] = $config
+    Save-DeployDefs $script:DeployDefs
+    return $config
+}
+
+function Show-DeployRunDialog {
+    # Runs the build command, then mirrors the output folder into every
+    # configured target via robocopy - the build gates the copies (a && so
+    # a failed build deploys nothing), the targets themselves run
+    # unconditionally one after another (a bare & - if target 2 is
+    # unreachable, target 1 having already succeeded still matters). Same
+    # async Register-ObjectEvent pattern as Start-ProjectAtPath (not a raw
+    # .Add_OutputDataReceived - that fires on a ThreadPool thread and
+    # corrupts this single-threaded runspace) so a slow build never blocks
+    # the window.
+    #
+    # Runs under cmd /k, not /c - the session stays open afterward as a
+    # real interactive shell instead of exiting the moment the scripted
+    # part finishes, and the textbox is editable: typing a line and
+    # pressing Enter sends it to the session's stdin (RedirectStandardInput)
+    # the same way a real terminal would. Since /k means there's no single
+    # "final exit code" to read once and be done (the process only exits
+    # when the user types `exit` or the dialog force-kills it), the
+    # build+deploy result instead comes from a sentinel line
+    # (LHM_DEPLOY_DONE:<code>) echoed right after the scripted commands,
+    # parsed out of the output stream and never shown to the user verbatim.
+    #
+    # -Port is just which port row this recipe is attached to, shown here
+    # so it's never ambiguous which of possibly several similar-looking
+    # projects is actually about to be built - the info panel below the
+    # title also spells out the exact build folder/command and every
+    # copy target, since the port itself doesn't say where the build
+    # actually runs (see Show-DeployConfigDialog: that's a separate,
+    # independently-editable folder).
+    param([string]$ProjectPath, [string]$Label, [string]$Port, [hashtable]$Config)
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = if ($Port) { "Deploy - $Label (port $Port)" } else { "Deploy - $Label" }
+    $dlg.Size = New-Object System.Drawing.Size(720, 520)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimumSize = New-Object System.Drawing.Size(420, 300)
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $infoLbl = New-Object System.Windows.Forms.Label
+    $infoLbl.Dock = 'Top'
+    $infoLbl.Height = 60
+    $infoLbl.TextAlign = 'TopLeft'
+    $infoLbl.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 4)
+    $infoLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+    $infoLbl.ForeColor = $script:Theme.TextDim
+    $infoLbl.BackColor = $script:Theme.WindowBg
+    $portSuffix = if ($Port) { " (port $Port)" } else { '' }
+    $targetsText = (@($Config.TargetDirs) -join '  ;  ')
+    $infoLbl.Text = "Project: $Label$portSuffix`r`nBuild: `"$($Config.BuildCommand)`" in $($Config.WorkingDir)`r`nCopy: $($Config.SourceDir)  ->  $targetsText"
+
+    $statusLbl = New-Object System.Windows.Forms.Label
+    $statusLbl.Dock = 'Top'
+    $statusLbl.Height = 28
+    $statusLbl.TextAlign = 'MiddleLeft'
+    $statusLbl.Padding = New-Object System.Windows.Forms.Padding(10, 0, 0, 0)
+    $statusLbl.Text = 'Starting...'
+    $statusLbl.ForeColor = $script:Theme.TextDim
+    $statusLbl.BackColor = $script:Theme.PanelBg
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Multiline = $true
+    $textBox.ReadOnly = $false
+    $textBox.ScrollBars = 'Vertical'
+    $textBox.WordWrap = $false
+    $textBox.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $textBox.Dock = 'Fill'
+    $textBox.BackColor = [System.Drawing.Color]::Black
+    $textBox.ForeColor = [System.Drawing.Color]::Gainsboro
+
+    $bottomPanel = New-Object System.Windows.Forms.Panel
+    $bottomPanel.Dock = 'Bottom'
+    $bottomPanel.Height = 40
+    $bottomPanel.BackColor = $script:Theme.PanelBg
+
+    $rerunButton = New-Object System.Windows.Forms.Button
+    $rerunButton.Text = 'Run Again'
+    $rerunButton.Location = New-Object System.Drawing.Point(10, 6)
+    $rerunButton.Size = New-Object System.Drawing.Size(100, 28)
+    $rerunButton.Enabled = $false
+    Initialize-ModernButton -Button $rerunButton -Variant Accent
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = 'Close'
+    $closeButton.Anchor = 'Top,Right'
+    $closeButton.Location = New-Object System.Drawing.Point(620, 6)
+    $closeButton.Size = New-Object System.Drawing.Size(80, 28)
+    $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton
+
+    [System.Windows.Forms.Control[]]$bottomControls = @($rerunButton, $closeButton)
+    $bottomPanel.Controls.AddRange($bottomControls)
+    $dlg.Controls.Add($textBox)
+    $dlg.Controls.Add($statusLbl)
+    $dlg.Controls.Add($infoLbl)
+    $dlg.Controls.Add($bottomPanel)
+
+    $currentProc = $null
+
+    # Enter sends whatever's on the current line to the session's stdin -
+    # a minimal terminal, not a full PTY (programs that need a real console,
+    # like interactive setup wizards, won't work over this pipe), but
+    # enough to run ordinary follow-up commands in the same shell/directory
+    # the build just ran in.
+    $textBox.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -ne [System.Windows.Forms.Keys]::Return) { return }
+        $e.SuppressKeyPress = $true
+        if (-not $currentProc -or $currentProc.HasExited) { return }
+        $lineIndex = $textBox.GetLineFromCharIndex($textBox.SelectionStart)
+        $lineText = $textBox.Lines[$lineIndex]
+        try { $currentProc.StandardInput.WriteLine($lineText) } catch {}
+        $textBox.AppendText("`r`n")
+        $textBox.SelectionStart = $textBox.TextLength
+        $textBox.ScrollToCaret()
+    })
+
+    function Start-DeployRun {
+        if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} }
+        $rerunButton.Enabled = $false
+        $textBox.Clear()
+        $statusLbl.Text = 'Running...'
+        $statusLbl.ForeColor = $script:Theme.Accent
+
+        $workDir = if ($Config.WorkingDir) { $Config.WorkingDir } else { $ProjectPath }
+        $buildCmd = if ($Config.BuildCommand) { $Config.BuildCommand } else { 'npm run build' }
+        $targets = @($Config.TargetDirs)
+        $copySteps = ($targets | ForEach-Object { "robocopy `"$($Config.SourceDir)`" `"$_`" /MIR" }) -join ' & '
+        $cmdLine = "cd /d `"$workDir`" && $buildCmd && $copySteps & echo LHM_DEPLOY_DONE:%errorlevel%"
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'cmd.exe'
+        $psi.Arguments = "/k $cmdLine"
+        $psi.WorkingDirectory = $workDir
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        $proc.EnableRaisingEvents = $true
+
+        $subPrefix = "LHMDeploy_$([guid]::NewGuid().ToString('N'))"
+        $eventData = @{ TextBox = $textBox; StatusLbl = $statusLbl; RerunButton = $rerunButton; SubPrefix = $subPrefix; Dlg = $dlg; MultiTarget = ($targets.Count -gt 1) }
+
+        Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -SourceIdentifier "$subPrefix`_out" -MessageData $eventData -Action {
+            if ($null -eq $Event.SourceEventArgs.Data -or $Event.MessageData.Dlg.IsDisposed) { return }
+            $line = $Event.SourceEventArgs.Data
+            if ($line -match '^LHM_DEPLOY_DONE:(\d+)$') {
+                $code = [int]$Matches[1]
+                $suffix = if ($Event.MessageData.MultiTarget) { ' - see output above for per-folder results' } else { '' }
+                if ($code -lt 8) {
+                    $Event.MessageData.StatusLbl.Text = "Deploy done (exit code $code)$suffix - shell still open below"
+                    $Event.MessageData.StatusLbl.ForeColor = $script:Theme.Success
+                } else {
+                    $Event.MessageData.StatusLbl.Text = "Deploy failed (exit code $code)$suffix - shell still open below"
+                    $Event.MessageData.StatusLbl.ForeColor = $script:Theme.Danger
+                }
+                $Event.MessageData.RerunButton.Enabled = $true
+                return
+            }
+            $Event.MessageData.TextBox.AppendText($line + "`r`n")
+        } | Out-Null
+        Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -SourceIdentifier "$subPrefix`_err" -MessageData $eventData -Action {
+            if ($null -ne $Event.SourceEventArgs.Data -and -not $Event.MessageData.Dlg.IsDisposed) {
+                $Event.MessageData.TextBox.AppendText($Event.SourceEventArgs.Data + "`r`n")
+            }
+        } | Out-Null
+        Register-ObjectEvent -InputObject $proc -EventName Exited -SourceIdentifier "$subPrefix`_exit" -MessageData $eventData -Action {
+            $d = $Event.MessageData
+            if (-not $d.Dlg.IsDisposed) {
+                $d.StatusLbl.Text = 'Session closed'
+                $d.StatusLbl.ForeColor = $script:Theme.TextDim
+                $d.RerunButton.Enabled = $true
+            }
+            $p = $d.SubPrefix
+            Unregister-Event -SourceIdentifier "${p}_out" -ErrorAction SilentlyContinue
+            Unregister-Event -SourceIdentifier "${p}_err" -ErrorAction SilentlyContinue
+            Unregister-Event -SourceIdentifier "${p}_exit" -ErrorAction SilentlyContinue
+        } | Out-Null
+
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+        $currentProc = $proc
+    }
+
+    $rerunButton.Add_Click({ Start-DeployRun })
+    $dlg.Add_Shown({ Start-DeployRun })
+    $dlg.Add_FormClosed({ if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} } })
+    $dlg.ShowDialog($form) | Out-Null
+}
+
+function Invoke-DeployForProject {
+    # Entry point for both the row-detail "Deploy..." button and the
+    # Deploy Manager picker. First run for a project prompts for its recipe
+    # (Show-DeployConfigDialog); every run after that reuses the saved one.
+    # -Port is display-only (which port row this recipe is attached to,
+    # for Show-DeployRunDialog's header - it's not itself part of the
+    # recipe, since the actual build folder can be a different one, see
+    # Show-DeployConfigDialog).
+    param([string]$ProjectPath, [string]$Label, [string]$Port)
+    if (-not $ProjectPath) {
+        [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Deploy', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $key = Get-NormalizedPath $ProjectPath
+    $config = $script:DeployDefs[$key]
+    if (-not $config) {
+        $config = Show-DeployConfigDialog -ProjectPath $ProjectPath -Label $Label
+        if (-not $config) { return }
+    }
+    Show-DeployRunDialog -ProjectPath $ProjectPath -Label $Label -Port $Port -Config $config
+}
+
+function Show-DeployManagerDialog {
+    # What the toolbar Deploy button opens: every tracked port (live +
+    # remembered history, ignoring the main window's own Group/root-dir
+    # scoping - this picker filters independently), filterable by group or
+    # by a port range, so a deploy recipe can be attached to any project,
+    # not just ones already configured.
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Build & Deploy'
+    $dlg.Size = New-Object System.Drawing.Size(760, 560)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimumSize = New-Object System.Drawing.Size(560, 360)
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $filterPanel = New-Object System.Windows.Forms.Panel
+    $filterPanel.Dock = 'Top'
+    # Taller than the row of controls strictly needs, on purpose - the
+    # "Selected port" label's top edge got visually clipped when this was
+    # sized tight to the controls, and a fixed exact-fit height is exactly
+    # the kind of guess that keeps breaking under a different font/theme
+    # (Terminal's monospace metrics again). Generous fixed padding here
+    # costs nothing and heads that class of bug off for every row added to
+    # this panel in the future, not just the current ones.
+    $filterPanel.Height = 60
+    $filterPanel.BackColor = $script:Theme.PanelBg
+    # Set before adding the Top,Right-anchored $selectedLbl below, or its
+    # anchor baseline gets computed against the panel's tiny un-docked
+    # default width instead of the dialog's real one, and it ends up
+    # nowhere near the right edge once Dock actually resizes the panel -
+    # same fix already applied to topPanel/BottomBar elsewhere in this file.
+    $filterPanel.Width = $dlg.ClientSize.Width
+
+    # Every X position below is measured against the actual label text at
+    # the dialog's real font, not guessed - a fixed guessed gap (or worse, a
+    # fixed-width Label box) is exactly what produced both spacing bugs
+    # here before this: "Port from:" wrapping inside too narrow a box, then
+    # "Group:"/"Port range:" crowding straight into the control after them
+    # because the guessed gap was too small for how they actually render.
+    $filterFont = $dlg.Font
+    $pad = 12
+    $x = 10
+
+    $groupLbl = New-Object System.Windows.Forms.Label
+    $groupLbl.Text = 'Group:'
+    $groupLbl.AutoSize = $true
+    $groupLbl.Location = New-Object System.Drawing.Point($x, 23)
+    $groupLbl.ForeColor = $script:Theme.TextDim
+    $x += [System.Windows.Forms.TextRenderer]::MeasureText($groupLbl.Text, $filterFont).Width + $pad
+
+    $groupCombo = New-Object System.Windows.Forms.ComboBox
+    $groupCombo.DropDownStyle = 'DropDownList'
+    $groupCombo.Location = New-Object System.Drawing.Point($x, 18)
+    $groupCombo.Size = New-Object System.Drawing.Size(160, 24)
+    [void]$groupCombo.Items.Add('All Groups')
+    foreach ($gName in ($script:Groups.Keys | Sort-Object)) { [void]$groupCombo.Items.Add($gName) }
+    $groupCombo.SelectedIndex = 0
+    $x += $groupCombo.Width + ($pad * 2)
+
+    $rangeLbl = New-Object System.Windows.Forms.Label
+    $rangeLbl.Text = 'Port range:'
+    $rangeLbl.AutoSize = $true
+    $rangeLbl.Location = New-Object System.Drawing.Point($x, 23)
+    $rangeLbl.ForeColor = $script:Theme.TextDim
+    $x += [System.Windows.Forms.TextRenderer]::MeasureText($rangeLbl.Text, $filterFont).Width + $pad
+
+    $portMinBox = New-Object System.Windows.Forms.TextBox
+    $portMinBox.Location = New-Object System.Drawing.Point($x, 18)
+    $portMinBox.Size = New-Object System.Drawing.Size(60, 24)
+    $portMinBox.BorderStyle = 'FixedSingle'
+    $portMinBox.BackColor = $script:Theme.CardBg
+    $portMinBox.ForeColor = $script:Theme.TextPrimary
+    $x += $portMinBox.Width + $pad
+
+    $dashLbl = New-Object System.Windows.Forms.Label
+    $dashLbl.Text = '-'
+    $dashLbl.AutoSize = $true
+    $dashLbl.Location = New-Object System.Drawing.Point($x, 23)
+    $dashLbl.ForeColor = $script:Theme.TextDim
+    $x += [System.Windows.Forms.TextRenderer]::MeasureText($dashLbl.Text, $filterFont).Width + $pad
+
+    $portMaxBox = New-Object System.Windows.Forms.TextBox
+    $portMaxBox.Location = New-Object System.Drawing.Point($x, 18)
+    $portMaxBox.Size = New-Object System.Drawing.Size(60, 24)
+    $portMaxBox.BorderStyle = 'FixedSingle'
+    $portMaxBox.BackColor = $script:Theme.CardBg
+    $portMaxBox.ForeColor = $script:Theme.TextPrimary
+
+    $selectedLbl = New-Object System.Windows.Forms.Label
+    $selectedLbl.Text = 'Selected port: -'
+    $selectedLbl.AutoSize = $true
+    $selectedLbl.Anchor = 'Top,Right'
+    $selectedLbl.ForeColor = $script:Theme.Accent
+    $selectedLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
+    # X is a placeholder - AutoSize plus the Top,Right anchor repositions
+    # it against the dialog's real width the moment it's parented/shown,
+    # same fix as the rest of this row: never trust a guessed X for text
+    # whose rendered width depends on the active theme's font. Pulled left
+    # of the panel's true right edge (rather than flush against it) so it
+    # doesn't crowd the window's edge/border.
+    $selectedLbl.Location = New-Object System.Drawing.Point(520, 23)
+
+    [System.Windows.Forms.Control[]]$filterControls = @($groupLbl, $groupCombo, $rangeLbl, $portMinBox, $dashLbl, $portMaxBox, $selectedLbl)
+    $filterPanel.Controls.AddRange($filterControls)
+
+    $list = New-Object System.Windows.Forms.ListView
+    $list.View = 'Details'
+    $list.FullRowSelect = $true
+    $list.GridLines = $true
+    $list.MultiSelect = $false
+    $list.Dock = 'Fill'
+    $list.BackColor = $script:Theme.CardBg
+    $list.ForeColor = $script:Theme.TextPrimary
+    [void]$list.Columns.Add('Port', 70)
+    [void]$list.Columns.Add('Name', 130)
+    [void]$list.Columns.Add('Status', 60)
+    [void]$list.Columns.Add('Process', 80)
+    [void]$list.Columns.Add('Deploy', 60)
+    [void]$list.Columns.Add('Project Path', 260)
+
+    function Update-DeployManagerList {
+        $list.Items.Clear()
+        $selectedGroup = [string]$groupCombo.SelectedItem
+        $groupPaths = if ($selectedGroup -and $selectedGroup -ne 'All Groups' -and $script:Groups.ContainsKey($selectedGroup)) {
+            [System.Collections.Generic.HashSet[string]]::new([string[]]@($script:Groups[$selectedGroup] | ForEach-Object { Get-NormalizedPath $_ }))
+        } else { $null }
+        $minPort = 0; [void][int]::TryParse($portMinBox.Text, [ref]$minPort)
+        $maxPort = [int]::MaxValue
+        if ($portMaxBox.Text) { [void][int]::TryParse($portMaxBox.Text, [ref]$maxPort); if ($maxPort -eq 0) { $maxPort = [int]::MaxValue } }
+
+        $rows = @(Build-Rows -OnlyNode $false -RootDir '') | Where-Object { $_.ProjectPath }
+        foreach ($r in $rows) {
+            $portNum = 0; [void][int]::TryParse([string]$r.Port, [ref]$portNum)
+            if ($portNum -lt $minPort -or $portNum -gt $maxPort) { continue }
+            if ($groupPaths -and -not $groupPaths.Contains((Get-NormalizedPath $r.ProjectPath))) { continue }
+
+            $displayName = if ($r.CustomName) { $r.CustomName } else { Split-Path -Leaf $r.ProjectPath }
+            $hasDeploy = if ($script:DeployDefs.ContainsKey((Get-NormalizedPath $r.ProjectPath))) { 'Yes' } else { 'No' }
+
+            $item = New-Object System.Windows.Forms.ListViewItem([string]$r.Port)
+            [void]$item.SubItems.Add($displayName)
+            [void]$item.SubItems.Add([string]$r.Status)
+            [void]$item.SubItems.Add([string]$r.ProcessName)
+            [void]$item.SubItems.Add($hasDeploy)
+            [void]$item.SubItems.Add([string]$r.ProjectPath)
+            $item.Tag = @{ ProjectPath = $r.ProjectPath; Label = $displayName; Port = [string]$r.Port }
+            [void]$list.Items.Add($item)
+        }
+    }
+
+    $groupCombo.Add_SelectedIndexChanged({ Update-DeployManagerList })
+    $portMinBox.Add_TextChanged({ Update-DeployManagerList })
+    $portMaxBox.Add_TextChanged({ Update-DeployManagerList })
+    $list.Add_SelectedIndexChanged({
+        $selectedLbl.Text = if ($list.SelectedItems.Count -gt 0) { "Selected port: $($list.SelectedItems[0].Tag.Port)" } else { 'Selected port: -' }
+    })
+
+    $bottomPanel = New-Object System.Windows.Forms.Panel
+    $bottomPanel.Dock = 'Bottom'
+    $bottomPanel.Height = 40
+    $bottomPanel.BackColor = $script:Theme.PanelBg
+
+    $deployBtn = New-Object System.Windows.Forms.Button
+    $deployBtn.Text = 'Deploy'
+    $deployBtn.Location = New-Object System.Drawing.Point(10, 6)
+    $deployBtn.Size = New-Object System.Drawing.Size(90, 28)
+    $deployBtn.Add_Click({
+        # Deliberately no .GetNewClosure() here (or on Configure below) -
+        # this button is created once, not inside a loop, so it doesn't
+        # need a snapshotted copy of $list; it needs the LIVE enclosing
+        # scope, the same as $rerunButton.Add_Click({ Start-DeployRun }) in
+        # Show-DeployRunDialog. GetNewClosure() creates an isolated scope
+        # that only carries variables, not nested `function`s defined in
+        # the enclosing scope - Configure's click handler used to call
+        # Update-DeployManagerList (a nested function, right below) and
+        # threw "term not recognized" because of exactly this.
+        if ($list.SelectedItems.Count -eq 0) { return }
+        $sel = $list.SelectedItems[0].Tag
+        Invoke-DeployForProject -ProjectPath $sel.ProjectPath -Label $sel.Label -Port $sel.Port
+    })
+    Initialize-ModernButton -Button $deployBtn -Variant Accent
+
+    $configureBtn = New-Object System.Windows.Forms.Button
+    $configureBtn.Text = 'Configure...'
+    $configureBtn.Location = New-Object System.Drawing.Point(108, 6)
+    $configureBtn.Size = New-Object System.Drawing.Size(100, 28)
+    $configureBtn.Add_Click({
+        if ($list.SelectedItems.Count -eq 0) { return }
+        $sel = $list.SelectedItems[0].Tag
+        Show-DeployConfigDialog -ProjectPath $sel.ProjectPath -Label $sel.Label | Out-Null
+        Update-DeployManagerList
+    })
+    Initialize-ModernButton -Button $configureBtn
+
+    $closeBtn = New-Object System.Windows.Forms.Button
+    $closeBtn.Text = 'Close'
+    $closeBtn.Anchor = 'Top,Right'
+    $closeBtn.Location = New-Object System.Drawing.Point(660, 6)
+    $closeBtn.Size = New-Object System.Drawing.Size(80, 28)
+    $closeBtn.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeBtn
+
+    [System.Windows.Forms.Control[]]$bottomControls = @($deployBtn, $configureBtn, $closeBtn)
+    $bottomPanel.Controls.AddRange($bottomControls)
+
+    $dlg.Controls.Add($list)
+    $dlg.Controls.Add($filterPanel)
+    $dlg.Controls.Add($bottomPanel)
+
+    Update-DeployManagerList
+    $dlg.ShowDialog($form) | Out-Null
+}
+
 function Show-RowDetail {
     # Sticky-note style: compact, appears right at the click point, and
     # nothing in the body is a clickable/editable control except the copy
@@ -4168,6 +4979,16 @@ function Show-RowDetail {
         @{ Label = 'Port';        Value = [string]$Data.Port;        IsVirtual = $false }
         @{ Label = 'Pinned';      Value = if ($Data.Pinned) { 'Yes' } else { 'No' }; IsVirtual = $false }
         @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
+    )
+
+    # Auto-restart only makes sense for a real project (Start-ProjectAtPath
+    # needs a ProjectPath to relaunch) - System-tab rows and bare unresolved
+    # ports never get this row.
+    if ($Data.ProjectPath) {
+        $fields += @{ Label = 'Auto-Restart'; Value = [bool]$Data.AutoRestart; IsVirtual = $false }
+    }
+
+    $fields += @(
         @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
         @{ Label = 'PID';         Value = [string]$Data.ProcId;      IsVirtual = $false }
         @{ Label = 'CPU';         Value = if ($null -ne $Data.Cpu) { "$($Data.Cpu)%" } else { '' }; IsVirtual = $false }
@@ -4229,6 +5050,30 @@ function Show-RowDetail {
         $rowPanel.Location = New-Object System.Drawing.Point(0, $rowY)
         $rowPanel.Size = New-Object System.Drawing.Size($dlgWidth, $rowHeight)
         $rowPanel.BackColor = if ($f.IsVirtual) { $purpleBg } else { $script:Theme.WindowBg }
+
+        # Auto-Restart is the one live, clickable control in an otherwise
+        # read-only sticky-note popup - a real CheckBox instead of the
+        # usual label/value/copy-button triple, wired straight to
+        # Invoke-ToggleAutoRestart (same history.json-backed toggle Pin
+        # uses). Checked is set before the event is wired so the initial
+        # render doesn't fire a spurious toggle.
+        if ($f.Label -eq 'Auto-Restart') {
+            $chk = New-Object System.Windows.Forms.CheckBox
+            $chk.Text = 'Restart automatically if this crashes'
+            $chk.AutoSize = $false
+            $chk.Location = New-Object System.Drawing.Point(10, 5)
+            $chk.Size = New-Object System.Drawing.Size(($dlgWidth - 20), 20)
+            $chk.ForeColor = $script:Theme.TextPrimary
+            $chk.BackColor = [System.Drawing.Color]::Transparent
+            $chk.Checked = [bool]$f.Value
+            $capturedData = $Data
+            $chk.Add_CheckedChanged({ Invoke-ToggleAutoRestart $capturedData }.GetNewClosure())
+            $rowPanel.Controls.Add($chk)
+            $rowPanels += $rowPanel
+            [void]$allValuesText.AppendLine("Auto-Restart: $(if ($f.Value) { 'Yes' } else { 'No' })")
+            $rowY += $rowHeight
+            continue
+        }
 
         $lbl = New-Object System.Windows.Forms.Label
         $lbl.Text = "$($f.Label):"
@@ -4294,6 +5139,36 @@ function Show-RowDetail {
     Initialize-ModernButton -Button $copyAllButton
 
     [System.Windows.Forms.Control[]]$bottomControls = @($copyAllButton)
+    if ($Data.ProjectPath) {
+        $capturedPath = $Data.ProjectPath
+        $capturedLabel = $label
+        $capturedPort = [string]$Data.Port
+
+        $deployRunButton = New-Object System.Windows.Forms.Button
+        $deployRunButton.Text = 'Deploy...'
+        $deployRunButton.Location = New-Object System.Drawing.Point(94, 3)
+        $deployRunButton.Size = New-Object System.Drawing.Size(90, 26)
+        $deployRunButton.Add_Click({ Invoke-DeployForProject -ProjectPath $capturedPath -Label $capturedLabel -Port $capturedPort }.GetNewClosure())
+        Initialize-ModernButton -Button $deployRunButton -Variant Accent
+        $bottomControls += $deployRunButton
+
+        # "Edit Deploy..." only makes sense once there's an existing
+        # recipe to edit - Invoke-DeployForProject (the plain "Deploy..."
+        # button above) already prompts for one via Show-DeployConfigDialog
+        # the first time there isn't one, then runs it. Before that first
+        # save, both buttons opened the exact same dialog with no way to
+        # tell them apart - showing only one button until then removes the
+        # apparent duplication instead of just explaining it away.
+        if ($script:DeployDefs.ContainsKey((Get-NormalizedPath $capturedPath))) {
+            $deployEditButton = New-Object System.Windows.Forms.Button
+            $deployEditButton.Text = 'Edit Deploy...'
+            $deployEditButton.Location = New-Object System.Drawing.Point(192, 3)
+            $deployEditButton.Size = New-Object System.Drawing.Size(110, 26)
+            $deployEditButton.Add_Click({ Show-DeployConfigDialog -ProjectPath $capturedPath -Label $capturedLabel | Out-Null }.GetNewClosure())
+            Initialize-ModernButton -Button $deployEditButton
+            $bottomControls += $deployEditButton
+        }
+    }
     $bottomPanel.Controls.AddRange($bottomControls)
     $dlg.Controls.Add($bottomPanel)
 

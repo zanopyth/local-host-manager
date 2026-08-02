@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.17.1] - 2026-08-02
+
+### Fixed
+- Configure Deploy dialog: a value box could overlap its own label's
+  second line (e.g. "Project folder (where the build command runs):").
+  The row layout read a label's `.Height` immediately after creating
+  it, before it had ever been added to the dialog - AutoSize doesn't
+  actually recompute a wrapped label's height until it's been through
+  a real layout pass, so that read was always the single-line default
+  regardless of whether the text actually wrapped. Now measured
+  directly (TextRenderer.MeasureText with word-wrap), the same
+  approach already used for the Restart column's width.
+- Row Detail popup: "Deploy..." and "Edit Deploy..." looked like they
+  did the same thing for any project without a saved recipe yet -
+  because they did: Deploy... opens the exact same configure dialog on
+  a first run before it can deploy anything. "Edit Deploy..." now only
+  appears once a recipe actually exists to edit.
+
+## [1.17.0] - 2026-08-01
+
+### Added
+- Auto-restart on crash: a new "Restart automatically if this crashes"
+  checkbox in the row's Detail popup (right-click a row) tells
+  Localhost Manager to relaunch that project on its own the next time it
+  exits unexpectedly, instead of just sitting there marked CRASHED until
+  someone manually clicks Restart. Backed by the same history.json
+  record Pin already uses (a new `AutoRestart` field alongside
+  `Pinned`), and capped at 5 attempts within a rolling 5-minute window
+  so a genuinely broken project (bad code, a permanently-taken port)
+  gets a handful of real tries and then gives up loudly - a balloon
+  notification and an Error & Crash Log entry - instead of hammering
+  forever.
+
 ## [1.16.0] - 2026-07-29
 
 ### Added
