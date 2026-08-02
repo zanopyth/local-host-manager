@@ -44,11 +44,19 @@ Invoke-PS2EXE `
   -iconFile "LocalhostManager.ico" `
   -title "Localhost Manager" `
   -product "Localhost Manager" `
-  -version "1.7.0.0"
+  -x64 `
+  -version "1.17.4.0"
 ```
 
 `-noConsole` is important — without it, every launch pops a visible
 PowerShell console window behind the GUI.
+
+`-x64` is required, not optional: the app reads a target process's PEB
+directly (`Get-ProcessWorkingDirectory`) to recover its working directory,
+and a 32-bit build cannot read the memory of 64-bit processes like
+`node.exe`. Without it, every Node/npm dev server silently fails
+working-directory detection and gets filtered out by the "Node/npm
+projects only" checkbox.
 
 ## Option 3 — Run the .ps1 directly (no compile)
 
