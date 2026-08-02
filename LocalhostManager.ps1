@@ -1945,7 +1945,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.17.4'
+$script:AppVersion = '1.18.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -3552,6 +3552,21 @@ function Get-NpmRunScript {
     return 'start'
 }
 
+function Test-HasShellChainingChars {
+    # Guards every place a string that didn't come from this app's own
+    # fixed choices (npm run <script>, a hardcoded flag, ...) gets
+    # concatenated into a cmd.exe command line - captured process command
+    # lines and Build & Deploy recipe fields both flow in from JSON files
+    # (history.json/deploydefs.json) that a crafted/tampered backup import
+    # can plant values into. Blocks the actual command-chaining operators
+    # (&, |) and embedded newlines rather than quotes, since a real
+    # captured Windows command line legitimately contains quoted paths -
+    # blocking those would break the normal replay case, not just attacks.
+    param([string]$Value)
+    if (-not $Value) { return $false }
+    return [bool]($Value -match '[&|]|\r|\n')
+}
+
 function Start-ProjectAtPath {
     # Node projects always go through npm run <script> - unchanged, and
     # still the most predictable option when a package.json is present.
@@ -3574,6 +3589,10 @@ function Start-ProjectAtPath {
             "npm run $(Get-NpmRunScript -ProjectPath $ProjectPath)"
         } else {
             $CommandLine
+        }
+        if ((Test-HasShellChainingChars $runCommand) -or (Test-HasShellChainingChars $ProjectPath)) {
+            Write-AppErrorLog -Context "Refused to start project: command/path contains shell chaining characters ($ProjectPath)" -Level Warning
+            return $false
         }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -4698,6 +4717,22 @@ function Show-DeployRunDialog {
         $workDir = if ($Config.WorkingDir) { $Config.WorkingDir } else { $ProjectPath }
         $buildCmd = if ($Config.BuildCommand) { $Config.BuildCommand } else { 'npm run build' }
         $targets = @($Config.TargetDirs)
+
+        # Recipe fields are free-typed and stored in deploydefs.json, which
+        # (like history.json's CommandLine) a tampered/shared backup import
+        # could plant a value into - refuse to build a command line out of
+        # anything containing shell chaining operators rather than trusting
+        # every field is always benign.
+        $unsafeValues = @($workDir, $buildCmd, $Config.SourceDir) + $targets
+        if ($unsafeValues | Where-Object { Test-HasShellChainingChars $_ }) {
+            $statusLbl.Text = 'Refused to run: recipe contains shell chaining characters (& or |) - check C-Deploy.'
+            $statusLbl.ForeColor = $script:Theme.Danger
+            $rerunButton.Enabled = $true
+            $stopButton.Enabled = $false
+            Write-AppErrorLog -Context "Refused to run deploy for $ProjectPath - recipe contains shell chaining characters" -Level Warning
+            return
+        }
+
         $copySteps = ($targets | ForEach-Object { "robocopy `"$($Config.SourceDir)`" `"$_`" /MIR" }) -join ' & '
         $cmdLine = "cd /d `"$workDir`" && $buildCmd && $copySteps & echo LHM_DEPLOY_DONE:%errorlevel%"
 
@@ -6653,49 +6688,94 @@ function Publish-DashboardRows {
     $script:DashboardCache.RowsJson = ConvertTo-Json -InputObject $dashRows -Depth 6
 }
 
+function Get-DashboardKnownHistoryEntry {
+    # The dashboard has no login - anyone who can POST to it could otherwise
+    # name an arbitrary ProjectPath/CommandLine and have Start-ProjectAtPath
+    # run it verbatim. Never trust those two fields off the wire: look the
+    # path up against history.json (what this app actually knows about) and
+    # always re-derive CommandLine from that record, ignoring whatever the
+    # request body claims it is.
+    param([string]$ProjectPath)
+    if (-not $ProjectPath) { return $null }
+    $key = Get-NormalizedPath $ProjectPath
+    foreach ($entry in (Load-History).Values) {
+        if ((Get-NormalizedPath ([string]$entry.ProjectPath)) -eq $key) { return $entry }
+    }
+    return $null
+}
+
+function Test-DashboardKnownListener {
+    # Same idea for Stop: without this, Stop-ProjectById's own safety-net
+    # falls back to Stop-Process -Id <whatever PID the caller named> -Force
+    # for any PID that doesn't match a process this app itself launched -
+    # letting an unauthenticated caller kill an arbitrary process on the
+    # machine. Require the PID to actually be the one this app's own scan
+    # currently has recorded as listening for that project.
+    param([string]$ProjectPath, [int]$ProcId)
+    if (-not $ProjectPath -or -not $ProcId) { return $false }
+    $key = Get-NormalizedPath $ProjectPath
+    foreach ($l in (Get-LiveListeners).Values) {
+        if ([int]$l.ProcId -eq $ProcId -and (Get-NormalizedPath ([string]$l.ProjectPath)) -eq $key) { return $true }
+    }
+    return $false
+}
+
 function Invoke-DashboardAction {
     param($Action)
     $result = @{ Ok = $false; Message = '' }
     try {
         switch ($Action.Type) {
             'stop' {
-                if (Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath) {
+                if (-not (Test-DashboardKnownListener -ProjectPath $Action.ProjectPath -ProcId $Action.ProcId)) {
+                    $result.Message = 'Unknown process - refusing to stop.'
+                } elseif (Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath) {
                     $result.Ok = $true; $result.Message = 'Stopped.'
                 } else {
                     $result.Message = 'Could not stop process.'
                 }
             }
             'start' {
-                if (-not $Action.ProjectPath) {
-                    $result.Message = 'No known project path for this port.'
-                } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine $Action.CommandLine) {
+                $known = Get-DashboardKnownHistoryEntry -ProjectPath $Action.ProjectPath
+                if (-not $known) {
+                    $result.Message = 'Unknown project - refusing to start.'
+                } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine ([string]$known.CommandLine)) {
                     $result.Ok = $true; $result.Message = 'Started.'
                 } else {
                     $result.Message = 'Could not start project.'
                 }
             }
             'restart' {
-                if (-not $Action.ProjectPath) {
-                    $result.Message = 'No known project path for this port.'
+                $known = Get-DashboardKnownHistoryEntry -ProjectPath $Action.ProjectPath
+                if (-not $known) {
+                    $result.Message = 'Unknown project - refusing to restart.'
                 } else {
                     $ok = $true
                     if ($Action.Status -eq 'ON') {
-                        $ok = Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath
-                        if ($ok) { Start-Sleep -Milliseconds 800 }
+                        if (-not (Test-DashboardKnownListener -ProjectPath $Action.ProjectPath -ProcId $Action.ProcId)) {
+                            $ok = $false
+                            $result.Message = 'Unknown process - refusing to restart.'
+                        } else {
+                            $ok = Stop-ProjectById -ProcId $Action.ProcId -ProjectPath $Action.ProjectPath
+                            if (-not $ok) { $result.Message = 'Could not stop process.' }
+                            if ($ok) { Start-Sleep -Milliseconds 800 }
+                        }
                     }
-                    if (-not $ok) {
-                        $result.Message = 'Could not stop process.'
-                    } elseif (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine $Action.CommandLine) {
-                        $result.Ok = $true; $result.Message = 'Restarted.'
-                    } else {
-                        $result.Message = 'Could not start project.'
+                    if ($ok) {
+                        if (Start-ProjectAtPath -ProjectPath $Action.ProjectPath -CommandLine ([string]$known.CommandLine)) {
+                            $result.Ok = $true; $result.Message = 'Restarted.'
+                        } else {
+                            $result.Message = 'Could not start project.'
+                        }
                     }
                 }
             }
             default { $result.Message = 'Unknown action.' }
         }
     } catch {
-        $result.Message = $_.Exception.Message
+        # Never echo raw exception text back to an unauthenticated caller -
+        # log the real detail server-side, return a generic message.
+        Write-AppErrorLog -Context 'Dashboard action failed' -Exception $_.Exception
+        $result.Message = 'Action failed - see the app for details.'
     }
     Refresh-Grid
     return $result
@@ -6890,8 +6970,107 @@ setInterval(refresh, 1500);
     return $html.Replace('__NETSH_CMD__', $netshCmd).Replace('__FAVICON_DATA_URI__', $faviconDataUri)
 }
 
+# One HTTP request per PowerShell instance, run against a pooled runspace -
+# same fix, same reason, as the Local Domains proxy (see
+# ProxyHandleRequestScript above): a plain accept-process-accept loop meant
+# one client's Stop/Start/Restart click - which can legitimately block for
+# up to 8s waiting on the UI thread to drain the action queue - froze the
+# whole dashboard for every other visitor, including that same page's own
+# 1.5s auto-refresh poll, until the click finished.
+$script:DashboardHandleRequestScript = {
+    param($Context, $Cache, $Html)
+
+    $req = $Context.Request
+    $res = $Context.Response
+    try {
+        $path = $req.Url.AbsolutePath
+        if ($req.HttpMethod -eq 'GET' -and $path -eq '/') {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
+            $res.ContentType = 'text/html; charset=utf-8'
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/rows') {
+            $json = $Cache.RowsJson
+            if (-not $json) { $json = '[]' }
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $res.ContentType = 'application/json; charset=utf-8'
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/meta') {
+            $meta = ConvertTo-Json -InputObject @{ Addresses = $Cache.Addresses; Port = $Cache.Port; BoundWildcard = $Cache.BoundWildcard } -Depth 4
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($meta)
+            $res.ContentType = 'application/json; charset=utf-8'
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        elseif ($req.HttpMethod -eq 'POST' -and ($path -eq '/api/stop' -or $path -eq '/api/restart' -or $path -eq '/api/start')) {
+            $enc = if ($req.ContentEncoding) { $req.ContentEncoding } else { [System.Text.Encoding]::UTF8 }
+            $reader = New-Object System.IO.StreamReader($req.InputStream, $enc)
+            $bodyText = $reader.ReadToEnd()
+            $reader.Close()
+            $body = $null
+            $bodyParseFailed = $false
+            try { $body = $bodyText | ConvertFrom-Json } catch { $bodyParseFailed = $true }
+
+            if ($bodyParseFailed) {
+                $res.StatusCode = 400
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes('Malformed JSON body')
+                $res.ContentLength64 = $bytes.Length
+                $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                return
+            }
+
+            $type = 'start'
+            if ($path -eq '/api/stop') { $type = 'stop' } elseif ($path -eq '/api/restart') { $type = 'restart' }
+            $id = [guid]::NewGuid().ToString()
+            $procId = 0
+            try { if ($body.ProcId) { $procId = [int]$body.ProcId } } catch {}
+            $action = @{
+                Id          = $id
+                Type        = $type
+                ProcId      = $procId
+                ProjectPath = [string]$body.ProjectPath
+                Status      = [string]$body.Status
+                CommandLine = [string]$body.CommandLine
+            }
+            $Cache.Actions.Enqueue($action)
+
+            $waited = 0
+            $result = $null
+            while ($waited -lt 8000) {
+                if ($Cache.Results.ContainsKey($id)) {
+                    $result = $Cache.Results[$id]
+                    [void]$Cache.Results.Remove($id)
+                    break
+                }
+                Start-Sleep -Milliseconds 150
+                $waited += 150
+            }
+            if (-not $result) { $result = @{ Ok = $false; Message = 'Timed out waiting for the app to process the action.' } }
+
+            $json = ConvertTo-Json -InputObject $result -Depth 3
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $res.ContentType = 'application/json; charset=utf-8'
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+        else {
+            $res.StatusCode = 404
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes('Not found')
+            $res.ContentLength64 = $bytes.Length
+            $res.OutputStream.Write($bytes, 0, $bytes.Length)
+        }
+    } catch {
+        try { $res.StatusCode = 500 } catch {}
+    } finally {
+        try { $res.OutputStream.Close() } catch {}
+    }
+}
+
 $script:DashboardListenScript = {
-    param($Cache, $Html)
+    param($Cache, $Html, $HandleRequestScript)
 
     $listener = New-Object System.Net.HttpListener
     $boundOk = $false
@@ -6917,12 +7096,32 @@ $script:DashboardListenScript = {
     $Cache.Listening = $boundOk
     if (-not $boundOk) { return }
 
+    $pool = [runspacefactory]::CreateRunspacePool(1, 8)
+    $pool.Open()
+    # Same in-flight bookkeeping as ProxyListenScript - each entry is one
+    # accepted connection currently being handled on the pool, reaped
+    # (Disposed) once its BeginInvoke completes.
+    $inFlight = New-Object System.Collections.Generic.List[object]
+
     while (-not $Cache.StopRequested) {
+        for ($i = $inFlight.Count - 1; $i -ge 0; $i--) {
+            if ($inFlight[$i].Handle.IsCompleted) {
+                try { $inFlight[$i].Shell.EndInvoke($inFlight[$i].Handle) } catch {}
+                try { $inFlight[$i].Shell.Dispose() } catch {}
+                $inFlight.RemoveAt($i)
+            }
+        }
+
         $context = $null
         try {
             $asyncResult = $listener.BeginGetContext($null, $null)
             while (-not $asyncResult.AsyncWaitHandle.WaitOne(500)) {
-                if ($Cache.StopRequested) { try { $listener.Stop() } catch {}; return }
+                if ($Cache.StopRequested) {
+                    try { $listener.Stop() } catch {}
+                    foreach ($inf in $inFlight) { try { $inf.Shell.Dispose() } catch {} }
+                    try { $pool.Close() } catch {}
+                    return
+                }
             }
             $context = $listener.EndGetContext($asyncResult)
         } catch {
@@ -6931,83 +7130,14 @@ $script:DashboardListenScript = {
         }
         if (-not $context) { continue }
 
-        $req = $context.Request
-        $res = $context.Response
-        try {
-            $path = $req.Url.AbsolutePath
-            if ($req.HttpMethod -eq 'GET' -and $path -eq '/') {
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
-                $res.ContentType = 'text/html; charset=utf-8'
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-            elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/rows') {
-                $json = $Cache.RowsJson
-                if (-not $json) { $json = '[]' }
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-                $res.ContentType = 'application/json; charset=utf-8'
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-            elseif ($req.HttpMethod -eq 'GET' -and $path -eq '/api/meta') {
-                $meta = ConvertTo-Json -InputObject @{ Addresses = $Cache.Addresses; Port = $Cache.Port; BoundWildcard = $Cache.BoundWildcard } -Depth 4
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($meta)
-                $res.ContentType = 'application/json; charset=utf-8'
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-            elseif ($req.HttpMethod -eq 'POST' -and ($path -eq '/api/stop' -or $path -eq '/api/restart' -or $path -eq '/api/start')) {
-                $enc = if ($req.ContentEncoding) { $req.ContentEncoding } else { [System.Text.Encoding]::UTF8 }
-                $reader = New-Object System.IO.StreamReader($req.InputStream, $enc)
-                $bodyText = $reader.ReadToEnd()
-                $reader.Close()
-                $body = $null
-                try { $body = $bodyText | ConvertFrom-Json } catch {}
-
-                $type = 'start'
-                if ($path -eq '/api/stop') { $type = 'stop' } elseif ($path -eq '/api/restart') { $type = 'restart' }
-                $id = [guid]::NewGuid().ToString()
-                $action = @{
-                    Id          = $id
-                    Type        = $type
-                    ProcId      = if ($body.ProcId) { [int]$body.ProcId } else { 0 }
-                    ProjectPath = [string]$body.ProjectPath
-                    Status      = [string]$body.Status
-                    CommandLine = [string]$body.CommandLine
-                }
-                $Cache.Actions.Enqueue($action)
-
-                $waited = 0
-                $result = $null
-                while ($waited -lt 8000) {
-                    if ($Cache.Results.ContainsKey($id)) {
-                        $result = $Cache.Results[$id]
-                        [void]$Cache.Results.Remove($id)
-                        break
-                    }
-                    Start-Sleep -Milliseconds 150
-                    $waited += 150
-                }
-                if (-not $result) { $result = @{ Ok = $false; Message = 'Timed out waiting for the app to process the action.' } }
-
-                $json = ConvertTo-Json -InputObject $result -Depth 3
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-                $res.ContentType = 'application/json; charset=utf-8'
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-            else {
-                $res.StatusCode = 404
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes('Not found')
-                $res.ContentLength64 = $bytes.Length
-                $res.OutputStream.Write($bytes, 0, $bytes.Length)
-            }
-        } catch {
-            try { $res.StatusCode = 500 } catch {}
-        } finally {
-            try { $res.OutputStream.Close() } catch {}
-        }
+        $sh = [powershell]::Create()
+        $sh.RunspacePool = $pool
+        [void]$sh.AddScript($HandleRequestScript).AddArgument($context).AddArgument($Cache).AddArgument($Html)
+        $handle = $sh.BeginInvoke()
+        $inFlight.Add(@{ Shell = $sh; Handle = $handle })
     }
+    foreach ($inf in $inFlight) { try { $inf.Shell.Dispose() } catch {} }
+    try { $pool.Close() } catch {}
     try { $listener.Stop() } catch {}
     try { $listener.Close() } catch {}
 }
@@ -7032,7 +7162,8 @@ function Start-WebDashboard {
     $script:DashboardShell.Runspace = $script:DashboardRunspace
     [void]$script:DashboardShell.AddScript($script:DashboardListenScript).
         AddArgument($script:DashboardCache).
-        AddArgument($html)
+        AddArgument($html).
+        AddArgument($script:DashboardHandleRequestScript)
     $script:DashboardHandle = $script:DashboardShell.BeginInvoke()
 }
 

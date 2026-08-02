@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.0] - 2026-08-02
+
+### Security
+- **Web dashboard `/api/start`/`/api/restart` accepted an arbitrary
+  `ProjectPath`/`CommandLine` straight from the POST body with no
+  validation.** Since the dashboard has no login, anyone who could reach
+  the port could run any command on the host (`cmd.exe /c cd /d
+  "<any path>" && <any command>`), not just control already-tracked
+  projects. Both actions now look `ProjectPath` up against `history.json`
+  first and always re-derive `CommandLine` from that record - the request
+  body's own `CommandLine` is never trusted or used.
+- **`/api/stop` accepted an arbitrary `ProcId` with no validation**,
+  falling through to an unconditional `Stop-Process -Force` on it when it
+  didn't match a process this app itself launched - an unauthenticated
+  caller could kill any process on the machine by PID. Stop/restart now
+  require the PID to match what this app's own scan currently has
+  recorded as listening for that project.
+- The dashboard's action-error responses no longer echo the raw
+  `.Exception.Message` back to the (unauthenticated) caller; the detail
+  is logged server-side instead.
+- Build & Deploy recipes and the non-npm "replay the last known command
+  line" Start/Restart path both refuse to run if any of the relevant
+  fields contain shell chaining characters (`&`, `|`) or embedded
+  newlines, closing a command-injection path that a crafted/tampered
+  Backup Restore import (`history.json`'s `CommandLine`) could otherwise
+  reach silently, without the user typing anything malicious themselves.
+- A malformed JSON body on `/api/stop|start|restart` now returns 400
+  instead of silently being treated as an empty action.
+
+### Changed
+- The web dashboard's `HttpListener` now hands each accepted request to a
+  small `RunspacePool` (the same fix already used for the Local Domains
+  proxy), instead of processing requests one at a time on the accept
+  loop. Previously, one visitor's Stop/Start/Restart click - which can
+  legitimately take up to 8 seconds waiting on the UI thread - froze the
+  whole dashboard for every other visitor, including that same page's own
+  1.5-second auto-refresh poll, until it finished.
+
 ## [1.17.4] - 2026-08-02
 
 ### Fixed
