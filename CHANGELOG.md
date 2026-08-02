@@ -26,6 +26,15 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ## [1.17.0] - 2026-08-01
 
 ### Added
+- **Build & Deploy**: a per-project "build, then mirror the output into
+  one or more target folders" recipe - project folder, build command,
+  build output folder, and any number of deploy targets (each one
+  mirrored exactly, so stale files there get deleted). Run it from a
+  new toolbar button (every tracked port, filterable by group or port
+  range) or from a row's Detail popup; a live shell view shows the
+  build/copy output as it runs, and stays open to re-run without
+  closing. First run for a project prompts for its recipe; every run
+  after reuses the saved one.
 - Auto-restart on crash: a new "Restart automatically if this crashes"
   checkbox in the row's Detail popup (right-click a row) tells
   Localhost Manager to relaunch that project on its own the next time it
