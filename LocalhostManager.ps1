@@ -1945,7 +1945,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.17.2'
+$script:AppVersion = '1.17.3'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -4624,6 +4624,20 @@ function Show-DeployRunDialog {
     $rerunButton.Enabled = $false
     Initialize-ModernButton -Button $rerunButton -Variant Accent
 
+    # Hard-kills the whole cmd.exe /k tree (taskkill /T /F), same mechanism
+    # Stop-ProjectById already uses for the grid's Stop button - not a real
+    # CTRL_C_EVENT (this process has no console of its own to attach for
+    # one, being a -noConsole build, and a soft signal risks a build tool
+    # just swallowing it and continuing). The visible effect is the same
+    # thing a user expects from Ctrl+C at a real prompt: the running
+    # build/copy stops right now.
+    $stopButton = New-Object System.Windows.Forms.Button
+    $stopButton.Text = 'Stop Deploy'
+    $stopButton.Location = New-Object System.Drawing.Point(120, 6)
+    $stopButton.Size = New-Object System.Drawing.Size(100, 28)
+    $stopButton.Enabled = $false
+    Initialize-ModernButton -Button $stopButton -Variant Danger
+
     $closeButton = New-Object System.Windows.Forms.Button
     $closeButton.Text = 'Close'
     $closeButton.Anchor = 'Top,Right'
@@ -4632,7 +4646,7 @@ function Show-DeployRunDialog {
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton
 
-    [System.Windows.Forms.Control[]]$bottomControls = @($rerunButton, $closeButton)
+    [System.Windows.Forms.Control[]]$bottomControls = @($rerunButton, $stopButton, $closeButton)
     $bottomPanel.Controls.AddRange($bottomControls)
     $dlg.Controls.Add($textBox)
     $dlg.Controls.Add($statusLbl)
@@ -4662,6 +4676,7 @@ function Show-DeployRunDialog {
     function Start-DeployRun {
         if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} }
         $rerunButton.Enabled = $false
+        $stopButton.Enabled = $true
         $textBox.Clear()
         $statusLbl.Text = 'Running...'
         $statusLbl.ForeColor = $script:Theme.Accent
@@ -4687,7 +4702,7 @@ function Show-DeployRunDialog {
         $proc.EnableRaisingEvents = $true
 
         $subPrefix = "LHMDeploy_$([guid]::NewGuid().ToString('N'))"
-        $eventData = @{ TextBox = $textBox; StatusLbl = $statusLbl; RerunButton = $rerunButton; SubPrefix = $subPrefix; Dlg = $dlg; MultiTarget = ($targets.Count -gt 1) }
+        $eventData = @{ TextBox = $textBox; StatusLbl = $statusLbl; RerunButton = $rerunButton; StopButton = $stopButton; SubPrefix = $subPrefix; Dlg = $dlg; MultiTarget = ($targets.Count -gt 1) }
 
         Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -SourceIdentifier "$subPrefix`_out" -MessageData $eventData -Action {
             if ($null -eq $Event.SourceEventArgs.Data -or $Event.MessageData.Dlg.IsDisposed) { return }
@@ -4718,6 +4733,7 @@ function Show-DeployRunDialog {
                 $d.StatusLbl.Text = 'Session closed'
                 $d.StatusLbl.ForeColor = $script:Theme.TextDim
                 $d.RerunButton.Enabled = $true
+                $d.StopButton.Enabled = $false
             }
             $p = $d.SubPrefix
             Unregister-Event -SourceIdentifier "${p}_out" -ErrorAction SilentlyContinue
@@ -4732,6 +4748,26 @@ function Show-DeployRunDialog {
     }
 
     $rerunButton.Add_Click({ Start-DeployRun })
+    $stopButton.Add_Click({
+        if (-not $currentProc -or $currentProc.HasExited) { return }
+        $stopButton.Enabled = $false
+        $statusLbl.Text = 'Stopping...'
+        $statusLbl.ForeColor = $script:Theme.Danger
+        # Same taskkill /T /F approach as Stop-ProjectById - see the "Stop
+        # Deploy" comment above for why this hard-kills the tree instead of
+        # sending a real CTRL_C_EVENT. The Exited handler above still fires
+        # once the process actually dies, which is what flips the buttons
+        # back and prints "Session closed" - this click just triggers that.
+        try {
+            $killProc = New-Object System.Diagnostics.Process
+            $killProc.StartInfo.FileName = 'taskkill.exe'
+            $killProc.StartInfo.Arguments = "/PID $($currentProc.Id) /T /F"
+            $killProc.StartInfo.UseShellExecute = $false
+            $killProc.StartInfo.CreateNoWindow = $true
+            [void]$killProc.Start()
+            Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000 | Out-Null
+        } catch {}
+    })
     $dlg.Add_Shown({ Start-DeployRun })
     $dlg.Add_FormClosed({ if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} } })
     $dlg.ShowDialog($form) | Out-Null
@@ -5157,30 +5193,27 @@ function Show-RowDetail {
         $capturedLabel = $label
         $capturedPort = [string]$Data.Port
 
-        $deployRunButton = New-Object System.Windows.Forms.Button
-        $deployRunButton.Text = 'Deploy...'
-        $deployRunButton.Location = New-Object System.Drawing.Point(94, 3)
-        $deployRunButton.Size = New-Object System.Drawing.Size(90, 26)
-        $deployRunButton.Add_Click({ Invoke-DeployForProject -ProjectPath $capturedPath -Label $capturedLabel -Port $capturedPort }.GetNewClosure())
-        Initialize-ModernButton -Button $deployRunButton -Variant Accent
-        $bottomControls += $deployRunButton
+        # C-Deploy ("Configure Deploy") always opens the recipe editor,
+        # whether or not one exists yet - it never runs anything itself.
+        # Separate from Deploy below so "set up/change the recipe" and
+        # "actually build and copy" are two distinct, unambiguous actions
+        # instead of one button that means different things depending on
+        # whether a recipe happens to exist yet.
+        $configDeployButton = New-Object System.Windows.Forms.Button
+        $configDeployButton.Text = 'C-Deploy'
+        $configDeployButton.Location = New-Object System.Drawing.Point(94, 3)
+        $configDeployButton.Size = New-Object System.Drawing.Size(78, 26)
+        $configDeployButton.Add_Click({ Show-DeployConfigDialog -ProjectPath $capturedPath -Label $capturedLabel | Out-Null }.GetNewClosure())
+        Initialize-ModernButton -Button $configDeployButton
+        $bottomControls += $configDeployButton
 
-        # "Edit Deploy..." only makes sense once there's an existing
-        # recipe to edit - Invoke-DeployForProject (the plain "Deploy..."
-        # button above) already prompts for one via Show-DeployConfigDialog
-        # the first time there isn't one, then runs it. Before that first
-        # save, both buttons opened the exact same dialog with no way to
-        # tell them apart - showing only one button until then removes the
-        # apparent duplication instead of just explaining it away.
-        if ($script:DeployDefs.ContainsKey((Get-NormalizedPath $capturedPath))) {
-            $deployEditButton = New-Object System.Windows.Forms.Button
-            $deployEditButton.Text = 'Edit Deploy...'
-            $deployEditButton.Location = New-Object System.Drawing.Point(192, 3)
-            $deployEditButton.Size = New-Object System.Drawing.Size(110, 26)
-            $deployEditButton.Add_Click({ Show-DeployConfigDialog -ProjectPath $capturedPath -Label $capturedLabel | Out-Null }.GetNewClosure())
-            Initialize-ModernButton -Button $deployEditButton
-            $bottomControls += $deployEditButton
-        }
+        $deployButton = New-Object System.Windows.Forms.Button
+        $deployButton.Text = 'Deploy'
+        $deployButton.Location = New-Object System.Drawing.Point(180, 3)
+        $deployButton.Size = New-Object System.Drawing.Size(70, 26)
+        $deployButton.Add_Click({ Invoke-DeployForProject -ProjectPath $capturedPath -Label $capturedLabel -Port $capturedPort }.GetNewClosure())
+        Initialize-ModernButton -Button $deployButton -Variant Accent
+        $bottomControls += $deployButton
     }
     $bottomPanel.Controls.AddRange($bottomControls)
     $dlg.Controls.Add($bottomPanel)

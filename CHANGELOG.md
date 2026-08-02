@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.17.3] - 2026-08-02
+
+### Changed
+- Row Detail popup: the single "Deploy..." button (which quietly meant
+  "configure, then run" the first time and "just run" every time after)
+  is now two separate, always-visible buttons - **C-Deploy** opens the
+  recipe editor without running anything, **Deploy** actually builds
+  and copies (prompting for a recipe first if one isn't saved yet).
+  Matches the naming the Deploy Manager dialog already used for the
+  same two actions.
+
+### Added
+- Deploy terminal: a **Stop Deploy** button next to Run Again, for
+  killing a build/copy that's stuck or taking too long without closing
+  the whole dialog. Hard-kills the running shell's whole process tree
+  (`taskkill /T /F`, the same mechanism the grid's own Stop button
+  uses) rather than a real Ctrl+C signal - this session has no console
+  of its own to send one from, and a soft signal risks some build
+  tools just swallowing it and continuing anyway.
+
 ## [1.17.2] - 2026-08-02
 
 ### Changed
