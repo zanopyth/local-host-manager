@@ -1945,7 +1945,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.17.1'
+$script:AppVersion = '1.17.2'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -3763,7 +3763,17 @@ function Invoke-TogglePin {
         CommandLine = $data.CommandLine
     }
     Save-History $history
-    Refresh-Grid
+    # Unlike Invoke-ToggleAction/Invoke-Restart, there's no confirm
+    # MessageBox or DoEvents pump between the triggering click and this
+    # call to let the grid's own CellContentClick dispatch settle first -
+    # calling Refresh-Grid synchronously here can catch the DataGridView
+    # still mid-click (e.g. right after committing an edit on a
+    # different cell in the same click, like clicking away from Custom
+    # Name onto the neighboring Pin column), which throws "Operation
+    # cannot be performed in this event handler" on Rows.Clear().
+    # BeginInvoke defers it to the next message-loop iteration, after the
+    # current click has fully unwound.
+    $form.BeginInvoke([Action]{ Refresh-Grid }) | Out-Null
 }
 
 function Invoke-ToggleAutoRestart {
@@ -4974,19 +4984,22 @@ function Show-RowDetail {
 
     $label = if ($Data.CustomName) { $Data.CustomName } elseif ($Data.ProjectPath) { Split-Path -Leaf $Data.ProjectPath } else { "Port $($Data.Port)" }
 
-    $fields = @(
+    $fields = @()
+
+    # Auto-restart only makes sense for a real project (Start-ProjectAtPath
+    # needs a ProjectPath to relaunch) - System-tab rows and bare unresolved
+    # ports never get this row. Placed first since it's the one live,
+    # clickable control in the popup rather than read-only information.
+    if ($Data.ProjectPath) {
+        $fields += @{ Label = 'Auto-Restart'; Value = [bool]$Data.AutoRestart; IsVirtual = $false }
+    }
+
+    $fields += @(
         @{ Label = 'Status';      Value = [string]$Data.Status;      IsVirtual = $false }
         @{ Label = 'Port';        Value = [string]$Data.Port;        IsVirtual = $false }
         @{ Label = 'Pinned';      Value = if ($Data.Pinned) { 'Yes' } else { 'No' }; IsVirtual = $false }
         @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
     )
-
-    # Auto-restart only makes sense for a real project (Start-ProjectAtPath
-    # needs a ProjectPath to relaunch) - System-tab rows and bare unresolved
-    # ports never get this row.
-    if ($Data.ProjectPath) {
-        $fields += @{ Label = 'Auto-Restart'; Value = [bool]$Data.AutoRestart; IsVirtual = $false }
-    }
 
     $fields += @(
         @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
@@ -5059,7 +5072,7 @@ function Show-RowDetail {
         # render doesn't fire a spurious toggle.
         if ($f.Label -eq 'Auto-Restart') {
             $chk = New-Object System.Windows.Forms.CheckBox
-            $chk.Text = 'Restart automatically if this crashes'
+            $chk.Text = 'Auto Crash Restart'
             $chk.AutoSize = $false
             $chk.Location = New-Object System.Drawing.Point(10, 5)
             $chk.Size = New-Object System.Drawing.Size(($dlgWidth - 20), 20)

@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.17.2] - 2026-08-02
+
+### Changed
+- Row Detail popup: the "Auto Crash Restart" checkbox (renamed from
+  "Restart automatically if this crashes") now sits at the very top of
+  the popup instead of between Custom Name and Process, since it's the
+  one live, clickable control in an otherwise read-only sticky note.
+
+### Fixed
+- Editing a row's Custom Name, then clicking away onto the neighboring
+  Pin column in the same click, could pop a repeating "Operation cannot
+  be performed in this event handler" error. Toggling Pin refreshed the
+  grid synchronously, with no confirm dialog or pump in between to let
+  the grid's own click dispatch settle first - if that click also just
+  committed an edit on a different cell, the grid was still mid-dispatch
+  and refused the rebuild. The refresh is now deferred to the next
+  message-loop tick instead of running inline.
+
 ## [1.17.1] - 2026-08-02
 
 ### Fixed
