@@ -252,8 +252,17 @@ function Load-History {
 }
 
 function Save-History($history) {
-    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
-    $history | ConvertTo-Json | Set-Content -Path $script:HistoryPath -Encoding UTF8
+    # Unlike Load-History, this used to have no error handling at all - a
+    # disk-full/locked-file/permission failure here would throw unhandled
+    # while $script:CustomNames-style in-memory state had already moved on,
+    # silently losing the write (and everything since the last successful
+    # one) with no user-visible sign anything went wrong.
+    try {
+        if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+        $history | ConvertTo-Json | Set-Content -Path $script:HistoryPath -Encoding UTF8
+    } catch {
+        Write-AppErrorLog -Context 'Failed to save history.json' -Exception $_.Exception
+    }
 }
 
 $script:SettingsPath = Join-Path $script:HistoryDir 'settings.json'
@@ -397,8 +406,14 @@ function Load-Settings {
 }
 
 function Save-Settings($settings) {
-    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
-    $settings | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+    # See Save-History for why this is wrapped - same silent-data-loss risk
+    # on a disk-full/locked-file/permission failure.
+    try {
+        if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+        $settings | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+    } catch {
+        Write-AppErrorLog -Context 'Failed to save settings.json' -Exception $_.Exception
+    }
 }
 
 $script:StartupRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -524,8 +539,14 @@ function Load-CustomNames {
 }
 
 function Save-CustomNames($names) {
-    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
-    $names | ConvertTo-Json | Set-Content -Path $script:CustomNamesPath -Encoding UTF8
+    # See Save-History for why this is wrapped - same silent-data-loss risk
+    # on a disk-full/locked-file/permission failure.
+    try {
+        if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+        $names | ConvertTo-Json | Set-Content -Path $script:CustomNamesPath -Encoding UTF8
+    } catch {
+        Write-AppErrorLog -Context 'Failed to save customnames.json' -Exception $_.Exception
+    }
 }
 
 function Get-CustomNameKey {
@@ -577,8 +598,14 @@ function Load-DeployDefs {
 }
 
 function Save-DeployDefs($defs) {
-    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
-    $defs | ConvertTo-Json | Set-Content -Path $script:DeployDefsPath -Encoding UTF8
+    # See Save-History for why this is wrapped - same silent-data-loss risk
+    # on a disk-full/locked-file/permission failure.
+    try {
+        if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+        $defs | ConvertTo-Json | Set-Content -Path $script:DeployDefsPath -Encoding UTF8
+    } catch {
+        Write-AppErrorLog -Context 'Failed to save deploydefs.json' -Exception $_.Exception
+    }
 }
 
 $script:GroupsPath = Join-Path $script:HistoryDir 'groups.json'
@@ -594,8 +621,14 @@ function Load-Groups {
 }
 
 function Save-Groups($groups) {
-    if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
-    $groups | ConvertTo-Json | Set-Content -Path $script:GroupsPath -Encoding UTF8
+    # See Save-History for why this is wrapped - same silent-data-loss risk
+    # on a disk-full/locked-file/permission failure.
+    try {
+        if (-not (Test-Path $script:HistoryDir)) { New-Item -ItemType Directory -Path $script:HistoryDir -Force | Out-Null }
+        $groups | ConvertTo-Json | Set-Content -Path $script:GroupsPath -Encoding UTF8
+    } catch {
+        Write-AppErrorLog -Context 'Failed to save groups.json' -Exception $_.Exception
+    }
 }
 
 function Get-AllGroupedPaths {
@@ -1945,7 +1978,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.0'
+$script:AppVersion = '1.18.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -3732,31 +3765,46 @@ function Wait-ProcessExitUiResponsive {
     return $Process.HasExited
 }
 
+function Invoke-TaskKill {
+    # Shared by every "hard-kill a process tree" call site (Stop-ProjectById,
+    # Test-PortCollision, the deploy terminal's Stop Deploy button) - used
+    # to be copy-pasted three times. Bounded wait, not -Wait: every caller
+    # runs on the single WinForms UI thread, and a slow/stuck taskkill (AV
+    # scanning it, an unkillable detached grandchild process, ...) must
+    # never block that thread indefinitely - that's what froze the whole
+    # app for an hour after a phone-hub restart, once. If it doesn't finish
+    # in time this just gives up and returns $false; taskkill keeps running
+    # independently and callers already treat that as "a safety-net
+    # Stop-Process still has a shot at it", not a hard failure.
+    param(
+        [Parameter(Mandatory)][int]$ProcId,
+        [int]$TimeoutMilliseconds = 3000,
+        [string]$LogContext = ''
+    )
+    try {
+        $killProc = New-Object System.Diagnostics.Process
+        $killProc.StartInfo.FileName = 'taskkill.exe'
+        $killProc.StartInfo.Arguments = "/PID $ProcId /T /F"
+        $killProc.StartInfo.UseShellExecute = $false
+        $killProc.StartInfo.CreateNoWindow = $true
+        [void]$killProc.Start()
+        $finished = Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds $TimeoutMilliseconds
+        if (-not $finished -and $LogContext) {
+            Write-AppErrorLog -Context "taskkill did not finish within $($TimeoutMilliseconds)ms for PID $ProcId ($LogContext) - continuing without waiting" -Level Warning
+        }
+        return $finished
+    } catch {
+        return $false
+    }
+}
+
 function Stop-ProjectById {
     param([int]$ProcId, [string]$ProjectPath)
 
     $managed = $script:ManagedProcesses[(Get-NormalizedPath $ProjectPath)]
     if ($managed -and -not $managed.Proc.HasExited) {
         $managed.StoppedByUser = $true
-        try {
-            $killProc = New-Object System.Diagnostics.Process
-            $killProc.StartInfo.FileName = 'taskkill.exe'
-            $killProc.StartInfo.Arguments = "/PID $($managed.Proc.Id) /T /F"
-            $killProc.StartInfo.UseShellExecute = $false
-            $killProc.StartInfo.CreateNoWindow = $true
-            [void]$killProc.Start()
-            # Bounded wait, not -Wait: every caller of Stop-ProjectById (grid
-            # buttons, "stop all", the web dashboard action queue) runs on
-            # the single WinForms UI thread. A slow/stuck taskkill (AV
-            # scanning it, an unkillable detached grandchild process, ...)
-            # must never block that thread indefinitely - that's what froze
-            # the whole app for an hour after a phone-hub restart. If it
-            # doesn't finish in time we just move on; taskkill keeps running
-            # independently and the safety net below still has a shot at it.
-            if (-not (Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000)) {
-                Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($managed.Proc.Id) ($ProjectPath) - continuing without waiting" -Level Warning
-            }
-        } catch {}
+        Invoke-TaskKill -ProcId $managed.Proc.Id -LogContext $ProjectPath | Out-Null
         # Safety net: the discovered listening PID is sometimes a grandchild
         # a couple of hops below the wrapper we hold a handle to, and
         # taskkill /T occasionally misses a detached descendant.
@@ -3967,19 +4015,7 @@ function Test-PortCollision {
     $confirm = [System.Windows.Forms.MessageBox]::Show($message, $title, 'YesNo', 'Warning')
     if ($confirm -ne 'Yes') { return $false }
 
-    # Same taskkill-then-safety-net pattern as Stop-ProjectById: bounded
-    # wait so a slow/stuck taskkill can never block the single UI thread.
-    try {
-        $killProc = New-Object System.Diagnostics.Process
-        $killProc.StartInfo.FileName = 'taskkill.exe'
-        $killProc.StartInfo.Arguments = "/PID $($info.ProcId) /T /F"
-        $killProc.StartInfo.UseShellExecute = $false
-        $killProc.StartInfo.CreateNoWindow = $true
-        [void]$killProc.Start()
-        if (-not (Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000)) {
-            Write-AppErrorLog -Context "taskkill did not finish within 3s for PID $($info.ProcId) (port $Port) - continuing without waiting" -Level Warning
-        }
-    } catch {}
+    Invoke-TaskKill -ProcId $info.ProcId -LogContext "port $Port" | Out-Null
     try {
         if (Get-Process -Id $info.ProcId -ErrorAction SilentlyContinue) {
             Stop-Process -Id $info.ProcId -Force -ErrorAction SilentlyContinue
@@ -4807,15 +4843,7 @@ function Show-DeployRunDialog {
         # sending a real CTRL_C_EVENT. The Exited handler above still fires
         # once the process actually dies, which is what flips the buttons
         # back and prints "Session closed" - this click just triggers that.
-        try {
-            $killProc = New-Object System.Diagnostics.Process
-            $killProc.StartInfo.FileName = 'taskkill.exe'
-            $killProc.StartInfo.Arguments = "/PID $($currentProc.Id) /T /F"
-            $killProc.StartInfo.UseShellExecute = $false
-            $killProc.StartInfo.CreateNoWindow = $true
-            [void]$killProc.Start()
-            Wait-ProcessExitUiResponsive -Process $killProc -TimeoutMilliseconds 3000 | Out-Null
-        } catch {}
+        Invoke-TaskKill -ProcId $currentProc.Id | Out-Null
     })
     $dlg.Add_Shown({ Start-DeployRun })
     $dlg.Add_FormClosed({ if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} } })

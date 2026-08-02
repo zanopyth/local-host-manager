@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.1] - 2026-08-02
+
+### Fixed
+- `Save-History`/`Save-Settings`/`Save-CustomNames`/`Save-DeployDefs`/
+  `Save-Groups` had no error handling at all, unlike their `Load-*`
+  counterparts, which are all uniformly wrapped. A disk-full condition, a
+  locked file (antivirus scan, cloud-sync), or a permission error would
+  throw unhandled while the in-memory state had already moved on -
+  silently losing that write, and everything since the last successful
+  one, with no visible sign anything went wrong. Now logged to
+  `app-error.log` instead of failing silently.
+
+### Changed
+- The identical `taskkill.exe /PID ... /T /F` process-kill block that was
+  copy-pasted in three places (`Stop-ProjectById`, `Test-PortCollision`,
+  the deploy terminal's Stop Deploy button) is now one shared
+  `Invoke-TaskKill` helper. No behavior change - purely so a future fix
+  to how a kill is invoked only has to happen once.
+
 ## [1.18.0] - 2026-08-02
 
 ### Security
