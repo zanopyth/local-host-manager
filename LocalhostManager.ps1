@@ -1945,7 +1945,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.17.3'
+$script:AppVersion = '1.17.4'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -3034,7 +3034,21 @@ function New-PortsGrid {
         $dir = if ($e.RowIndex + 1 -lt $s.Rows.Count) { 1 } else { -1 }
         $targetIndex = $e.RowIndex + $dir
         if ($targetIndex -ge 0 -and $targetIndex -lt $s.Rows.Count) {
-            $s.CurrentCell = $s.Rows[$targetIndex].Cells[$e.ColumnIndex]
+            # Setting .CurrentCell synchronously here re-enters
+            # SetCurrentCellAddressCore - the very call still on the stack
+            # dispatching this CellEnter - and throws "Operation is not
+            # valid because it results in a reentrant call to the
+            # SetCurrentCellAddressCore function." Deferred via
+            # BeginInvoke so it runs after the click that landed on this
+            # separator row has fully finished, not nested inside it.
+            $col = $e.ColumnIndex
+            $s.BeginInvoke([Action]{
+                # Re-check bounds - by the time this runs the grid may
+                # have re-rendered (rows cleared/rebuilt) out from under
+                # the row/column indices captured above.
+                if ($s.IsDisposed -or $targetIndex -ge $s.Rows.Count -or $col -ge $s.ColumnCount) { return }
+                $s.CurrentCell = $s.Rows[$targetIndex].Cells[$col]
+            }.GetNewClosure()) | Out-Null
         }
     })
 

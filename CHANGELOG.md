@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.17.4] - 2026-08-02
+
+### Fixed
+- Clicking directly on a group-divider row in the table popped
+  "Operation is not valid because it results in a reentrant call to
+  the SetCurrentCellAddressCore function." Separator rows redirect the
+  current cell to the nearest real row so they're never selectable
+  themselves - but doing that assignment synchronously from inside the
+  very `CellEnter` event it was reacting to re-enters the same
+  internal call still on the stack, which WinForms disallows. This was
+  the actual cause behind the repeating "Operation cannot be performed
+  in this event handler" report fixed (incompletely, as it turns out)
+  in 1.17.2 - now deferred via BeginInvoke so it runs after the click
+  has fully finished instead of nested inside it.
+
 ## [1.17.3] - 2026-08-02
 
 ### Changed
