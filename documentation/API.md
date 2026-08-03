@@ -225,9 +225,12 @@ Auto Crash Restart enabled exits unexpectedly. Tracks attempts in
 `$script:AutoRestartAttempts` (keyed by normalized path, kept separate
 from the process's own managed-process entry since that gets replaced
 outright on every restart). Capped at `$script:AutoRestartMaxAttempts`
-(5) within `$script:AutoRestartWindowMinutes` (5); past the cap, logs and
-shows a balloon instead of retrying, if
-`$script:Settings.CrashNotifications` is on.
+within `$script:AutoRestartWindowMinutes` - both default to 5, initialized
+from (and user-configurable via) `$script:Settings.AutoRestartMaxAttempts`/
+`AutoRestartWindowMinutes` in Settings ▸ Preferences ▸ Startup, kept in
+lockstep with `$script:Settings` on save rather than read from it
+directly at every call site. Past the cap, logs and shows a balloon
+instead of retrying, if `$script:Settings.CrashNotifications` is on.
 
 ## Build & Deploy
 

@@ -330,7 +330,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnFillWeights = (Get-DefaultColumnFillWeights); ColumnOrder = (Get-DefaultColumnOrder) }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; AutoRestartMaxAttempts = 5; AutoRestartWindowMinutes = 5; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnFillWeights = (Get-DefaultColumnFillWeights); ColumnOrder = (Get-DefaultColumnOrder) }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -352,6 +352,8 @@ function Load-Settings {
         $groupDividerStyle = if ($raw.PSObject.Properties.Name -contains 'GroupDividerStyle' -and [string]$raw.GroupDividerStyle -in @('Dotted', 'Labeled')) { [string]$raw.GroupDividerStyle } else { 'Hairline' }
         $proxyEnabled = if ($raw.PSObject.Properties.Name -contains 'ProxyEnabled') { [bool]$raw.ProxyEnabled } else { $false }
         $proxyPort = if ($raw.PSObject.Properties.Name -contains 'ProxyPort' -and [int]$raw.ProxyPort -gt 0) { [int]$raw.ProxyPort } else { 2802 }
+        $autoRestartMaxAttempts = if ($raw.PSObject.Properties.Name -contains 'AutoRestartMaxAttempts' -and [int]$raw.AutoRestartMaxAttempts -gt 0) { [int]$raw.AutoRestartMaxAttempts } else { 5 }
+        $autoRestartWindowMinutes = if ($raw.PSObject.Properties.Name -contains 'AutoRestartWindowMinutes' -and [int]$raw.AutoRestartWindowMinutes -gt 0) { [int]$raw.AutoRestartWindowMinutes } else { 5 }
         # Merged onto the defaults (not replaced wholesale) so a settings
         # file saved before a new toggleable column existed still gets
         # that column's intended default instead of it vanishing/showing
@@ -396,6 +398,8 @@ function Load-Settings {
             CrashNotifications = $crashNotifications
             ProxyEnabled       = $proxyEnabled
             ProxyPort          = $proxyPort
+            AutoRestartMaxAttempts   = $autoRestartMaxAttempts
+            AutoRestartWindowMinutes = $autoRestartWindowMinutes
             CheckForUpdates    = $checkForUpdates
             GroupDividerStyle  = $groupDividerStyle
             ColumnVisibility   = $columnVisibility
@@ -989,9 +993,16 @@ function Get-NetworkInterfaceLabel {
     switch -Regex ($InterfaceAlias) {
         'Tailscale'          { return [PSCustomObject]@{ Label = 'Tailscale';   IsVirtual = $false; SortRank = 1 } }
         'Wi-?Fi|Wireless'    { return [PSCustomObject]@{ Label = 'Wi-Fi';       IsVirtual = $false; SortRank = 0 } }
+        # Checked before the plain 'Ethernet' case below - Windows names a
+        # Hyper-V virtual switch's host-side adapter "vEthernet (...)",
+        # which contains "Ethernet" as a substring. With 'Ethernet' checked
+        # first, every real Hyper-V adapter matched it instead and was
+        # misclassified as a real, non-virtual NIC (SortRank 0, not tinted
+        # purple in the row Detail popup) - the opposite of what this
+        # function exists to flag.
+        'Hyper-V|vEthernet'  { return [PSCustomObject]@{ Label = 'Hyper-V';    IsVirtual = $true;  SortRank = 2 } }
         'Ethernet'           { return [PSCustomObject]@{ Label = 'Ethernet';    IsVirtual = $false; SortRank = 0 } }
         'VMware'             { return [PSCustomObject]@{ Label = 'VMware';     IsVirtual = $true;  SortRank = 2 } }
-        'Hyper-V|vEthernet'  { return [PSCustomObject]@{ Label = 'Hyper-V';    IsVirtual = $true;  SortRank = 2 } }
         'VirtualBox'         { return [PSCustomObject]@{ Label = 'VirtualBox';IsVirtual = $true;  SortRank = 2 } }
         'Docker'             { return [PSCustomObject]@{ Label = 'Docker';    IsVirtual = $true;  SortRank = 2 } }
         default              { return [PSCustomObject]@{ Label = $InterfaceAlias; IsVirtual = $false; SortRank = 1 } }
@@ -1888,8 +1899,15 @@ $script:ManagedProcesses = @{}
 # after a single successful restart and defeat the whole point of capping
 # a crash loop. This dictionary outlives any one process's entry.
 $script:AutoRestartAttempts = @{}
-$script:AutoRestartMaxAttempts = 5
-$script:AutoRestartWindowMinutes = 5
+# User-configurable via Settings > Preferences > Startup - Load-Settings
+# already validated/clamped these (falls back to 5/5 if missing or
+# nonsensical), so no further checking needed here. Kept as their own
+# script-scope variables (rather than reading $script:Settings.* directly
+# at every use site) since they're read on every crash, and the Settings
+# dialog's OK handler updates both in lockstep with $script:Settings so a
+# changed cap takes effect immediately, no restart required.
+$script:AutoRestartMaxAttempts = [int]$script:Settings.AutoRestartMaxAttempts
+$script:AutoRestartWindowMinutes = [int]$script:Settings.AutoRestartWindowMinutes
 # Guards Invoke-Restart/Invoke-ToggleAction against re-entrancy: both now
 # pump the UI message loop (Wait-UiResponsive) while they wait on kills/
 # starts instead of blocking it outright, which keeps the window responsive
@@ -2023,7 +2041,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.2'
+$script:AppVersion = '1.18.3'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -5886,7 +5904,41 @@ function Show-SettingsDialog {
     $updateCheckLbl.ForeColor = $script:Theme.TextPrimary
     Connect-ToggleLabel -Switch $updateCheckSwitch -Label $updateCheckLbl
 
-    $tabStartup.Controls.AddRange(@($launchSwitch, $launchLbl, $minimizedSwitch, $minimizedLbl, $crashNotifSwitch, $crashNotifLbl, $updateCheckSwitch, $updateCheckLbl))
+    $autoRestartAttemptsLbl = New-Object System.Windows.Forms.Label
+    $autoRestartAttemptsLbl.Text = 'Auto Crash Restart: max attempts'
+    $autoRestartAttemptsLbl.Location = New-Object System.Drawing.Point(15, 163)
+    $autoRestartAttemptsLbl.Size = New-Object System.Drawing.Size(280, 24)
+    $autoRestartAttemptsLbl.ForeColor = $script:Theme.TextPrimary
+    $autoRestartAttemptsLbl.TextAlign = 'MiddleLeft'
+
+    $autoRestartAttemptsBox = New-Object System.Windows.Forms.NumericUpDown
+    $autoRestartAttemptsBox.Location = New-Object System.Drawing.Point(300, 161)
+    $autoRestartAttemptsBox.Size = New-Object System.Drawing.Size(70, 24)
+    $autoRestartAttemptsBox.Minimum = 1
+    $autoRestartAttemptsBox.Maximum = 50
+    $autoRestartAttemptsBox.Value = [Math]::Max(1, [Math]::Min(50, [int]$script:Settings.AutoRestartMaxAttempts))
+    $autoRestartAttemptsBox.BackColor = $script:Theme.CardBg
+    $autoRestartAttemptsBox.ForeColor = $script:Theme.TextPrimary
+    $autoRestartAttemptsBox.BorderStyle = 'FixedSingle'
+
+    $autoRestartWindowLbl = New-Object System.Windows.Forms.Label
+    $autoRestartWindowLbl.Text = '...within a rolling window of (minutes)'
+    $autoRestartWindowLbl.Location = New-Object System.Drawing.Point(15, 199)
+    $autoRestartWindowLbl.Size = New-Object System.Drawing.Size(280, 24)
+    $autoRestartWindowLbl.ForeColor = $script:Theme.TextPrimary
+    $autoRestartWindowLbl.TextAlign = 'MiddleLeft'
+
+    $autoRestartWindowBox = New-Object System.Windows.Forms.NumericUpDown
+    $autoRestartWindowBox.Location = New-Object System.Drawing.Point(300, 197)
+    $autoRestartWindowBox.Size = New-Object System.Drawing.Size(70, 24)
+    $autoRestartWindowBox.Minimum = 1
+    $autoRestartWindowBox.Maximum = 120
+    $autoRestartWindowBox.Value = [Math]::Max(1, [Math]::Min(120, [int]$script:Settings.AutoRestartWindowMinutes))
+    $autoRestartWindowBox.BackColor = $script:Theme.CardBg
+    $autoRestartWindowBox.ForeColor = $script:Theme.TextPrimary
+    $autoRestartWindowBox.BorderStyle = 'FixedSingle'
+
+    $tabStartup.Controls.AddRange(@($launchSwitch, $launchLbl, $minimizedSwitch, $minimizedLbl, $crashNotifSwitch, $crashNotifLbl, $updateCheckSwitch, $updateCheckLbl, $autoRestartAttemptsLbl, $autoRestartAttemptsBox, $autoRestartWindowLbl, $autoRestartWindowBox))
 
     # --- Diagnostics --------------------------------------------------------
     $logStats = Get-AppErrorLogStats
@@ -5947,6 +5999,13 @@ function Show-SettingsDialog {
         $script:Settings.CheckForUpdates = Get-ToggleChecked $updateCheckSwitch
 
         $script:Settings.GroupDividerStyle = if ($dividerLabeledRadio.Checked) { 'Labeled' } elseif ($dividerDottedRadio.Checked) { 'Dotted' } else { 'Hairline' }
+
+        $script:Settings.AutoRestartMaxAttempts = [int]$autoRestartAttemptsBox.Value
+        $script:Settings.AutoRestartWindowMinutes = [int]$autoRestartWindowBox.Value
+        # Takes effect immediately, no restart needed - unlike Theme, this
+        # isn't baked into anything already constructed at startup.
+        $script:AutoRestartMaxAttempts = [int]$autoRestartAttemptsBox.Value
+        $script:AutoRestartWindowMinutes = [int]$autoRestartWindowBox.Value
 
         Save-Settings $script:Settings
         Update-ScopeLabel

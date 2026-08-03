@@ -20,6 +20,7 @@ LocalhostManager.ps1        - the entire app
 LocalhostManager.ico        - window/tray icon (healthy state, green)
 LocalhostManager-alert.ico  - tray icon (alert state, red)
 LocalhostManager.exe        - compiled output (gitignored, shipped via Releases)
+tests\PureLogic.Tests.ps1   - Pester unit tests for the pure-logic functions
 ```
 
 ## Runtime data (not in the repo)
@@ -304,20 +305,51 @@ missing `.ico` file never crashes the app — it just looks generic.
 ## Making changes
 
 1. Edit `LocalhostManager.ps1` directly.
-2. Test by running it as a script first (faster iteration than
+2. Run the unit tests (seconds, no compile needed):
+   `Invoke-Pester (Join-Path (Get-Location) 'tests\PureLogic.Tests.ps1')`
+3. Test by running the script directly (faster iteration than
    recompiling): `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
    LocalhostManager.ps1`
-3. Recompile with `Invoke-PS2EXE` (see `INSTALLATION.md`) once you're
+4. Recompile with `Invoke-PS2EXE` (see `INSTALLATION.md`) once you're
    happy — bump `$script:AppVersion` in the script and the `-version`
    argument together.
-4. Commit the `.ps1`/`.ico` changes, push, and cut a new GitHub Release
+5. Commit the `.ps1`/`.ico` changes, push, and cut a new GitHub Release
    with the freshly built `.exe` attached (the `.exe` itself is
    gitignored, never committed to the repo).
 
-There's no automated test suite. Verification so far has been manual:
-launching the compiled exe, exercising each feature against real running
-npm dev servers, checking `logs\app-error.log` for anything new, and
-using direct Win32 API calls (`SendMessage`/`BM_CLICK`, `IsWindowVisible`,
-`MoveWindow` to script a live window resize, etc.) to exercise UI
-interaction and assert on real control state rather than screenshots,
-where screenshots proved unreliable in this environment.
+## Unit tests
+
+`tests\PureLogic.Tests.ps1` covers the functions with no WinForms/network/
+process dependency - path normalization, filtering, the network-adapter
+classifier, the LAN-URL builder, the live/history merge step, etc. Written
+for Pester 3.4.0 (what ships in Windows PowerShell 5.1 by default, so
+nothing extra to install).
+
+There's no "import just the functions" mode for `LocalhostManager.ps1` -
+the bottom of the file calls `Application.Run($form)`, and even
+dot-sourcing it starts the background poller runspace, the tray icon, and
+(if enabled) the dashboard/proxy HTTP listeners. The test file works
+around this by pulling specific named function *bodies* out of the script
+via the PowerShell AST (`Get-PureFunctionSource`, at the top of the test
+file) and dot-sourcing only those into the test session - the real
+shipped code runs, not a reimplementation kept in sync by hand, but the
+GUI/startup path never executes. Only add a function to that test file's
+import list if it's genuinely free of `$script:`/WinForms/process
+dependencies; anything else still has to be verified manually per the
+paragraph below.
+
+This suite already caught one real bug on its first run: `Get-NetworkInterfaceLabel`
+classified every Hyper-V virtual adapter as a real, non-virtual "Ethernet"
+NIC, because Windows names those adapters `vEthernet (...)` - which
+contains "Ethernet" as a substring - and the `switch -Regex` checked the
+generic `'Ethernet'` pattern before the more specific `'Hyper-V|vEthernet'`
+one, `return`-ing on the first match. Fixed by reordering the switch.
+
+Beyond that unit-testable slice, there's no automated coverage for the
+WinForms/GUI half. Verification there has been manual: launching the
+compiled exe, exercising each feature against real running npm dev
+servers, checking `logs\app-error.log` for anything new, and using direct
+Win32 API calls (`SendMessage`/`BM_CLICK`, `IsWindowVisible`, `MoveWindow`
+to script a live window resize, etc.) to exercise UI interaction and
+assert on real control state rather than screenshots, where screenshots
+proved unreliable in this environment.

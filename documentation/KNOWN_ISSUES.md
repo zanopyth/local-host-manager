@@ -74,12 +74,14 @@ on this for something important.
   under `%LOCALAPPDATA%`; there's no built-in sync across machines or
   accounts — **Backup Settings.../Restore Backup...** (File menu) covers
   moving to a new machine manually, but there's no live/automatic sharing.
-- **No automated tests.** Verification has been manual, exercised against
-  real running dev servers each time a feature changed. See
-  `DEVELOPER_GUIDE.md` for how UI behavior was actually verified
-  (direct Win32 calls and programmatic window manipulation rather than
-  screenshots, which were unreliable in this environment for reasons
-  unrelated to the app itself).
+- **Automated coverage is limited to the pure-logic half.**
+  `tests\PureLogic.Tests.ps1` (Pester) covers path normalization,
+  filtering, the network-adapter classifier, and similar - see
+  `DEVELOPER_GUIDE.md`. The WinForms/GUI half has none; verification
+  there is manual, exercised against real running dev servers each time
+  a feature changes (direct Win32 calls and programmatic window
+  manipulation rather than screenshots, which were unreliable in this
+  environment for reasons unrelated to the app itself).
 - **Multi-monitor window restore quirks were observed during
   development** on setups with a monitor at negative screen coordinates
   — purely an artifact of automated testing tools (`PrintWindow`), not

@@ -94,7 +94,8 @@ popup, then check **Auto Crash Restart** (at the top of the popup) to
 have Localhost Manager relaunch that project on its own the next time it
 exits unexpectedly, instead of sitting there marked `CRASHED` until you
 notice and click Restart manually. Capped at 5 attempts within a rolling
-5-minute window — a genuinely broken project (bad code, a permanently
+5-minute window by default (adjustable in **Settings ▸ Preferences ▸
+Startup**) — a genuinely broken project (bad code, a permanently
 taken port) gets a handful of real tries and then gives up loudly (a
 balloon notification, logged to the Error & Crash Log) instead of
 hammering forever. A project you stop yourself is never auto-restarted;
@@ -247,7 +248,10 @@ offer to do for you.
   is always shown in the bottom-right corner of the main window.
 - **Appearance** — theme and group-divider style, see **Themes** above.
 - **Startup** — launch at Windows sign-in, start minimized to tray,
-  crash notifications, check for updates on launch.
+  crash notifications, check for updates on launch, and the **Auto Crash
+  Restart** cap (max attempts and the rolling window in minutes - see
+  **Auto Crash Restart** above; defaults to 5 attempts / 5 minutes,
+  changes apply immediately, no restart needed).
 - **Diagnostics** — the Error & Crash Log viewer, for everything logged
   via `Write-AppErrorLog` (failed launches, taskkill timeouts, unhandled
   UI exceptions, ...).

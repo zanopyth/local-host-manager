@@ -33,8 +33,8 @@ non-npm processes, and more all landed between v1.7.0 and v1.17.4).
   symmetrical friction with Stop's confirmation.
 - **Code signing.** Would remove the SmartScreen warning on first run —
   meaningful if this is ever shared beyond one person's machine.
-- **Automated tests.** No test suite currently exists — all verification
-  has been manual, driven against real running dev servers. Even a small
-  set of tests around the pure-logic half of the script (row building,
-  filtering, path normalization) wouldn't require any WinForms/GUI
-  scaffolding and would catch regressions early.
+- **Expand automated test coverage.** `tests\PureLogic.Tests.ps1` covers
+  the pure-logic pieces with no WinForms/network/process dependency
+  (path normalization, filtering, the network-adapter classifier, the
+  live/history merge step) — see `DEVELOPER_GUIDE.md`. The GUI half still
+  has no automated coverage; verification there remains manual.

@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.3] - 2026-08-02
+
+### Added
+- Auto Crash Restart's cap (max attempts / rolling window in minutes,
+  previously hardcoded at 5 / 5) is now configurable in **Settings ▸
+  Preferences ▸ Startup**. Takes effect immediately, no restart needed.
+- A Pester unit test suite (`tests\PureLogic.Tests.ps1`, 33 tests) for
+  the pure-logic functions - path normalization, filtering, the
+  network-adapter classifier, the LAN-URL builder, the live/history
+  merge step. See `DEVELOPER_GUIDE.md` for how it works around
+  `LocalhostManager.ps1` having no "import just the functions" mode.
+
+### Fixed
+- `Get-NetworkInterfaceLabel` misclassified every real Hyper-V virtual
+  adapter as a plain, non-virtual "Ethernet" NIC. Windows names those
+  adapters `vEthernet (...)`, which contains "Ethernet" as a substring -
+  the classifier's `switch -Regex` checked the generic `'Ethernet'`
+  pattern before the more specific `'Hyper-V|vEthernet'` one and
+  returned on the first match. Caught by the new test suite's first run
+  and confirmed against this machine's own real vEthernet adapter,
+  which now correctly shows as "Hyper-V" (and gets purple-tinted as
+  virtual in the row Detail popup) instead of being indistinguishable
+  from a real NIC.
+
 ## [1.18.2] - 2026-08-02
 
 ### Changed
