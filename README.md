@@ -45,6 +45,27 @@ Grab the latest `LocalhostManager.exe` from the
   non-Node processes can be grouped too
 - Custom names, root-directory scoping, and a tray icon that turns red
   when something in your tracked set goes down
+- **Search/filter box** in the toolbar — narrows the table to rows whose
+  name, process, port, or project path match what you type, live as you
+  type. Local to the window only; never affects what the web dashboard
+  or Local Domains proxy see
+- **Health check** (opt-in, Settings ▸ Preferences): a bound port doesn't
+  prove the app behind it is actually working — a hung server still
+  holds the socket. A lightweight probe against each running project
+  catches that case and shows it ON in amber instead of green, correctly
+  matching whichever address family a project actually bound to (some
+  dev servers, Vite included, bind to the IPv6 loopback rather than
+  `127.0.0.1`)
+- **Pin** a port to keep its entry (and Restart button) around after it
+  stops, instead of it disappearing once nothing's listening — works for
+  non-Node processes too
+- **Auto Crash Restart** — opt in per project from its Detail popup to
+  relaunch automatically on an unexpected exit, capped at a configurable
+  attempts/window pair so a genuinely broken project doesn't retry forever
+- **Build & Deploy** — a per-project build-then-mirror-to-target(s)
+  recipe, run from a live shell view with its own Stop button, from a
+  toolbar button or a row's Detail popup
+- **Themes** — Light, Dark, and a Catppuccin-Mocha-inspired Terminal theme
 - Runs from the tray — closing the window just hides it
 - **Web dashboard** (new in v1.6, opt-in — off until you enable it from the
   **Dashboard** menu): a browser view of the same table at

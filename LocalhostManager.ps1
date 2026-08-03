@@ -330,7 +330,7 @@ function Load-Settings {
     # DashboardEnabled defaults to $false: the web dashboard is opt-in,
     # never auto-started on a fresh install. The end user turns it on (and
     # picks a port) themselves via the Dashboard menu.
-    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; AutoRestartMaxAttempts = 5; AutoRestartWindowMinutes = 5; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnFillWeights = (Get-DefaultColumnFillWeights); ColumnOrder = (Get-DefaultColumnOrder) }
+    $defaults = @{ OnlyNode = $true; RootDir = ''; ShowGroups = $true; SelectedGroups = @(); WebPort = 3199; DashboardEnabled = $false; ShowSystemPorts = $false; Theme = 'Terminal'; LaunchAtStartup = $false; StartMinimized = $false; CrashNotifications = $true; CheckForUpdates = $true; GroupDividerStyle = 'Hairline'; ProxyEnabled = $false; ProxyPort = 2802; AutoRestartMaxAttempts = 5; AutoRestartWindowMinutes = 5; HealthCheckEnabled = $false; ColumnVisibility = (Get-DefaultColumnVisibility); ColumnFillWeights = (Get-DefaultColumnFillWeights); ColumnOrder = (Get-DefaultColumnOrder) }
     if (-not (Test-Path $script:SettingsPath)) { return $defaults }
     try {
         $raw = Get-Content $script:SettingsPath -Raw | ConvertFrom-Json
@@ -354,6 +354,7 @@ function Load-Settings {
         $proxyPort = if ($raw.PSObject.Properties.Name -contains 'ProxyPort' -and [int]$raw.ProxyPort -gt 0) { [int]$raw.ProxyPort } else { 2802 }
         $autoRestartMaxAttempts = if ($raw.PSObject.Properties.Name -contains 'AutoRestartMaxAttempts' -and [int]$raw.AutoRestartMaxAttempts -gt 0) { [int]$raw.AutoRestartMaxAttempts } else { 5 }
         $autoRestartWindowMinutes = if ($raw.PSObject.Properties.Name -contains 'AutoRestartWindowMinutes' -and [int]$raw.AutoRestartWindowMinutes -gt 0) { [int]$raw.AutoRestartWindowMinutes } else { 5 }
+        $healthCheckEnabled = if ($raw.PSObject.Properties.Name -contains 'HealthCheckEnabled') { [bool]$raw.HealthCheckEnabled } else { $false }
         # Merged onto the defaults (not replaced wholesale) so a settings
         # file saved before a new toggleable column existed still gets
         # that column's intended default instead of it vanishing/showing
@@ -400,6 +401,7 @@ function Load-Settings {
             ProxyPort          = $proxyPort
             AutoRestartMaxAttempts   = $autoRestartMaxAttempts
             AutoRestartWindowMinutes = $autoRestartWindowMinutes
+            HealthCheckEnabled = $healthCheckEnabled
             CheckForUpdates    = $checkForUpdates
             GroupDividerStyle  = $groupDividerStyle
             ColumnVisibility   = $columnVisibility
@@ -717,6 +719,13 @@ $script:LiveCache = [hashtable]::Synchronized(@{
     LanIps        = @()
     Ready         = $false
     StopRequested = $false
+    # Placeholder - $script:Settings doesn't exist yet at this point in
+    # the script's own startup, so the real persisted value is synced in
+    # right after Load-Settings runs (below), well before the background
+    # poller thread that actually reads this is started. Also updated
+    # live from Show-SettingsDialog's OK handler, so toggling it takes
+    # effect on the poller's next cycle without an app restart.
+    HealthCheckEnabled = $false
 })
 
 # ---------------------------------------------------------------------------
@@ -827,6 +836,89 @@ $script:BackgroundPollScript = {
         } catch {
             return $null
         }
+    }
+
+    function Get-HealthProbeHost {
+        # Wildcard binds (0.0.0.0/::) accept both address families, so
+        # plain IPv4 loopback always reaches them - no different from how
+        # LocalUrl is already built elsewhere. A listener bound to one
+        # specific address, though, is genuinely only reachable on that
+        # address; an IPv6 literal needs [brackets] in a URL, which a bare
+        # IPv4 literal or hostname never does.
+        param([string]$LocalAddr)
+        if (-not $LocalAddr -or $LocalAddr -eq '0.0.0.0' -or $LocalAddr -eq '::') { return '127.0.0.1' }
+        if ($LocalAddr -like '*:*') { return "[$LocalAddr]" }
+        return $LocalAddr
+    }
+
+    function Test-HttpResponding {
+        # Opt-in health check (Settings > Preferences): proves a listening
+        # process is actually processing HTTP requests, not just holding
+        # the socket open - a hung/frozen server looks identical to a
+        # healthy one under a plain "is something listening" check, which
+        # is all Status=ON has ever meant. Runs every probe concurrently
+        # via BeginGetResponse/EndGetResponse (true async, not a
+        # thread-per-port) so N tracked projects cost roughly one
+        # timeout's worth of wall time total, not N timeouts summed -
+        # this whole poller loop only gets ~4s per cycle before other
+        # tracked ports go stale, and a single hung server must never
+        # delay detecting everything else.
+        # $Targets is @{ Port; ProbeHost } pairs, not bare port numbers -
+        # ProbeHost must match the listener's actual bind address family.
+        # Vite (and other modern Node tooling) binds to "localhost", which
+        # Node resolves to the IPv6 loopback (::1) first on many systems -
+        # a probe that always assumes 127.0.0.1 silently misses every one
+        # of those and reports a perfectly healthy dev server as not
+        # responding, having never actually reached it. See
+        # Get-HealthProbeHost for how ProbeHost is derived from the
+        # listener's real LocalAddr.
+        param($Targets, [int]$TimeoutMs)
+        $pending = @()
+        foreach ($t in $Targets) {
+            try {
+                $req = [System.Net.HttpWebRequest]::Create("http://$($t.ProbeHost):$($t.Port)/")
+                $req.Method = 'GET'
+                $req.Timeout = $TimeoutMs
+                $req.ReadWriteTimeout = $TimeoutMs
+                $req.KeepAlive = $false
+                $ar = $req.BeginGetResponse($null, $null)
+                $pending += @{ Port = $t.Port; Request = $req; AsyncResult = $ar }
+            } catch {
+                # Couldn't even start the request (socket-level failure) -
+                # treated as unresponsive below, same as a real timeout.
+            }
+        }
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs + 300)
+        while (([DateTime]::UtcNow -lt $deadline) -and @($pending | Where-Object { -not $_.AsyncResult.IsCompleted }).Count -gt 0) {
+            Start-Sleep -Milliseconds 50
+        }
+        $results = @{}
+        foreach ($p in $pending) {
+            try {
+                if ($p.AsyncResult.IsCompleted) {
+                    $resp = $p.Request.EndGetResponse($p.AsyncResult)
+                    $resp.Close()
+                    $results[$p.Port] = $true
+                } else {
+                    try { $p.Request.Abort() } catch {}
+                    $results[$p.Port] = $false
+                }
+            } catch [System.Net.WebException] {
+                # Any HTTP response at all - even a 404/500 - still proves
+                # the process is actually answering requests, not just
+                # holding the socket. WebException is how HttpWebRequest
+                # surfaces a non-2xx status, not only connection failures.
+                if ($_.Exception.Response) {
+                    $_.Exception.Response.Close()
+                    $results[$p.Port] = $true
+                } else {
+                    $results[$p.Port] = $false
+                }
+            } catch {
+                $results[$p.Port] = $false
+            }
+        }
+        return $results
     }
 
     # CPU% isn't a snapshot value - .NET only exposes cumulative
@@ -940,6 +1032,22 @@ $script:BackgroundPollScript = {
                 if ($seenLanIp.ContainsKey($ipInfo.IPAddress)) { continue }
                 $seenLanIp[$ipInfo.IPAddress] = $true
                 $lanEntries += [PSCustomObject]@{ IPAddress = $ipInfo.IPAddress; InterfaceAlias = $ipInfo.InterfaceAlias }
+            }
+
+            # Health-check probe, opt-in and off by default - only actual
+            # npm/node projects get probed (never IsSystem processes,
+            # which frequently aren't HTTP servers at all and would just
+            # rack up false "unresponsive" reports for something that was
+            # never going to answer a GET request in the first place).
+            if ($Cache.HealthCheckEnabled) {
+                $portsToProbe = @($result.Keys | Where-Object { $result[$_].IsNode -and -not $result[$_].IsSystem })
+                if ($portsToProbe.Count -gt 0) {
+                    $targets = @($portsToProbe | ForEach-Object { @{ Port = $_; ProbeHost = (Get-HealthProbeHost -LocalAddr $result[$_].LocalAddr) } })
+                    $probeResults = Test-HttpResponding -Targets $targets -TimeoutMs 1500
+                    foreach ($port in $portsToProbe) {
+                        $result[$port].Responding = if ($probeResults.ContainsKey($port)) { $probeResults[$port] } else { $false }
+                    }
+                }
             }
 
             $Cache.Listeners = $result
@@ -1128,6 +1236,11 @@ function Build-Rows {
             Pinned      = $pinned
             AutoRestart = $autoRestart
             CommandLine = $e.CommandLine
+            # $true/$false once the background poller's health-check probe
+            # (opt-in, Settings > Preferences) has actually run against
+            # this port; $null when it's off, or this isn't an npm/node
+            # project the probe bothers with - see Test-HttpResponding.
+            Responding  = $e.Responding
         }
     }
 
@@ -1160,6 +1273,7 @@ function Build-Rows {
             Pinned      = [bool]$h.Pinned
             AutoRestart = [bool]$h.AutoRestart
             CommandLine = $h.CommandLine
+            Responding  = $null
         }
     }
 
@@ -1250,6 +1364,11 @@ if (-not $script:SingleInstanceCreatedNew) {
 # because the Light/Dark palette selection right below needs to know the
 # saved theme choice before any control gets built against it.
 $script:Settings = Load-Settings
+# Syncs the placeholder set when $script:LiveCache was declared (above,
+# before $script:Settings existed) to the actual persisted value - the
+# background poller thread that reads this isn't started until well after
+# this point, so it always sees the real setting from its very first cycle.
+$script:LiveCache.HealthCheckEnabled = [bool]$script:Settings.HealthCheckEnabled
 
 # ---------------------------------------------------------------------------
 # Theme — flat, GNOME/Adwaita-inspired palettes, light and dark. Swapped in
@@ -1275,6 +1394,8 @@ $script:LightTheme = @{
     SuccessTint = [System.Drawing.Color]::FromArgb(0xE3, 0xF6, 0xEC)
     Danger      = [System.Drawing.Color]::FromArgb(0xC0, 0x1C, 0x28)
     DangerTint  = [System.Drawing.Color]::FromArgb(0xFB, 0xE6, 0xE7)
+    Warning     = [System.Drawing.Color]::FromArgb(0xF5, 0x7C, 0x00)
+    WarningTint = [System.Drawing.Color]::FromArgb(0xFF, 0xF3, 0xE0)
     RowAlt      = [System.Drawing.Color]::FromArgb(0xF7, 0xF6, 0xF5)
     ToggleOff   = [System.Drawing.Color]::FromArgb(0xC6, 0xC6, 0xC6)
     IsDark      = $false
@@ -1301,6 +1422,8 @@ $script:DarkTheme = @{
     SuccessTint = [System.Drawing.Color]::FromArgb(0x1E, 0x2E, 0x25)
     Danger      = [System.Drawing.Color]::FromArgb(0xF2, 0x3F, 0x42)
     DangerTint  = [System.Drawing.Color]::FromArgb(0x30, 0x22, 0x24)
+    Warning     = [System.Drawing.Color]::FromArgb(0xFA, 0xA6, 0x1A)
+    WarningTint = [System.Drawing.Color]::FromArgb(0x3A, 0x2E, 0x1C)
     RowAlt      = [System.Drawing.Color]::FromArgb(0x2E, 0x30, 0x35)
     ToggleOff   = [System.Drawing.Color]::FromArgb(0x4E, 0x50, 0x58)
     IsDark      = $true
@@ -1328,6 +1451,8 @@ $script:TerminalTheme = @{
     SuccessTint = [System.Drawing.Color]::FromArgb(0x1E, 0x2E, 0x25)
     Danger      = [System.Drawing.Color]::FromArgb(0xF3, 0x8B, 0xA8)
     DangerTint  = [System.Drawing.Color]::FromArgb(0x30, 0x22, 0x26)
+    Warning     = [System.Drawing.Color]::FromArgb(0xFA, 0xB3, 0x87)
+    WarningTint = [System.Drawing.Color]::FromArgb(0x30, 0x28, 0x20)
     RowAlt      = [System.Drawing.Color]::FromArgb(0x1A, 0x1A, 0x28)
     ToggleOff   = [System.Drawing.Color]::FromArgb(0x45, 0x47, 0x5A)
     IsDark      = $true
@@ -1885,6 +2010,14 @@ $script:CustomNames = Load-CustomNames
 $script:DeployDefs = Load-DeployDefs
 $script:Groups = Load-Groups
 $script:SelectedGroups = @($script:Settings.SelectedGroups | Where-Object { $script:Groups.ContainsKey($_) })
+# Search box state - deliberately transient (not persisted to
+# settings.json, resets on restart, same as a browser's find-in-page).
+# LastDisplaySplit caches the most recently built Get-DisplayRowsSplit
+# result so typing in the search box can re-filter/re-render instantly
+# without a fresh live scan or history.json write - see
+# Get-SearchFilteredDisplay/Render-FilteredGrids.
+$script:SearchFilter = ''
+$script:LastDisplaySplit = $null
 
 # Processes launched by this app, keyed by normalized project path. Lets us
 # capture stdout/stderr and tell "stopped by user" apart from "exited on its
@@ -2041,7 +2174,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.3'
+$script:AppVersion = '1.18.4'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2269,7 +2402,11 @@ function Connect-ToggleLabel {
 # ---------------------------------------------------------------------------
 function New-DashboardPill {
     $pill = New-Object System.Windows.Forms.Panel
-    $pill.Size = New-Object System.Drawing.Size(20, 20)
+    # 23x23 to sit close to the search box's 24px height (top-aligned with
+    # it too - see its Location below) instead of the smaller 20x20 this
+    # used to be, which read as visually mismatched sitting right next to
+    # it.
+    $pill.Size = New-Object System.Drawing.Size(23, 23)
     $pill.Tag = [PSCustomObject]@{ On = $false; Text = 'Dashboard off'; Url = $null }
 
     $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
@@ -2355,7 +2492,7 @@ function New-ActionBusyIndicator {
         $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
         $g.Clear($parentColor)
 
-        $size = 20
+        $size = [Math]::Min($s.Width, $s.Height)
         $rect = New-Object System.Drawing.Rectangle((($s.Width - $size) / 2), (($s.Height - $size) / 2), $size, $size)
         $d = $rect.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -2611,16 +2748,22 @@ $script:DashboardTip.InitialDelay = 300
 $script:DashboardTip.ReshowDelay = 100
 $script:DashboardTip.AutoPopDelay = 2000
 $script:DashboardPill = New-DashboardPill
-$script:DashboardPill.Location = New-Object System.Drawing.Point(908, 16)
+# Y=14 top-aligns with the search box (also Y=14, 24px tall) sitting just
+# to its left - both read as one row at a glance instead of the dot
+# looking vertically offset next to it.
+$script:DashboardPill.Location = New-Object System.Drawing.Point(908, 14)
 $script:DashboardPill.Anchor = 'Top,Right'
 
 # Busy light for Start/Stop/Restart - stacked directly under the dashboard
 # status pill (both Top,Right-anchored so they move together on resize),
-# resized down to match its compact 20x20 footprint instead of the 34x28
-# toolbar-button size it used before the Deploy button took that slot.
+# sized to match it (23x23, was a smaller 20x20 that read as mismatched
+# next to the pill) instead of the 34x28 toolbar-button size it used
+# before the Deploy button took that slot. Y keeps the same 8px gap below
+# the pill as before (14 + 23 + 8 = 45), just shifted to match the pill's
+# new position/size.
 $script:ActionBusyIndicator = New-ActionBusyIndicator
-$script:ActionBusyIndicator.Size = New-Object System.Drawing.Size(20, 20)
-$script:ActionBusyIndicator.Location = New-Object System.Drawing.Point(908, 44)
+$script:ActionBusyIndicator.Size = New-Object System.Drawing.Size(23, 23)
+$script:ActionBusyIndicator.Location = New-Object System.Drawing.Point(908, 45)
 $script:ActionBusyIndicator.Anchor = 'Top,Right'
 $script:ActionBusyTip = New-Object System.Windows.Forms.ToolTip
 $script:ActionBusyTip.InitialDelay = 300
@@ -2666,6 +2809,34 @@ $nodeOnlyLabel.Location = New-Object System.Drawing.Point(356, 51)
 $nodeOnlyLabel.Size = New-Object System.Drawing.Size(152, 22)
 $nodeOnlyLabel.TextAlign = 'MiddleLeft'
 $nodeOnlyLabel.ForeColor = $script:Theme.TextPrimary
+
+# Search/filter box - narrows the Live/History/System grids to rows whose
+# Custom Name, Process, Port, or Project Path contains the typed text.
+# Deliberately NOT applied inside Get-DisplayRows/Get-DisplayRowsSplit
+# (see Get-SearchFilteredDisplay) - it only affects what these three
+# grids render, never what the web dashboard or the Local Domains proxy
+# see. Anchored Top,Left,Right so it stretches with the window instead of
+# leaving a growing gap (or, at a narrower width, crowding the dashboard
+# status dot) - the right margin captured here at the panel's initial
+# 960px width keeps a fixed gap before that dot as the window resizes.
+$searchLbl = New-Object System.Windows.Forms.Label
+$searchLbl.Text = 'Search:'
+$searchLbl.Location = New-Object System.Drawing.Point(525, 16)
+$searchLbl.Size = New-Object System.Drawing.Size(55, 22)
+$searchLbl.TextAlign = 'MiddleLeft'
+$searchLbl.ForeColor = $script:Theme.TextPrimary
+
+$searchBox = New-Object System.Windows.Forms.TextBox
+$searchBox.Location = New-Object System.Drawing.Point(582, 14)
+$searchBox.Size = New-Object System.Drawing.Size(318, 24)
+$searchBox.Anchor = 'Top,Left,Right'
+$searchBox.BackColor = $script:Theme.CardBg
+$searchBox.ForeColor = $script:Theme.TextPrimary
+$searchBox.BorderStyle = 'FixedSingle'
+$searchBox.Add_TextChanged({
+    $script:SearchFilter = $searchBox.Text.Trim()
+    Render-FilteredGrids
+})
 
 # Footer clock — just the time, not "Last refreshed: ... | N shown"; the
 # count moved to the tab headers (Live (N) / History (N)) already, so
@@ -2810,7 +2981,7 @@ $script:DeployButtonTip = New-Object System.Windows.Forms.ToolTip
 $script:DeployButtonTip.InitialDelay = 300
 $script:DeployButtonTip.SetToolTip($deployButton, 'Build & Deploy')
 
-[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $deployButton, $startAllButton, $stopAllButton, $script:ActionBusyIndicator, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $topPanelDivider)
+[System.Windows.Forms.Control[]]$topControls = @($refreshButton, $groupsButton, $columnsButton, $deployButton, $startAllButton, $stopAllButton, $script:ActionBusyIndicator, $divider1, $script:DashboardPill, $useGroupsSwitch, $useGroupsLabel, $nodeOnlySwitch, $nodeOnlyLabel, $searchLbl, $searchBox, $topPanelDivider)
 $topPanel.Controls.AddRange($topControls)
 Connect-ToggleLabel -Switch $nodeOnlySwitch -Label $nodeOnlyLabel
 Connect-ToggleLabel -Switch $useGroupsSwitch -Label $useGroupsLabel
@@ -3344,7 +3515,19 @@ function Add-DataRow {
     $row = $Grid.Rows[$idx]
     $row.Tag = $r
     switch ($r.Status) {
-        'ON'      { $row.Cells['Status'].Style.ForeColor = $script:Theme.Success }
+        'ON'      {
+            # Responding is $false only once a health-check probe has
+            # actually timed out (see the background poller) - $null means
+            # "not probed" (health check off, or not an npm/node project),
+            # which reads the same as a normal healthy ON row rather than
+            # a false alarm.
+            if ($r.Responding -eq $false) {
+                $row.Cells['Status'].Style.ForeColor = $script:Theme.Warning
+                $row.Cells['Status'].ToolTipText = 'Listening, but not responding to HTTP requests - may be hung, or still starting up.'
+            } else {
+                $row.Cells['Status'].Style.ForeColor = $script:Theme.Success
+            }
+        }
         'CRASHED' {
             $row.Cells['Status'].Style.ForeColor = $script:Theme.Danger
             $row.Cells['Status'].Style.Font = New-Object System.Drawing.Font($Grid.Font, [System.Drawing.FontStyle]::Bold)
@@ -3535,8 +3718,27 @@ function Get-DisplayRowsSplit {
 function Get-DisplayRowsSignature {
     param($Display)
     return ($Display | ForEach-Object {
-        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)|$([bool]$_.Row.Pinned)|$($_.Row.Cpu)|$($_.Row.Mem)"
+        "$($_.Group)|$($_.Row.Status)|$($_.Row.Port)|$($_.Row.ProcId)|$($_.Row.CustomName)|$($_.Row.ProjectPath)|$($_.Row.Action)|$([bool]$_.Row.HasLog)|$([bool]$_.Row.Pinned)|$($_.Row.Cpu)|$($_.Row.Mem)|$($_.Row.Responding)"
     }) -join "`n"
+}
+
+function Get-SearchFilteredDisplay {
+    # Narrows an already-built display list (Group-tagged rows, the same
+    # shape Get-DisplayRows returns) down to rows matching the search box's
+    # current text. Deliberately applied only here - right before
+    # rendering - never inside Get-DisplayRows/Get-DisplayRowsSplit
+    # themselves, since that same result also feeds the web dashboard and
+    # the Local Domains proxy route map. A local search narrowing what you
+    # see in this window shouldn't stop a project's *.localhost address
+    # from working, or hide it from someone checking the dashboard on
+    # their phone.
+    param($Display)
+    $term = $script:SearchFilter
+    if (-not $term) { return $Display }
+    return @($Display | Where-Object {
+        $r = $_.Row
+        "$($r.CustomName) $($r.ProcessName) $($r.Port) $($r.ProjectPath)" -like "*$term*"
+    })
 }
 
 function Render-Grid {
@@ -3581,19 +3783,40 @@ function Flash-StatusLabel {
     $script:FlashTimer.Start()
 }
 
+function Render-FilteredGrids {
+    # Re-renders all three grids from the last-built display data (no live
+    # rescan, no history.json write) - shared by Refresh-Grid below and by
+    # the search box's TextChanged handler, so typing in the search box
+    # doesn't trigger a fresh scan/disk write on every keystroke.
+    if (-not $script:LastDisplaySplit) { return }
+    $split = $script:LastDisplaySplit
+    # @(...) wrapping the call (not just the return inside
+    # Get-SearchFilteredDisplay itself) matters here - PowerShell unrolls
+    # a single-item array back to a bare scalar as it crosses a function
+    # return boundary, and collapses a zero-item one to $null. Without
+    # forcing array context at the call site too, an exactly-one-match (or
+    # zero-match) search left $liveFiltered.Count silently returning $null
+    # instead of 1 or 0, and the tab header briefly read "Live ()".
+    $liveFiltered = @(Get-SearchFilteredDisplay -Display $split.Live)
+    $historyFiltered = @(Get-SearchFilteredDisplay -Display $split.History)
+    $systemFiltered = @(Get-SearchFilteredDisplay -Display $split.System)
+    Render-Grid -Grid $liveGrid -Display $liveFiltered
+    Render-Grid -Grid $historyGrid -Display $historyFiltered
+    Render-Grid -Grid $systemGrid -Display $systemFiltered
+    Update-TabHeaders -LiveCount $liveFiltered.Count -HistoryCount $historyFiltered.Count -SystemCount $systemFiltered.Count
+}
+
 function Refresh-Grid {
     # Full, forced rebuild — used for direct user actions (Refresh button,
     # toggles, settings/group changes, start/stop) where the grid content
     # is expected to change right away.
     if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode -or $systemGrid.IsCurrentCellInEditMode) { return }
     $split = Get-DisplayRowsSplit
-    Render-Grid -Grid $liveGrid -Display $split.Live
-    Render-Grid -Grid $historyGrid -Display $split.History
-    Render-Grid -Grid $systemGrid -Display $split.System
+    $script:LastDisplaySplit = $split
+    Render-FilteredGrids
     $script:LastLiveSignature = Get-DisplayRowsSignature $split.Live
     $script:LastHistorySignature = Get-DisplayRowsSignature $split.History
     $script:LastSystemSignature = Get-DisplayRowsSignature $split.System
-    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count -SystemCount $split.System.Count
     $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
@@ -3609,22 +3832,23 @@ function Invoke-PeriodicRefresh {
     # in the others.
     if ($liveGrid.IsCurrentCellInEditMode -or $historyGrid.IsCurrentCellInEditMode -or $systemGrid.IsCurrentCellInEditMode) { Flash-StatusLabel; return }
     $split = Get-DisplayRowsSplit
+    $script:LastDisplaySplit = $split
     $liveSig = Get-DisplayRowsSignature $split.Live
     $historySig = Get-DisplayRowsSignature $split.History
     $systemSig = Get-DisplayRowsSignature $split.System
     if ($liveSig -ne $script:LastLiveSignature) {
-        Render-Grid -Grid $liveGrid -Display $split.Live
+        Render-Grid -Grid $liveGrid -Display @(Get-SearchFilteredDisplay -Display $split.Live)
         $script:LastLiveSignature = $liveSig
     }
     if ($historySig -ne $script:LastHistorySignature) {
-        Render-Grid -Grid $historyGrid -Display $split.History
+        Render-Grid -Grid $historyGrid -Display @(Get-SearchFilteredDisplay -Display $split.History)
         $script:LastHistorySignature = $historySig
     }
     if ($systemSig -ne $script:LastSystemSignature) {
-        Render-Grid -Grid $systemGrid -Display $split.System
+        Render-Grid -Grid $systemGrid -Display @(Get-SearchFilteredDisplay -Display $split.System)
         $script:LastSystemSignature = $systemSig
     }
-    Update-TabHeaders -LiveCount $split.Live.Count -HistoryCount $split.History.Count -SystemCount $split.System.Count
+    Update-TabHeaders -LiveCount @(Get-SearchFilteredDisplay -Display $split.Live).Count -HistoryCount @(Get-SearchFilteredDisplay -Display $split.History).Count -SystemCount @(Get-SearchFilteredDisplay -Display $split.System).Count
     $statusLabel.Text = Get-Date -Format 'HH:mm:ss'
     Update-TrayIcon
     Flash-StatusLabel
@@ -5177,6 +5401,12 @@ function Get-RowDetailFields {
         @{ Label = 'Custom Name'; Value = [string]$Data.CustomName;  IsVirtual = $false }
     )
 
+    # $null (health check off, or not an npm/node project) shows nothing -
+    # only a completed probe (true/false) is worth a row here.
+    if ($null -ne $Data.Responding) {
+        $fields += @{ Label = 'Responding'; Value = if ($Data.Responding) { 'Yes' } else { 'No - listening but not answering HTTP requests' }; IsVirtual = $false }
+    }
+
     $fields += @(
         @{ Label = 'Process';     Value = [string]$Data.ProcessName; IsVirtual = $false }
         @{ Label = 'PID';         Value = [string]$Data.ProcId;      IsVirtual = $false }
@@ -5778,7 +6008,24 @@ function Show-SettingsDialog {
     $systemPortsHintLbl.ForeColor = $script:Theme.TextDim
     $systemPortsHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
 
-    $tabGeneral.Controls.AddRange(@($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl))
+    $healthCheckSwitch = New-ToggleSwitch -Checked ([bool]$script:Settings.HealthCheckEnabled)
+    $healthCheckSwitch.Location = New-Object System.Drawing.Point(15, 205)
+
+    $healthCheckLbl = New-Object System.Windows.Forms.Label
+    $healthCheckLbl.Text = 'Health check (listening vs. responding)'
+    $healthCheckLbl.Location = New-Object System.Drawing.Point(60, 205)
+    $healthCheckLbl.Size = New-Object System.Drawing.Size(320, 20)
+    $healthCheckLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ToggleLabel -Switch $healthCheckSwitch -Label $healthCheckLbl
+
+    $healthCheckHintLbl = New-Object System.Windows.Forms.Label
+    $healthCheckHintLbl.Text = "A bound port doesn't prove the app behind it is actually working - a hung server still holds the socket. Sends a lightweight GET to each npm/node project's own address every ~4s; one that doesn't answer shows ON in amber instead of green."
+    $healthCheckHintLbl.Location = New-Object System.Drawing.Point(15, 231)
+    $healthCheckHintLbl.Size = New-Object System.Drawing.Size(420, 48)
+    $healthCheckHintLbl.ForeColor = $script:Theme.TextDim
+    $healthCheckHintLbl.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+
+    $tabGeneral.Controls.AddRange(@($lbl, $pathBox, $browseButton, $clearButton, $systemPortsSwitch, $systemPortsLbl, $systemPortsHintLbl, $healthCheckSwitch, $healthCheckLbl, $healthCheckHintLbl))
 
     # --- Appearance -----------------------------------------------------------
     # Theme and Group Divider each get their own Panel: WinForms auto-groups
@@ -5985,6 +6232,13 @@ function Show-SettingsDialog {
         $script:RootDir = $pathBox.Text
         $script:Settings.RootDir = $script:RootDir
         $script:Settings.ShowSystemPorts = Get-ToggleChecked $systemPortsSwitch
+
+        $script:Settings.HealthCheckEnabled = Get-ToggleChecked $healthCheckSwitch
+        # Read directly by the background poller thread every cycle (see
+        # $script:LiveCache's own comment) - updating it here means
+        # toggling the switch takes effect on the poller's next tick,
+        # same "no restart needed" treatment as the Auto Crash Restart cap.
+        $script:LiveCache.HealthCheckEnabled = [bool]$script:Settings.HealthCheckEnabled
 
         $newTheme = if ($themeTerminalRadio.Checked) { 'Terminal' } elseif ($themeDarkRadio.Checked) { 'Dark' } else { 'Light' }
         $themeChanged = $newTheme -ne $script:Settings.Theme
@@ -6828,6 +7082,7 @@ function Publish-DashboardRows {
             ProjectPath = $_.Row.ProjectPath
             HasLog      = [bool]$_.Row.HasLog
             CommandLine = $_.Row.CommandLine
+            Responding  = $_.Row.Responding
         }
     })
     # -InputObject (not the pipeline) is required so a single-row result

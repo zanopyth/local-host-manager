@@ -45,6 +45,24 @@ text for anything unrecognized. Used by `Build-Rows` to label, sort, and
 flag each Network URL entry, and by `Show-RowDetail` to purple-tint rows
 for virtual/VM-only adapters.
 
+### `Get-HealthProbeHost -LocalAddr <string>` / `Test-HttpResponding -Targets <array> -TimeoutMs <int>`
+Defined inside `$script:BackgroundPollScript` (own runspace, like the PEB
+readers above). Opt-in (Settings ▸ Preferences ▸ General ▸ Health check,
+off by default) HTTP probe run once per poll cycle against every
+currently-`IsNode`, non-`IsSystem` listener: proves the process is
+actually answering requests, not just holding the socket open. Runs every
+probe concurrently via `BeginGetResponse`/`EndGetResponse` (true async,
+not a thread-per-port) so N tracked projects cost roughly one timeout's
+worth of wall time total. `Get-HealthProbeHost` picks the probe address
+from the listener's own `LocalAddr` (falling back to `127.0.0.1` only for
+a wildcard bind) rather than assuming IPv4 - some dev servers (Vite
+included) bind to the IPv6 loopback (`::1`), and a probe that only ever
+tried `127.0.0.1` would report one of those as unresponsive without ever
+actually reaching it. Result lands on each entry as `Responding`
+(`$true`/`$false`), read by `Build-Rows` into the row's own `Responding`
+field; `$null` means "not probed" (health check off, or not an npm/node
+project), not "unresponsive".
+
 ### `Get-PortListenerInfo -Port <int>`
 Fresh, synchronous, single-port check (not read from `$script:LiveCache`,
 which can lag by up to one poll interval) — used right before a launch,
@@ -72,12 +90,16 @@ and persists any newly-seen/Pinned/Auto-Restart project back to
 `history.json`. Returns an array of `[PSCustomObject]` with: `Status,
 Port, CustomName, ProcessName, ProcId, Cpu, Mem, LocalUrl, LanUrls,
 LanEntries, ProjectPath, Action, HasLog, Pinned, AutoRestart,
-CommandLine`, sorted by port number. `Status` is `ON`, `OFF`, or
-`CRASHED` (an unattended exit, as opposed to one the user triggered).
+CommandLine, Responding`, sorted by port number. `Status` is `ON`, `OFF`,
+or `CRASHED` (an unattended exit, as opposed to one the user triggered).
 `LanEntries` is the structured, per-adapter form behind `LanUrls` — an
 array of `[PSCustomObject]@{ Label; Url; IsVirtual; SortRank }`, already
 sorted real-adapters-first; empty for non-`ON` rows and for rows whose
-listener only binds to `127.0.0.1`.
+listener only binds to `127.0.0.1`. `Responding` is `$true`/`$false` once
+the health-check probe has actually run against that port (see
+`Get-HealthProbeHost`/`Test-HttpResponding` below), `$null` for every
+non-`ON` row and for an `ON` row the probe hasn't covered (health check
+off, or not an npm/node project).
 
 Called with different arguments by different parts of the UI — see
 `DEVELOPER_GUIDE.md` → "The scanning pipeline".
@@ -99,6 +121,26 @@ No parameters. Calls `Get-DisplayRows` once, then also calls
 what the grid is about to show), and splits the result into `@{ Live;
 History; System }` by `Status`. `System` is only populated when
 `$script:Settings.ShowSystemPorts` is on.
+
+### `Get-SearchFilteredDisplay -Display <array>`
+Narrows a `Get-DisplayRows`-shaped list down to rows whose `CustomName`/
+`ProcessName`/`Port`/`ProjectPath` contains `$script:SearchFilter` (the
+toolbar search box's live text; empty means no filtering). Applied only
+at render time (`Render-FilteredGrids`/`Invoke-PeriodicRefresh`), never
+inside `Get-DisplayRows`/`Get-DisplayRowsSplit` themselves - the search
+box narrows what the grids draw, never what `Publish-DashboardRows`/
+`Update-ProxyRouteMap` publish. Callers must wrap the call in `@(...)`
+(not just parentheses) - PowerShell collapses a one-item return back to
+a bare scalar, and a zero-item one to `$null`, crossing the function
+boundary otherwise.
+
+### `Render-FilteredGrids`
+No parameters - reads `$script:LastDisplaySplit` (cached by whichever of
+`Refresh-Grid`/`Invoke-PeriodicRefresh` last ran `Get-DisplayRowsSplit`).
+Re-renders all three grids through `Get-SearchFilteredDisplay`, with no
+fresh scan or `history.json` write - what the search box's `TextChanged`
+handler calls on every keystroke, and what `Refresh-Grid` calls after a
+real rebuild.
 
 ### `Get-GroupRowsOrdered -Rows <array> -GroupNames <string[]>`
 Reorders/filters a `Build-Rows` result down to just the given groups,

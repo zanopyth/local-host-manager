@@ -4,7 +4,7 @@
 
 | Column | Meaning | Shown by default? |
 |---|---|---|
-| Status | `ON` (green), `OFF` (red, known project not currently running), or `CRASHED` (exited on its own, not stopped by you) | always |
+| Status | `ON` (green), `ON` in amber (listening but not responding — see **Health check** below), `OFF` (red, known project not currently running), or `CRASHED` (exited on its own, not stopped by you) | always |
 | Port | The TCP port | always |
 | Pin | Keeps this row's entry (and Restart button) around after it stops — see **Pin** below | always |
 | Custom Name | Editable — see below | on |
@@ -42,6 +42,16 @@ the order you land on are saved and restored on restart, and stay in sync
 across Live/History/System (they're really the same table). Restart and
 Stop/Start always stay the last two columns no matter how you reorder the
 rest.
+
+## Search / filter
+
+The **Search** box in the toolbar narrows Live/History/System to rows
+whose Custom Name, Process, Port, or Project Path contains what you've
+typed — live as you type, no Enter needed. It's local to this window
+only: narrowing what you see here never changes what the web dashboard
+or a Local Domains address shows, and doesn't reset when you clear it —
+type again and everything comes back. Not persisted between restarts,
+same as a browser's find-in-page.
 
 ## Starting, stopping, and restarting a project
 
@@ -100,6 +110,24 @@ taken port) gets a handful of real tries and then gives up loudly (a
 balloon notification, logged to the Error & Crash Log) instead of
 hammering forever. A project you stop yourself is never auto-restarted;
 only an unattended exit counts as a crash.
+
+## Health check
+
+`ON` only ever meant "something is bound to this port" — a hung or
+frozen dev server holds its socket open exactly like a healthy one does,
+so it looked identical in the table. Turning on **Health check**
+(**Settings ▸ Preferences ▸ General**, off by default) adds a real check
+on top: every running npm/node project gets a lightweight HTTP request
+sent to its own address roughly every 4 seconds. One that doesn't answer
+in time shows **`ON` in amber** instead of green, with a tooltip
+explaining why, and the row's Detail popup gets a **Responding: No**
+line. A project that's simply not an HTTP server (or hasn't been probed
+yet) shows no such warning — no news is good news.
+
+This is opt-in because it means the app now makes real network requests
+to your own dev servers on a schedule, which isn't free of side effects
+for every project (some log every request, some don't like being polled)
+— turn it on if you've been bitten by a server that silently locks up.
 
 ## Log viewer
 
@@ -245,7 +273,8 @@ offer to do for you.
   `C:\Users\you\Documents\Projects`), handy if this machine also runs
   unrelated npm-based background apps you don't want cluttering the
   view. **Clear (no restriction)** removes the scope. The active scope
-  is always shown in the bottom-right corner of the main window.
+  is always shown in the bottom-right corner of the main window. Also
+  where **Health check** lives - see **Health check** above.
 - **Appearance** — theme and group-divider style, see **Themes** above.
 - **Startup** — launch at Windows sign-in, start minimized to tray,
   crash notifications, check for updates on launch, and the **Auto Crash

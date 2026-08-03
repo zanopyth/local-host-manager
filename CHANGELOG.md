@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.4] - 2026-08-03
+
+### Added
+- **Health check** (Settings ▸ Preferences ▸ General, off by default): a
+  lightweight HTTP probe against every running npm/node project, every
+  ~4 seconds, on top of the existing "is something listening" check. A
+  project that's bound to its port but not actually answering requests -
+  hung, frozen, still starting up - now shows **ON in amber** instead of
+  green, with a tooltip explaining why, a new "Responding" field in the
+  row Detail popup, and the same field exposed to the web dashboard.
+  Probes run concurrently (not one after another), so a single hung
+  project can never delay detecting the rest, and correctly match
+  whichever address family a project actually bound to - some dev
+  servers (Vite among them) bind to the IPv6 loopback (`::1`) rather
+  than `127.0.0.1`, and a probe that only ever tried IPv4 would report
+  a perfectly healthy server as unresponsive, having never actually
+  reached it.
+- **Search/filter box** in the toolbar, next to the column chooser and
+  Deploy buttons: narrows the Live/History/System tables to rows whose
+  Custom Name, Process, Port, or Project Path match what's typed, live
+  as you type. Only affects what these three tables render - never
+  what the web dashboard or Local Domains proxy see, so narrowing your
+  own view never breaks another project's `*.localhost` address or
+  hides it from someone checking the dashboard remotely.
+
+### Changed
+- The dashboard status dot and the busy-light indicator below it are
+  now 23x23 (were a smaller, mismatched-looking 20x20), top-aligned
+  with the new search box next to them.
+
+### Fixed
+- `Get-NetworkInterfaceLabel` misclassified every real Hyper-V virtual
+  adapter as a plain, non-virtual "Ethernet" NIC - caught by the new
+  Pester suite's first run (see below) and confirmed against a real
+  vEthernet adapter, which now correctly shows as "Hyper-V" instead of
+  being indistinguishable from a physical NIC.
+- A single-match (or zero-match) search briefly left a tab header
+  reading "Live ()" instead of "Live (1)"/"Live (0)" - a classic
+  PowerShell gotcha where a function's own `@()`-wrapped return value
+  still collapses back to a bare scalar (or `$null`) crossing the
+  return boundary unless the caller also wraps the call in `@(...)`.
+
 ## [1.18.3] - 2026-08-02
 
 ### Added

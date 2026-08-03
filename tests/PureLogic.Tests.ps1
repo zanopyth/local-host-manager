@@ -47,7 +47,8 @@ foreach ($source in (Get-PureFunctionSource -Names @(
     'Test-HasShellChainingChars',
     'Get-NetworkInterfaceLabel',
     'Get-RowLanInfo',
-    'Merge-LiveWithHistoryFallback'
+    'Merge-LiveWithHistoryFallback',
+    'Get-SearchFilteredDisplay'
 ))) {
     . ([scriptblock]::Create($source))
 }
@@ -211,4 +212,61 @@ Describe 'Merge-LiveWithHistoryFallback' {
         $result = Merge-LiveWithHistoryFallback -RawLive $rawLive -History @{}
         $result['3000'].ProjectPath | Should BeNullOrEmpty
     }
+}
+
+Describe 'Get-SearchFilteredDisplay' {
+    # Reads $script:SearchFilter directly (it's wired to the toolbar
+    # search box's live text, not passed as a parameter) - set/reset it
+    # around each assertion rather than depending on Pester 3.4's
+    # BeforeEach/AfterEach (not available in that version).
+    #
+    # Every call below wraps the function call itself in @(...), not just
+    # parentheses - PowerShell unrolls a single-item array back to a bare
+    # scalar (and a zero-item one to $null) as it crosses a function
+    # return boundary, regardless of the @() the function itself already
+    # wraps its own return value in. This bit the real call sites in
+    # LocalhostManager.ps1 too (Render-FilteredGrids/Invoke-PeriodicRefresh)
+    # until they were fixed to @()-wrap their calls as well - an
+    # exactly-one-match (or zero-match) search left a tab header reading
+    # "Live ()" instead of "Live (1)"/"Live (0)", since .Count on the
+    # collapsed scalar/$null silently returns $null rather than throwing.
+    $sampleDisplay = @(
+        [PSCustomObject]@{ Group = $null; Row = [PSCustomObject]@{ CustomName = 'Frontend'; ProcessName = 'node'; Port = '3000'; ProjectPath = 'C:\Projects\web-app' } }
+        [PSCustomObject]@{ Group = $null; Row = [PSCustomObject]@{ CustomName = ''; ProcessName = 'python'; Port = '8000'; ProjectPath = 'C:\Projects\api-server' } }
+        [PSCustomObject]@{ Group = $null; Row = [PSCustomObject]@{ CustomName = 'Worker'; ProcessName = $null; Port = '9000'; ProjectPath = $null } }
+    )
+
+    It 'returns everything unfiltered when the search term is empty' {
+        $script:SearchFilter = ''
+        @(Get-SearchFilteredDisplay -Display $sampleDisplay).Count | Should Be 3
+    }
+    It 'matches against Custom Name, case-insensitively, even with exactly one match' {
+        $script:SearchFilter = 'FRONT'
+        $result = @(Get-SearchFilteredDisplay -Display $sampleDisplay)
+        $result.Count | Should Be 1
+        $result[0].Row.CustomName | Should Be 'Frontend'
+    }
+    It 'matches against Process Name for a row with no Custom Name' {
+        $script:SearchFilter = 'python'
+        $result = @(Get-SearchFilteredDisplay -Display $sampleDisplay)
+        $result.Count | Should Be 1
+        $result[0].Row.ProcessName | Should Be 'python'
+    }
+    It 'matches against Port' {
+        $script:SearchFilter = '9000'
+        @(Get-SearchFilteredDisplay -Display $sampleDisplay).Count | Should Be 1
+    }
+    It 'matches against Project Path' {
+        $script:SearchFilter = 'api-server'
+        @(Get-SearchFilteredDisplay -Display $sampleDisplay).Count | Should Be 1
+    }
+    It 'does not throw for a row with null ProcessName/ProjectPath' {
+        $script:SearchFilter = 'worker'
+        { Get-SearchFilteredDisplay -Display $sampleDisplay } | Should Not Throw
+    }
+    It 'returns nothing (not an error) when no row matches, exactly zero results' {
+        $script:SearchFilter = 'nonexistent-xyz'
+        @(Get-SearchFilteredDisplay -Display $sampleDisplay).Count | Should Be 0
+    }
+    $script:SearchFilter = ''
 }

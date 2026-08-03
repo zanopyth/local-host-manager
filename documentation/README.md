@@ -26,6 +26,8 @@ build/deploy all of them.
 | Start / Stop / Restart | Per-row buttons, tray menu, or bulk via groups; port-collision check runs before every launch |
 | CPU / RAM columns | Live per-process usage right in the grid (CPU off by default, RAM on) |
 | Column chooser, resize, reorder | Show/hide the informational columns; drag to resize or reorder; both persist across restarts |
+| Search / filter | Toolbar box narrows the table by name/process/port/path, live as you type - local to the window only |
+| Health check | Opt-in: probes each running project's own address; one that's listening but not answering shows ON in amber |
 | Pin | Keeps a port's entry (and Restart button) around after it stops, including non-Node processes |
 | Custom Name | Rename any row to something meaningful ("API", "Frontend"...) |
 | Auto Crash Restart | Per-project opt-in: relaunch automatically on an unexpected exit, capped at 5 attempts / 5 minutes |

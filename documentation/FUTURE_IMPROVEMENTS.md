@@ -12,10 +12,6 @@ non-npm processes, and more all landed between v1.7.0 and v1.17.4).
 - **Column sorting** by clicking headers (currently fixed sort by port).
   Columns are freely resizable/reorderable/hideable now, but not
   sortable.
-- **Search/filter box** in the grid, for machines with many tracked
-  projects where scrolling gets old. Distinct from the existing
-  column-visibility chooser (the funnel icon next to Groups) — that
-  toggles which columns show, not which rows.
 - **Log viewing in the web dashboard.** The native app has a per-project
   log viewer (double-click a row → `Show-LogViewer`, capturing stdout/
   stderr for managed processes); the web dashboard's `/api/*` routes
