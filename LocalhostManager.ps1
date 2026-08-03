@@ -998,13 +998,7 @@ function Get-NetworkInterfaceLabel {
     }
 }
 
-function Build-Rows {
-    param([bool]$OnlyNode, [string]$RootDir)
-
-    $rawLive = Get-LiveListeners
-    $history = Load-History
-    $lanIps = @(Get-LanIPv4Addresses)
-
+function Merge-LiveWithHistoryFallback {
     # The PEB read behind ProjectPath can fail for a perfectly normal, live
     # process - e.g. one spawned inside a sandboxed shell (an agent/CI
     # runner) whose job/security context blocks an unrelated app like this
@@ -1016,10 +1010,11 @@ function Build-Rows {
     # out of Groups (path match), Manage Groups (path is required to even
     # list it) and the "Dev Servers Only" filter (needs IsNode). A process
     # that resolves fine this cycle always wins over history.
+    param($RawLive, $History)
     $live = @{}
-    foreach ($key in $rawLive.Keys) {
-        $e = $rawLive[$key]
-        $prior = $history[$key]
+    foreach ($key in $RawLive.Keys) {
+        $e = $RawLive[$key]
+        $prior = $History[$key]
         if (-not $e.ProjectPath -and $prior -and $prior.ProjectPath) {
             $e = $e.Clone()
             $e.ProjectPath = $prior.ProjectPath
@@ -1028,22 +1023,61 @@ function Build-Rows {
         }
         $live[$key] = $e
     }
+    return $live
+}
 
+function Sync-HistoryFromLive {
     # A pinned port is remembered here regardless of IsNode - that's the
     # whole point of pinning: keep tracking something (even a non-npm
     # process) through a shutdown so History can offer it back later. A
     # plain (unpinned) entry is still only tracked while it's a recognized
-    # Node project, same as before.
-    foreach ($key in $live.Keys) {
-        $e = $live[$key]
+    # Node project, same as before. $History is a hashtable (reference
+    # type) - mutated in place and saved, same as when this was inlined in
+    # Build-Rows, so the caller's copy reflects the update without needing
+    # a return value.
+    param($Live, $History)
+    foreach ($key in $Live.Keys) {
+        $e = $Live[$key]
         if ($e.IsSystem) { continue }
-        $pinned = $history.ContainsKey($key) -and [bool]$history[$key].Pinned
-        $autoRestart = $history.ContainsKey($key) -and [bool]$history[$key].AutoRestart
+        $pinned = $History.ContainsKey($key) -and [bool]$History[$key].Pinned
+        $autoRestart = $History.ContainsKey($key) -and [bool]$History[$key].AutoRestart
         if ($e.IsNode -or $pinned -or $autoRestart) {
-            $history[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName; Pinned = $pinned; AutoRestart = $autoRestart; CommandLine = $e.CommandLine }
+            $History[$key] = @{ ProjectPath = $e.ProjectPath; ProcessName = $e.ProcessName; Pinned = $pinned; AutoRestart = $autoRestart; CommandLine = $e.CommandLine }
         }
     }
-    Save-History $history
+    Save-History $History
+}
+
+function Get-RowLanInfo {
+    # A listener bound to a specific address (not the wildcard 0.0.0.0/::)
+    # only answers on localhost, regardless of what else is on the machine -
+    # no LAN entries to build in that case.
+    param([string]$LocalAddr, [string]$Port, $LanIps)
+    if ($LocalAddr -ne '0.0.0.0' -and $LocalAddr -ne '::') {
+        return @{ LanUrls = '(localhost only)'; LanEntries = @() }
+    }
+    $lanEntries = @($LanIps | ForEach-Object {
+        $info = Get-NetworkInterfaceLabel -InterfaceAlias $_.InterfaceAlias
+        [PSCustomObject]@{
+            Label     = $info.Label
+            Url       = "http://$($_.IPAddress):$Port"
+            IsVirtual = $info.IsVirtual
+            SortRank  = $info.SortRank
+        }
+    } | Sort-Object SortRank, Label)
+    $lanUrls = ($lanEntries | ForEach-Object { $_.Url }) -join ', '
+    return @{ LanUrls = $lanUrls; LanEntries = $lanEntries }
+}
+
+function Build-Rows {
+    param([bool]$OnlyNode, [string]$RootDir)
+
+    $rawLive = Get-LiveListeners
+    $history = Load-History
+    $lanIps = @(Get-LanIPv4Addresses)
+
+    $live = Merge-LiveWithHistoryFallback -RawLive $rawLive -History $history
+    Sync-HistoryFromLive -Live $live -History $history
 
     $rows = @()
     $seen = @{}
@@ -1059,22 +1093,7 @@ function Build-Rows {
         if (-not (Test-PathUnderRoot -Path $e.ProjectPath -Root $RootDir)) { continue }
         $seen[$key] = $true
 
-        $lanUrls = ''
-        $lanEntries = @()
-        if ($e.LocalAddr -eq '0.0.0.0' -or $e.LocalAddr -eq '::') {
-            $lanEntries = @($lanIps | ForEach-Object {
-                $info = Get-NetworkInterfaceLabel -InterfaceAlias $_.InterfaceAlias
-                [PSCustomObject]@{
-                    Label     = $info.Label
-                    Url       = "http://$($_.IPAddress):$key"
-                    IsVirtual = $info.IsVirtual
-                    SortRank  = $info.SortRank
-                }
-            } | Sort-Object SortRank, Label)
-            $lanUrls = ($lanEntries | ForEach-Object { $_.Url }) -join ', '
-        } else {
-            $lanUrls = '(localhost only)'
-        }
+        $lan = Get-RowLanInfo -LocalAddr $e.LocalAddr -Port $key -LanIps $lanIps
 
         $nameKey = Get-CustomNameKey -ProjectPath $e.ProjectPath -Port $key
         $customName = if ($script:CustomNames.ContainsKey($nameKey)) { $script:CustomNames[$nameKey] } else { '' }
@@ -1090,8 +1109,8 @@ function Build-Rows {
             Cpu         = $e.CpuPercent
             Mem         = $e.MemMB
             LocalUrl    = "http://localhost:$key"
-            LanUrls     = $lanUrls
-            LanEntries  = $lanEntries
+            LanUrls     = $lan.LanUrls
+            LanEntries  = $lan.LanEntries
             ProjectPath = $e.ProjectPath
             Action      = 'Stop'
             HasLog      = [bool]$managed
@@ -1465,6 +1484,98 @@ function Start-ButtonMorph {
     $Button.Invalidate()
 }
 
+function Get-ButtonRoundedRectPath {
+    # Builds the anti-aliased rounded-rect outline shared by every button
+    # paint state (split-mode and normal) - Region-based clipping has hard,
+    # stair-stepped corners with no anti-aliasing, so this traces the path
+    # by hand instead. Caller owns the returned path and must Dispose it.
+    param([System.Drawing.Rectangle]$Rect, [int]$Radius)
+    $d = [Math]::Min($Radius * 2, [Math]::Min($Rect.Width, $Rect.Height))
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    if ($d -le 0) {
+        $path.AddRectangle($Rect)
+    } else {
+        $path.AddArc($Rect.X, $Rect.Y, $d, $d, 180, 90)
+        $path.AddArc($Rect.Right - $d, $Rect.Y, $d, $d, 270, 90)
+        $path.AddArc($Rect.Right - $d, $Rect.Bottom - $d, $d, $d, 0, 90)
+        $path.AddArc($Rect.X, $Rect.Bottom - $d, $d, $d, 90, 90)
+        $path.CloseFigure()
+    }
+    return $path
+}
+
+function Draw-SplitModeButtonContent {
+    # Two-option pill: left half is a plain "Cancel" tile (an X, no fill
+    # commitment), right half is the actual destructive action (solid
+    # Danger, a check) - same rounded outline as a normal button, just
+    # clipped into two independently-filled halves either side of a thin
+    # divider, so the confirm step reads as "pick one of two buttons"
+    # instead of "click here again".
+    param($Graphics, $Path, [System.Drawing.Rectangle]$Rect, $Tag)
+    $g = $Graphics
+    $midX = $Rect.X + $Rect.Width / 2.0
+    $leftRectF  = New-Object System.Drawing.RectangleF($Rect.X, $Rect.Y, ($midX - $Rect.X), $Rect.Height)
+    $rightRectF = New-Object System.Drawing.RectangleF($midX, $Rect.Y, ($Rect.Right - $midX), $Rect.Height)
+    $leftFill   = if ($Tag.State -eq 'Pressed') { $script:Theme.PanelBg } else { $script:Theme.CardBg }
+
+    $origClip = $g.Clip.Clone()
+    $g.SetClip($Path, [System.Drawing.Drawing2D.CombineMode]::Replace)
+    $g.SetClip($leftRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
+    $leftBrush = New-Object System.Drawing.SolidBrush($leftFill)
+    $g.FillRectangle($leftBrush, $Rect)
+    $leftBrush.Dispose()
+    $g.Clip = $origClip.Clone()
+
+    $g.SetClip($Path, [System.Drawing.Drawing2D.CombineMode]::Replace)
+    $g.SetClip($rightRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
+    $rightBrush = New-Object System.Drawing.SolidBrush($Tag.SplitAccent)
+    $g.FillRectangle($rightBrush, $Rect)
+    $rightBrush.Dispose()
+    $g.Clip = $origClip.Clone()
+    $g.ResetClip()
+
+    $borderPen = New-Object System.Drawing.Pen($Tag.SplitAccent, 1.4)
+    $g.DrawPath($borderPen, $Path)
+    $borderPen.Dispose()
+
+    $dividerColor = [System.Drawing.Color]::FromArgb(100, $script:Theme.Border)
+    $dividerPen = New-Object System.Drawing.Pen($dividerColor, 1.2)
+    $g.DrawLine($dividerPen, $midX, ($Rect.Y + 4), $midX, ($Rect.Bottom - 4))
+    $dividerPen.Dispose()
+
+    $iconSize = 13
+    $leftIconRect  = New-Object System.Drawing.RectangleF(($leftRectF.X + $leftRectF.Width / 2.0 - $iconSize / 2.0), ($Rect.Y + $Rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
+    $rightIconRect = New-Object System.Drawing.RectangleF(($rightRectF.X + $rightRectF.Width / 2.0 - $iconSize / 2.0), ($Rect.Y + $Rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
+    Draw-ToolbarIcon -Graphics $g -Icon 'X' -Rect $leftIconRect -Color $script:Theme.TextPrimary -Alpha 1.0
+    Draw-ToolbarIcon -Graphics $g -Icon 'Check' -Rect $rightIconRect -Color ([System.Drawing.Color]::White) -Alpha 1.0
+}
+
+function Get-ButtonPaintColors {
+    # Resolves the fill/border/text colors for one paint of a non-split-mode
+    # button, given its current owner-drawn state (see Initialize-ModernButton's
+    # $Button.Tag). Disabled wins over everything; a caller-set SolidFill
+    # (used for morphed/pill-style buttons) wins over the normal
+    # state-based Normal/Hover/Pressed palette.
+    param($Tag, [bool]$Enabled, [System.Drawing.Color]$ParentColor)
+    if (-not $Enabled) {
+        $fillColor = $ParentColor
+        $borderColor = $script:Theme.Border
+        $textColor = $script:Theme.TextDim
+    } elseif ($Tag.SolidFill) {
+        $fillColor = $Tag.SolidFill
+        $borderColor = $Tag.SolidFill
+        $textColor = $Tag.Fg
+    } else {
+        $fillColor = if ($Tag.State -eq 'Normal') { $script:Theme.CardBg } else { $Tag.FillActive }
+        $borderColor = if ($Tag.State -eq 'Normal') { $Tag.BorderNormal } else { $Tag.BorderActive }
+        $textColor = $Tag.Fg
+    }
+    if ($null -eq $fillColor) { $fillColor = $script:Theme.CardBg }
+    if ($null -eq $borderColor) { $borderColor = $script:Theme.Border }
+    if ($null -eq $textColor) { $textColor = $script:Theme.TextPrimary }
+    return @{ Fill = $fillColor; Border = $borderColor; Text = $textColor }
+}
+
 function Initialize-ModernButton {
     # Fully owner-drawn button: a Region-based clip would leave hard,
     # stair-stepped corners (Region has no anti-aliasing). Instead this
@@ -1521,92 +1632,26 @@ function Initialize-ModernButton {
         # whileTap={{ scale: 0.98 }}, without disturbing sibling layout.
         $inset = if ($t.State -eq 'Pressed') { 2 } else { 0 }
         $rect = New-Object System.Drawing.Rectangle($inset, $inset, ($s.Width - 1 - 2 * $inset), ($s.Height - 1 - 2 * $inset))
-        $d = [Math]::Min($t.Radius * 2, [Math]::Min($rect.Width, $rect.Height))
-        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        if ($d -le 0) {
-            $path.AddRectangle($rect)
-        } else {
-            $path.AddArc($rect.X, $rect.Y, $d, $d, 180, 90)
-            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 90)
-            $path.AddArc($rect.Right - $d, $rect.Bottom - $d, $d, $d, 0, 90)
-            $path.AddArc($rect.X, $rect.Bottom - $d, $d, $d, 90, 90)
-            $path.CloseFigure()
-        }
+        $path = Get-ButtonRoundedRectPath -Rect $rect -Radius $t.Radius
 
         if ($t.SplitMode) {
-            # Two-option pill: left half is a plain "Cancel" tile (an X, no
-            # fill commitment), right half is the actual destructive action
-            # (solid Danger, a check) - same rounded outline as a normal
-            # button, just clipped into two independently-filled halves
-            # either side of a thin divider, so the confirm step reads as
-            # "pick one of two buttons" instead of "click here again".
-            $midX = $rect.X + $rect.Width / 2.0
-            $leftRectF  = New-Object System.Drawing.RectangleF($rect.X, $rect.Y, ($midX - $rect.X), $rect.Height)
-            $rightRectF = New-Object System.Drawing.RectangleF($midX, $rect.Y, ($rect.Right - $midX), $rect.Height)
-            $leftFill   = if ($t.State -eq 'Pressed') { $script:Theme.PanelBg } else { $script:Theme.CardBg }
-
-            $origClip = $g.Clip.Clone()
-            $g.SetClip($path, [System.Drawing.Drawing2D.CombineMode]::Replace)
-            $g.SetClip($leftRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
-            $leftBrush = New-Object System.Drawing.SolidBrush($leftFill)
-            $g.FillRectangle($leftBrush, $rect)
-            $leftBrush.Dispose()
-            $g.Clip = $origClip.Clone()
-
-            $g.SetClip($path, [System.Drawing.Drawing2D.CombineMode]::Replace)
-            $g.SetClip($rightRectF, [System.Drawing.Drawing2D.CombineMode]::Intersect)
-            $rightBrush = New-Object System.Drawing.SolidBrush($t.SplitAccent)
-            $g.FillRectangle($rightBrush, $rect)
-            $rightBrush.Dispose()
-            $g.Clip = $origClip.Clone()
-            $g.ResetClip()
-
-            $borderPen = New-Object System.Drawing.Pen($t.SplitAccent, 1.4)
-            $g.DrawPath($borderPen, $path)
-            $borderPen.Dispose()
-
-            $dividerColor = [System.Drawing.Color]::FromArgb(100, $script:Theme.Border)
-            $dividerPen = New-Object System.Drawing.Pen($dividerColor, 1.2)
-            $g.DrawLine($dividerPen, $midX, ($rect.Y + 4), $midX, ($rect.Bottom - 4))
-            $dividerPen.Dispose()
-
-            $iconSize = 13
-            $leftIconRect  = New-Object System.Drawing.RectangleF(($leftRectF.X + $leftRectF.Width / 2.0 - $iconSize / 2.0), ($rect.Y + $rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
-            $rightIconRect = New-Object System.Drawing.RectangleF(($rightRectF.X + $rightRectF.Width / 2.0 - $iconSize / 2.0), ($rect.Y + $rect.Height / 2.0 - $iconSize / 2.0), $iconSize, $iconSize)
-            Draw-ToolbarIcon -Graphics $g -Icon 'X' -Rect $leftIconRect -Color $script:Theme.TextPrimary -Alpha 1.0
-            Draw-ToolbarIcon -Graphics $g -Icon 'Check' -Rect $rightIconRect -Color ([System.Drawing.Color]::White) -Alpha 1.0
-
+            Draw-SplitModeButtonContent -Graphics $g -Path $path -Rect $rect -Tag $t
             $path.Dispose()
             return
         }
 
-        if (-not $s.Enabled) {
-            $fillColor = $parentColor
-            $borderColor = $script:Theme.Border
-            $textColor = $script:Theme.TextDim
-        } elseif ($t.SolidFill) {
-            $fillColor = $t.SolidFill
-            $borderColor = $t.SolidFill
-            $textColor = $t.Fg
-        } else {
-            $fillColor = if ($t.State -eq 'Normal') { $script:Theme.CardBg } else { $t.FillActive }
-            $borderColor = if ($t.State -eq 'Normal') { $t.BorderNormal } else { $t.BorderActive }
-            $textColor = $t.Fg
-        }
-        if ($null -eq $fillColor) { $fillColor = $script:Theme.CardBg }
-        if ($null -eq $borderColor) { $borderColor = $script:Theme.Border }
-        if ($null -eq $textColor) { $textColor = $script:Theme.TextPrimary }
+        $colors = Get-ButtonPaintColors -Tag $t -Enabled $s.Enabled -ParentColor $parentColor
 
-        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+        $fillBrush = New-Object System.Drawing.SolidBrush($colors.Fill)
         $g.FillPath($fillBrush, $path)
         $fillBrush.Dispose()
 
-        $borderPen = New-Object System.Drawing.Pen($borderColor, 1.4)
+        $borderPen = New-Object System.Drawing.Pen($colors.Border, 1.4)
         $g.DrawPath($borderPen, $path)
         $borderPen.Dispose()
 
         $contentRect = New-Object System.Drawing.RectangleF($rect.X, $rect.Y, $rect.Width, $rect.Height)
-        Draw-ButtonContent -Graphics $g -Rect $contentRect -Tag $t -Font $s.Font -Color $textColor
+        Draw-ButtonContent -Graphics $g -Rect $contentRect -Tag $t -Font $s.Font -Color $colors.Text
 
         $path.Dispose()
     })
@@ -1978,7 +2023,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.1'
+$script:AppVersion = '1.18.2'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -4417,6 +4462,62 @@ function Show-AppErrorLogViewer {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+function Get-WrappedLabelHeight {
+    # A wrapped Label's .Height is stale until it's been through a real
+    # layout pass (normally means being parented) - AutoSize + MaximumSize
+    # doesn't recompute it just from being constructed, so reading .Height
+    # right after `New-Object` still returns the single-line default even
+    # if the text visibly wraps once shown. Measuring the wrapped text
+    # directly (the same technique used for the Restart column's width -
+    # see New-PortsGrid) sidesteps the timing issue entirely: it's the
+    # real wrapped height, independent of when/whether the label has
+    # actually been parented yet.
+    param([string]$Text, [System.Drawing.Font]$LabelFont, [int]$MaxWidth)
+    $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak
+    return [System.Windows.Forms.TextRenderer]::MeasureText($Text, $LabelFont, (New-Object System.Drawing.Size($MaxWidth, 0)), $flags).Height
+}
+
+function New-DeployFieldRow {
+    # One "wrapping description label, above a value box (optionally with
+    # a Browse... button beside it)" row, used three times in
+    # Show-DeployConfigDialog. The box is positioned via
+    # Get-WrappedLabelHeight rather than a fixed gap, so it always lands
+    # below the label's real wrapped height regardless of theme font.
+    param([string]$LabelText, [int]$Y, [string]$Value, [bool]$Browse, [System.Drawing.Font]$LabelFont, [int]$LabelMaxWidth)
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $LabelText
+    $lbl.AutoSize = $true
+    $lbl.MaximumSize = New-Object System.Drawing.Size($LabelMaxWidth, 0)
+    $lbl.Location = New-Object System.Drawing.Point(15, $Y)
+    $lbl.ForeColor = $script:Theme.TextDim
+    $lbl.Font = $LabelFont
+
+    $boxY = $Y + (Get-WrappedLabelHeight -Text $LabelText -LabelFont $LabelFont -MaxWidth $LabelMaxWidth) + 2
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Text = $Value
+    $box.Location = New-Object System.Drawing.Point(15, $boxY)
+    $box.Size = New-Object System.Drawing.Size(($(if ($Browse) { 405 } else { 495 })), 24)
+    $box.BorderStyle = 'FixedSingle'
+    $box.BackColor = $script:Theme.CardBg
+    $box.ForeColor = $script:Theme.TextPrimary
+
+    $rowResult = @{ Label = $lbl; Box = $box; Browse = $null; Bottom = ($boxY + 24) }
+    if ($Browse) {
+        $browseBtn = New-Object System.Windows.Forms.Button
+        $browseBtn.Text = '...'
+        $browseBtn.Location = New-Object System.Drawing.Point(425, ($boxY - 1))
+        $browseBtn.Size = New-Object System.Drawing.Size(85, 26)
+        $browseBtn.Add_Click({
+            $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+            if ($box.Text) { $fbd.SelectedPath = $box.Text }
+            if ($fbd.ShowDialog() -eq 'OK') { $box.Text = $fbd.SelectedPath }
+        }.GetNewClosure())
+        Initialize-ModernButton -Button $browseBtn
+        $rowResult.Browse = $browseBtn
+    }
+    return $rowResult
+}
+
 function Show-DeployConfigDialog {
     # Add/edit the build+deploy recipe attached to one tracked port -
     # originally written for the Jewelry Store frontend/server split (npm
@@ -4458,73 +4559,22 @@ function Show-DeployConfigDialog {
     # build command runs) - not always this port's..." cut off mid-
     # sentence). Wrapping labels can never clip this way - worst case they
     # just wrap and every control below cascades down to match, via each
-    # row's real measured height instead of a guessed fixed gap.
-    # Label.Height isn't reliable immediately after construction - AutoSize
-    # only actually recomputes it once the control has been through a real
-    # layout pass, which normally means being added to a parent first, and
-    # none of these labels are parented until the single AddRange call at
-    # the end of this dialog. Reading .Height before that still returns
-    # the single-line default regardless of MaximumSize/wrapping, which is
-    # exactly what let a two-line label like "Project folder (where the
-    # build command runs):" get its value box positioned over its own
-    # second line. Measuring the wrapped text directly (same approach as
-    # the Restart column's width fix - see New-PortsGrid) sidesteps the
-    # timing entirely: it computes the real wrapped height up front,
-    # independent of when/whether the label has been parented yet.
-    function Get-WrappedLabelHeight {
-        param([string]$Text, [System.Drawing.Font]$LabelFont)
-        $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak
-        return [System.Windows.Forms.TextRenderer]::MeasureText($Text, $LabelFont, (New-Object System.Drawing.Size($labelMaxWidth, 0)), $flags).Height
-    }
-
-    function New-DeployFieldRow {
-        param([string]$LabelText, [int]$Y, [string]$Value, [bool]$Browse)
-        $lbl = New-Object System.Windows.Forms.Label
-        $lbl.Text = $LabelText
-        $lbl.AutoSize = $true
-        $lbl.MaximumSize = New-Object System.Drawing.Size($labelMaxWidth, 0)
-        $lbl.Location = New-Object System.Drawing.Point(15, $Y)
-        $lbl.ForeColor = $script:Theme.TextDim
-        $lbl.Font = $descFont
-
-        $boxY = $Y + (Get-WrappedLabelHeight -Text $LabelText -LabelFont $descFont) + 2
-        $box = New-Object System.Windows.Forms.TextBox
-        $box.Text = $Value
-        $box.Location = New-Object System.Drawing.Point(15, $boxY)
-        $box.Size = New-Object System.Drawing.Size(($(if ($Browse) { 405 } else { 495 })), 24)
-        $box.BorderStyle = 'FixedSingle'
-        $box.BackColor = $script:Theme.CardBg
-        $box.ForeColor = $script:Theme.TextPrimary
-
-        $rowResult = @{ Label = $lbl; Box = $box; Browse = $null; Bottom = ($boxY + 24) }
-        if ($Browse) {
-            $browseBtn = New-Object System.Windows.Forms.Button
-            $browseBtn.Text = '...'
-            $browseBtn.Location = New-Object System.Drawing.Point(425, ($boxY - 1))
-            $browseBtn.Size = New-Object System.Drawing.Size(85, 26)
-            $browseBtn.Add_Click({
-                $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
-                if ($box.Text) { $fbd.SelectedPath = $box.Text }
-                if ($fbd.ShowDialog() -eq 'OK') { $box.Text = $fbd.SelectedPath }
-            }.GetNewClosure())
-            Initialize-ModernButton -Button $browseBtn
-            $rowResult.Browse = $browseBtn
-        }
-        return $rowResult
-    }
+    # row's real measured height instead of a guessed fixed gap. See
+    # Get-WrappedLabelHeight/New-DeployFieldRow above for why the row
+    # boxes are positioned by measuring rather than trusting .Height.
 
     $defaultWorkingDir = if ($existing.WorkingDir) { $existing.WorkingDir } else { $ProjectPath }
     $defaultBuild = if ($existing.BuildCommand) { $existing.BuildCommand } else { 'npm run build' }
     $defaultSource = if ($existing.SourceDir) { $existing.SourceDir } else { Join-Path $defaultWorkingDir 'dist' }
 
     $y = 12
-    $workDirRow = New-DeployFieldRow -LabelText 'Project folder (where the build command runs):' -Y $y -Value $defaultWorkingDir -Browse $true
+    $workDirRow = New-DeployFieldRow -LabelText 'Project folder (where the build command runs):' -Y $y -Value $defaultWorkingDir -Browse $true -LabelFont $descFont -LabelMaxWidth $labelMaxWidth
     $y = $workDirRow.Bottom + 16
 
-    $buildRow = New-DeployFieldRow -LabelText 'Build command:' -Y $y -Value $defaultBuild -Browse $false
+    $buildRow = New-DeployFieldRow -LabelText 'Build command:' -Y $y -Value $defaultBuild -Browse $false -LabelFont $descFont -LabelMaxWidth $labelMaxWidth
     $y = $buildRow.Bottom + 16
 
-    $sourceRow = New-DeployFieldRow -LabelText 'Build output folder (source):' -Y $y -Value $defaultSource -Browse $true
+    $sourceRow = New-DeployFieldRow -LabelText 'Build output folder (source):' -Y $y -Value $defaultSource -Browse $true -LabelFont $descFont -LabelMaxWidth $labelMaxWidth
     $y = $sourceRow.Bottom + 16
 
     $targetsLbl = New-Object System.Windows.Forms.Label
@@ -4534,7 +4584,7 @@ function Show-DeployConfigDialog {
     $targetsLbl.Location = New-Object System.Drawing.Point(15, $y)
     $targetsLbl.ForeColor = $script:Theme.TextDim
     $targetsLbl.Font = $descFont
-    $y += (Get-WrappedLabelHeight -Text $targetsLbl.Text -LabelFont $descFont) + 2
+    $y += (Get-WrappedLabelHeight -Text $targetsLbl.Text -LabelFont $descFont -MaxWidth $labelMaxWidth) + 2
 
     $targetsList = New-Object System.Windows.Forms.ListBox
     $targetsList.Location = New-Object System.Drawing.Point(15, $y)
@@ -5085,18 +5135,13 @@ function Show-DeployManagerDialog {
     $dlg.ShowDialog($form) | Out-Null
 }
 
-function Show-RowDetail {
-    # Sticky-note style: compact, appears right at the click point, and
-    # nothing in the body is a clickable/editable control except the copy
-    # icon buttons - values are plain Labels (not TextBoxes) so there's
-    # nothing to accidentally focus/select/edit. Each Network URL gets its
-    # own row labeled by adapter ("Ethernet", "Tailscale", "VMware", ...);
-    # rows for a virtual (VM-only) adapter are tinted purple so it reads
-    # clearly as "not a real LAN/Tailnet address."
-    param($Data, [System.Drawing.Point]$ScreenPoint)
-
-    $label = if ($Data.CustomName) { $Data.CustomName } elseif ($Data.ProjectPath) { Split-Path -Leaf $Data.ProjectPath } else { "Port $($Data.Port)" }
-
+function Get-RowDetailFields {
+    # What to show in the Detail popup, and in what order - kept separate
+    # from the actual panel/control layout in Show-RowDetail below, since
+    # this part is pure data shaping (no WinForms objects touched at all):
+    # given a row, decide which fields exist and what their display value
+    # is.
+    param($Data)
     $fields = @()
 
     # Auto-restart only makes sense for a real project (Start-ProjectAtPath
@@ -5143,6 +5188,22 @@ function Show-RowDetail {
     if ($Data.CommandLine) {
         $fields += @{ Label = 'Command'; Value = [string]$Data.CommandLine; IsVirtual = $false }
     }
+
+    return $fields
+}
+
+function Show-RowDetail {
+    # Sticky-note style: compact, appears right at the click point, and
+    # nothing in the body is a clickable/editable control except the copy
+    # icon buttons - values are plain Labels (not TextBoxes) so there's
+    # nothing to accidentally focus/select/edit. Each Network URL gets its
+    # own row labeled by adapter ("Ethernet", "Tailscale", "VMware", ...);
+    # rows for a virtual (VM-only) adapter are tinted purple so it reads
+    # clearly as "not a real LAN/Tailnet address."
+    param($Data, [System.Drawing.Point]$ScreenPoint)
+
+    $label = if ($Data.CustomName) { $Data.CustomName } elseif ($Data.ProjectPath) { Split-Path -Leaf $Data.ProjectPath } else { "Port $($Data.Port)" }
+    $fields = Get-RowDetailFields -Data $Data
 
     $rowHeight = 28
     $topMargin = 8

@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.2] - 2026-08-02
+
+### Changed
+- No user-facing changes - internal readability cleanup from a tech-debt
+  pass on the largest/most complex functions in the file:
+  - `Build-Rows` (137 lines) split into itself plus
+    `Merge-LiveWithHistoryFallback`, `Sync-HistoryFromLive`, and
+    `Get-RowLanInfo` - the pure data-merging/filtering steps, now
+    independently named and readable apart from the row-building loops.
+  - `Initialize-ModernButton` (146 lines) split into itself plus
+    `Get-ButtonRoundedRectPath`, `Draw-SplitModeButtonContent`, and
+    `Get-ButtonPaintColors` - the paint-state logic shared by every
+    button in the app, previously all inlined in one paint handler.
+  - `Show-RowDetail`'s field list construction (which fields to show,
+    and their display value - pure data shaping, no WinForms touched)
+    is now its own `Get-RowDetailFields`, separate from the popup's
+    actual panel/control layout.
+  - `Show-DeployConfigDialog`'s two already-isolated nested helpers
+    (`Get-WrappedLabelHeight`, `New-DeployFieldRow`) are now top-level
+    functions with explicit parameters instead of closures, so they no
+    longer count toward - or implicitly depend on - the dialog
+    function's own local state.
+
 ## [1.18.1] - 2026-08-02
 
 ### Fixed
