@@ -2174,7 +2174,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.4'
+$script:AppVersion = '1.18.5'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2492,7 +2492,14 @@ function New-ActionBusyIndicator {
         $parentColor = if ($s.Parent) { $s.Parent.BackColor } else { $script:Theme.WindowBg }
         $g.Clear($parentColor)
 
-        $size = [Math]::Min($s.Width, $s.Height)
+        # -1 matters: without it, a container sized to exactly match the
+        # ring (23x23, same as New-DashboardPill's own control) produces a
+        # path whose bottom/right edge sits at pixel 23 - one past the
+        # last valid column/row (0-22) - so the 1px pen stroke along that
+        # edge gets clipped at the control boundary, leaving only the
+        # top/left of the ring visible. Same -1 New-DashboardPill already
+        # uses for exactly this reason.
+        $size = [Math]::Min($s.Width, $s.Height) - 1
         $rect = New-Object System.Drawing.Rectangle((($s.Width - $size) / 2), (($s.Height - $size) / 2), $size, $size)
         $d = $rect.Height
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -4544,7 +4551,33 @@ function Show-AppErrorLogViewer {
     $filterBox.BackColor = $script:Theme.CardBg
     $filterBox.ForeColor = $script:Theme.TextPrimary
 
-    [System.Windows.Forms.Control[]]$filterControls = @($filterLbl, $filterBox)
+    $projectLbl = New-Object System.Windows.Forms.Label
+    $projectLbl.Text = 'Project:'
+    $projectLbl.Location = New-Object System.Drawing.Point(386, 12)
+    $projectLbl.Size = New-Object System.Drawing.Size(55, 20)
+    $projectLbl.ForeColor = $script:Theme.TextDim
+
+    # Log entries never use a project's Custom Name - only whichever of
+    # Split-Path -Leaf $ProjectPath (crash/failed-start messages), the
+    # full $ProjectPath (several other Write-AppErrorLog call sites), or
+    # a bare "port <n>" (Test-PortCollision's taskkill context) a given
+    # call site happened to pass. Each dropdown entry below carries all
+    # three, and a selection matches if a log entry contains *any* of
+    # them - not just the friendly name shown in the grid, which often
+    # isn't literally present in the log text at all.
+    $projectCombo = New-Object System.Windows.Forms.ComboBox
+    $projectCombo.Location = New-Object System.Drawing.Point(444, 8)
+    $projectCombo.Size = New-Object System.Drawing.Size(210, 24)
+    $projectCombo.DropDownStyle = 'DropDownList'
+    $projectCombo.FlatStyle = 'Flat'
+    $projectCombo.BackColor = $script:Theme.CardBg
+    $projectCombo.ForeColor = $script:Theme.TextPrimary
+    $projectCombo.DisplayMember = 'Display'
+    [void]$projectCombo.Items.Add([PSCustomObject]@{ Display = 'All Projects'; FolderName = $null; ProjectPathText = $null; Port = $null })
+    foreach ($p in (Get-KnownProjectLogFilters)) { [void]$projectCombo.Items.Add($p) }
+    $projectCombo.SelectedIndex = 0
+
+    [System.Windows.Forms.Control[]]$filterControls = @($filterLbl, $filterBox, $projectLbl, $projectCombo)
     $filterPanel.Controls.AddRange($filterControls)
 
     $countLbl = New-Object System.Windows.Forms.Label
@@ -4633,21 +4666,24 @@ function Show-AppErrorLogViewer {
             try { $text = Get-Content -Path $script:AppLogPath -Raw -ErrorAction Stop } catch {}
         }
         $filter = $filterBox.Text.Trim()
-        $sig = "$filter|$text"
+        $selectedProject = if ($projectCombo.SelectedIndex -gt 0) { $projectCombo.SelectedItem } else { $null }
+        $sig = "$filter|$($selectedProject.ProjectPathText)|$text"
         if ($sig -eq $state.Signature) { return }
         $state.Signature = $sig
 
         $allEntries = if ($text) { @(Get-AppLogEntries -Text $text) } else { @() }
-        $shownEntries = if ($filter) {
-            @($allEntries | Where-Object { $_.Header -like "*$filter*" -or ($_.Details -join "`n") -like "*$filter*" })
-        } else {
-            $allEntries
+        $shownEntries = $allEntries
+        if ($selectedProject) {
+            $shownEntries = @($shownEntries | Where-Object { Test-LogEntryMatchesProject -Entry $_ -Project $selectedProject })
+        }
+        if ($filter) {
+            $shownEntries = @($shownEntries | Where-Object { $_.Header -like "*$filter*" -or ($_.Details -join "`n") -like "*$filter*" })
         }
 
         if ($allEntries.Count -eq 0) {
             $countLbl.Text = "$script:AppLogPath"
-        } elseif ($filter) {
-            $countLbl.Text = "$($shownEntries.Count) of $($allEntries.Count) entries match `"$filter`""
+        } elseif ($filter -or $selectedProject) {
+            $countLbl.Text = "$($shownEntries.Count) of $($allEntries.Count) entries match"
         } else {
             $stats = Get-AppErrorLogStats
             $countLbl.Text = "$($allEntries.Count) entr$(if ($allEntries.Count -eq 1) {'y'} else {'ies'}) - last: $($stats.LastText)"
@@ -4661,6 +4697,10 @@ function Show-AppErrorLogViewer {
             $rtb.SelectionFont = $bodyFont
             $emptyMessage = if ($allEntries.Count -eq 0) {
                 'No errors logged. Startup failures, unhandled exceptions, and dev-server crashes will show up here automatically.'
+            } elseif ($filter -and $selectedProject) {
+                "No entries for $($selectedProject.Display) match `"$filter`"."
+            } elseif ($selectedProject) {
+                "No logged entries mention $($selectedProject.Display)."
             } else {
                 "No entries match `"$filter`"."
             }
@@ -4687,6 +4727,7 @@ function Show-AppErrorLogViewer {
     Update-AppLogText
 
     $filterBox.Add_TextChanged({ Update-AppLogText })
+    $projectCombo.Add_SelectedIndexChanged({ Update-AppLogText })
 
     $clearButton.Add_Click({
         $confirm = [System.Windows.Forms.MessageBox]::Show('Clear the error log? This cannot be undone.', 'Clear Log', 'YesNo', 'Warning')
@@ -6540,6 +6581,52 @@ function Get-KnownProjects {
         }
     }
     return $projects | Sort-Object Label
+}
+
+function Get-KnownProjectLogFilters {
+    # For the Error & Crash Log's Project dropdown - a separate shape from
+    # Get-KnownProjects above (used by Manage Groups) because log entries
+    # never contain a project's Custom Name, only whichever of
+    # Split-Path -Leaf $ProjectPath, the full $ProjectPath, or a bare
+    # "port <n>" the Write-AppErrorLog call site that logged it happened
+    # to use. Display still shows the friendly Custom Name (or folder
+    # name) so the dropdown itself is recognizable - only the match
+    # terms behind it need to be the literal text log entries contain.
+    $allRows = @(Build-Rows -OnlyNode $false -RootDir '')
+    $seen = @{}
+    $result = @()
+    foreach ($r in $allRows) {
+        if (-not $r.ProjectPath) { continue }
+        $key = Get-NormalizedPath $r.ProjectPath
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $folderName = Split-Path -Leaf $r.ProjectPath
+        $niceName = if ($r.CustomName) { $r.CustomName } else { $folderName }
+        $result += [PSCustomObject]@{
+            Display         = "$niceName (port $($r.Port))"
+            FolderName      = $folderName
+            ProjectPathText = $r.ProjectPath
+            Port            = [string]$r.Port
+        }
+    }
+    return $result | Sort-Object Display
+}
+
+function Test-LogEntryMatchesProject {
+    # True if a Get-AppLogEntries-shaped entry's combined header+details
+    # text contains any of the given project's known identifying strings
+    # (folder name, full path, or "port <n>") - see
+    # Get-KnownProjectLogFilters for why a single one isn't enough:
+    # different Write-AppErrorLog call sites log different strings for
+    # the same project, and none of them are ever the project's Custom
+    # Name. $Project = $null (the "All Projects" dropdown entry) always
+    # matches.
+    param($Entry, $Project)
+    if (-not $Project) { return $true }
+    $combined = "$($Entry.Header)`n$($Entry.Details -join "`n")"
+    $terms = @($Project.FolderName, $Project.ProjectPathText, "port $($Project.Port)") | Where-Object { $_ }
+    foreach ($t in $terms) { if ($combined -like "*$t*") { return $true } }
+    return $false
 }
 
 function Set-GroupPortsPinned {

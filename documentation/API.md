@@ -385,6 +385,28 @@ unhandled UI-thread exceptions get logged automatically, plus called
 directly at specific failure points (a failed launch, a taskkill
 timeout, ...) for better context than a bare unhandled-exception trace.
 
+### `Get-KnownProjectLogFilters`
+For `Show-AppErrorLogViewer`'s **Project** dropdown - a different shape
+from `Get-KnownProjects` above (that one's for Manage Groups) because log
+entries never contain a project's Custom Name, only whichever of
+`Split-Path -Leaf $ProjectPath`, the full `$ProjectPath`, or a bare
+`"port <n>"` the `Write-AppErrorLog` call site that logged it happened to
+use. Returns one `[PSCustomObject]@{ Display; FolderName;
+ProjectPathText; Port }` per distinct known project - `Display` is the
+friendly Custom-Name-or-folder-name shown in the dropdown itself, the
+other three are the literal strings `Test-LogEntryMatchesProject` checks
+a log entry against.
+
+### `Test-LogEntryMatchesProject -Entry <object> -Project <object>`
+`$true` if a `Get-AppLogEntries`-shaped entry's combined header+details
+text contains *any* of `$Project`'s `FolderName`/`ProjectPathText`/`Port`
+(not all three - different call sites log different ones for the same
+project). `$Project = $null` (the "All Projects" dropdown entry) always
+matches. Pure/parameter-driven, covered by
+`tests\PureLogic.Tests.ps1` - including a case proving a Custom Name
+alone would *not* match, which is exactly why this doesn't just filter
+on `Display`.
+
 ## GUI wiring (not really an "API", but referenced elsewhere in these docs)
 
 - `Refresh-Grid` / `Render-Grid -Grid <control> -Display <array>` —

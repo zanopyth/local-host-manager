@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.5] - 2026-08-04
+
+### Added
+- Error & Crash Log viewer (Settings ▸ Preferences ▸ Diagnostics ▸ View
+  Log) gets a **Project** dropdown next to the existing free-text
+  Filter, listing every known project/port so you can narrow the log
+  to just one without typing its exact name. Matches whatever a given
+  entry actually contains - the project's folder name, its full path,
+  or a bare "port N" - rather than its Custom Name, since log entries
+  never use that (confirmed with a real example: "Jewerly" the custom
+  name isn't a substring of "jewelry-store-server" the actual folder,
+  so a naive name-based filter would have silently never matched that
+  project's own crash entries).
+
+### Fixed
+- The busy-light indicator (blinks red/green during a Start/Stop/
+  Restart action) only showed its top-left edge instead of the whole
+  ring - its drawn path extended to pixel 23 in a 23px-wide control,
+  one past the last valid pixel column, so the bottom/right of the
+  stroke was clipped at the control boundary. Inset by 1px, matching
+  the dashboard status dot's own already-correct approach.
+
 ## [1.18.4] - 2026-08-03
 
 ### Added

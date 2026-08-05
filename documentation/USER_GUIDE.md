@@ -283,7 +283,12 @@ offer to do for you.
   changes apply immediately, no restart needed).
 - **Diagnostics** — the Error & Crash Log viewer, for everything logged
   via `Write-AppErrorLog` (failed launches, taskkill timeouts, unhandled
-  UI exceptions, ...).
+  UI exceptions, ...). Besides the free-text **Filter** box, a
+  **Project** dropdown lists every known project/port so you can narrow
+  the log to just one without typing its exact name — matches whatever a
+  given entry actually contains (the project's folder name, its full
+  path, or a bare "port N"), not its Custom Name, since log entries never
+  use that.
 
 ## Groups
 

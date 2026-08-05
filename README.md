@@ -4,8 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A small Windows tray app that scans your machine for running `localhost` dev
-servers (npm/node projects), shows their status, LAN URLs, and lets you
-start/stop them individually or in named groups — all without a config file.
+servers (npm/node projects), shows their status, resource usage, and
+health, and lets you start/stop/restart/deploy them individually or in
+named groups — all without a config file.
 
 ![Localhost Manager preview](preview.png)
 

@@ -48,7 +48,8 @@ foreach ($source in (Get-PureFunctionSource -Names @(
     'Get-NetworkInterfaceLabel',
     'Get-RowLanInfo',
     'Merge-LiveWithHistoryFallback',
-    'Get-SearchFilteredDisplay'
+    'Get-SearchFilteredDisplay',
+    'Test-LogEntryMatchesProject'
 ))) {
     . ([scriptblock]::Create($source))
 }
@@ -269,4 +270,53 @@ Describe 'Get-SearchFilteredDisplay' {
         @(Get-SearchFilteredDisplay -Display $sampleDisplay).Count | Should Be 0
     }
     $script:SearchFilter = ''
+}
+
+Describe 'Test-LogEntryMatchesProject' {
+    # A real project's identifying strings, matching what
+    # Get-KnownProjectLogFilters would build - Write-AppErrorLog call
+    # sites use the raw folder name or full path, never the Custom Name
+    # ("Body-Shop"), which is exactly the bug this function exists to
+    # work around.
+    $project = [PSCustomObject]@{
+        Display         = 'Body-Shop (port 5100)'
+        FolderName       = 'body-shop-server'
+        ProjectPathText = 'C:\Users\Gaming\Documents\Body Shop\body-shop-server'
+        Port            = '5100'
+    }
+
+    It 'always matches when Project is $null (All Projects)' {
+        $entry = [PSCustomObject]@{ Header = 'anything at all'; Details = @() }
+        Test-LogEntryMatchesProject -Entry $entry -Project $null | Should Be $true
+    }
+    It 'matches a crash entry that only contains the raw folder name' {
+        $entry = [PSCustomObject]@{ Header = '[2026-07-29 23:31:44] Project crashed: body-shop-server (exit code -1)'; Details = @() }
+        Test-LogEntryMatchesProject -Entry $entry -Project $project | Should Be $true
+    }
+    It 'does NOT match on the Custom Name alone (the actual bug this exists to avoid)' {
+        # "Jewerly" (a real custom name typo in this app) vs. the real
+        # folder "jewelry-store-server" - deliberately not a substring of
+        # each other, unlike "Body-Shop"/"body-shop-server" which
+        # coincidentally overlap and would mask this exact failure mode.
+        $jewelryProject = [PSCustomObject]@{
+            Display         = 'Jewerly (port 5200)'
+            FolderName       = 'jewelry-store-server'
+            ProjectPathText = 'C:\Users\Gaming\Documents\Jewelry Store\jewelry-store-server'
+            Port            = '5200'
+        }
+        $entry = [PSCustomObject]@{ Header = 'Project crashed: Jewerly (exit code 1)'; Details = @() }
+        Test-LogEntryMatchesProject -Entry $entry -Project $jewelryProject | Should Be $false
+    }
+    It 'matches an entry that only contains the full project path' {
+        $entry = [PSCustomObject]@{ Header = 'Failed to start project:'; Details = @('C:\Users\Gaming\Documents\Body Shop\body-shop-server') }
+        Test-LogEntryMatchesProject -Entry $entry -Project $project | Should Be $true
+    }
+    It 'matches an entry that only contains "port <n>"' {
+        $entry = [PSCustomObject]@{ Header = "taskkill did not finish within 3000ms for PID 1234 (port 5100)"; Details = @() }
+        Test-LogEntryMatchesProject -Entry $entry -Project $project | Should Be $true
+    }
+    It 'does not match an unrelated entry' {
+        $entry = [PSCustomObject]@{ Header = 'Project crashed: Full-Stack (exit code 1)'; Details = @() }
+        Test-LogEntryMatchesProject -Entry $entry -Project $project | Should Be $false
+    }
 }

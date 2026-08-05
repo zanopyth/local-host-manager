@@ -1,9 +1,9 @@
 # Localhost Manager
 
 A small Windows tray app that scans your machine for running `localhost`
-dev servers (npm/node projects), shows their status, resource usage, and
-URLs, and lets you start/stop/restart/deploy them individually or in named
-groups — with no config file to hand-maintain.
+dev servers (npm/node projects), shows their status, resource usage,
+health, and URLs, and lets you start/stop/restart/deploy them individually
+or in named groups — with no config file to hand-maintain.
 
 Repo: https://github.com/zanopyth/local-host-manager
 Latest release: https://github.com/zanopyth/local-host-manager/releases
