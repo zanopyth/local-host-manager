@@ -177,6 +177,28 @@ selection overrides this toggle entirely (and the root-directory scope,
 too) — a project you've manually put in a group stays visible even if it
 wouldn't otherwise pass the Dev Servers Only filter.
 
+## Framework compatibility
+
+Detection doesn't care what framework you're running — only that it's a
+Node process with a `package.json` in its resolved working directory
+that's listening on a TCP port. That's a very low bar: Express, Fastify,
+NestJS, Koa, Hapi, a plain `http.createServer`, a server built with
+Effect.js (via `@effect/platform-node` or similar) — all of them are just
+a Node process with that same shape under the hood, so they're all
+detected, tracked, and shown the same way (same working-directory
+recovery, same CPU/RAM columns, same health check). There's no
+per-framework special-casing anywhere in the app, and nothing to
+configure — if it's `node <something>` with a `package.json` next to it,
+it works.
+
+One thing worth knowing that isn't specific to any framework: some
+servers bind to the IPv6 loopback (`::1`) instead of `127.0.0.1` when
+`.listen()` is called with `"localhost"` as the host — Vite's dev server
+is a common example. **Health check** already accounts for this by
+probing whichever address the listener actually bound to rather than
+assuming IPv4, so it's a non-issue regardless of framework — see
+**Health check** above.
+
 ## Row detail (right-click)
 
 Right-click any row (Live or History) for a **Detail...** menu. It opens a

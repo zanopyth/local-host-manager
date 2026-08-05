@@ -20,6 +20,49 @@ Grab the latest `LocalhostManager.exe` from the
 - Auto-detects running npm/node dev servers by port, recovering each
   project's real working directory even when the command line alone
   doesn't show it (e.g. `npm start`)
+- Start/Stop from the grid, the tray icon's right-click menu, or in bulk
+  via named **groups** (e.g. "frontend + backend + db"). Group membership
+  defaults to Node/dev-server ports; a "Show all listening ports" checkbox
+  in **Manage Groups** reveals every open port (Python, Docker, etc.) so
+  non-Node processes can be grouped too
+- **Build & Deploy** — a per-project build-then-mirror-to-target(s)
+  recipe, run from a live shell view with its own Stop button, from a
+  toolbar button or a row's Detail popup
+- **Web dashboard** (new in v1.6, opt-in — off until you enable it from the
+  **Dashboard** menu): a browser view of the same table at
+  `http://localhost:3199` (port configurable), with click-to-confirm
+  Stop/Start/Restart, per-adapter clickable LAN/Tailscale links, and a
+  live status pill in the toolbar showing whether it's running
+- **Local Domains** (new in v1.11, opt-in — off until you enable it from
+  the **Local Domains** menu): a reverse proxy that gives each running
+  project a friendly address, e.g. `http://bodyshop.localhost:2802/`
+  instead of a raw port - routed by hostname to whatever port that project
+  is actually on. Browser-only (Chrome/Edge/Firefox resolve `*.localhost`
+  to loopback themselves; curl/Postman/etc. can't). One-time setup, shown
+  in the dialog with a Copy button
+- **Health check** (opt-in, Settings ▸ Preferences): a bound port doesn't
+  prove the app behind it is actually working — a hung server still
+  holds the socket. A lightweight probe against each running project
+  catches that case and shows it ON in amber instead of green, correctly
+  matching whichever address family a project actually bound to (some
+  dev servers, Vite included, bind to the IPv6 loopback rather than
+  `127.0.0.1`)
+- **Auto Crash Restart** — opt in per project from its Detail popup to
+  relaunch automatically on an unexpected exit, capped at a configurable
+  attempts/window pair so a genuinely broken project doesn't retry forever
+- **Pin** a port to keep its entry (and Restart button) around after it
+  stops, instead of it disappearing once nothing's listening — works for
+  non-Node processes too
+- Custom names, root-directory scoping, and a tray icon that turns red
+  when something in your tracked set goes down
+- Shows local + LAN URLs so you can share a dev server on your network
+- Right-click any row for a compact **Detail** popup — every column's full
+  value with a one-click copy button, network addresses broken out one per
+  adapter (`Ethernet`, `Tailscale`, `VMware`, ...) and virtual/VM-only
+  adapters flagged in purple so you don't mistake one for a real LAN address
+- Single-instance protection — launching the app while it's already
+  running just shows a message instead of opening a duplicate window
+- Runs from the tray — closing the window just hides it
 - **CPU and RAM columns** per running process, right in the grid - see
   which of your dev servers is actually busy without alt-tabbing to Task
   Manager (100% = one full core busy, so a single-threaded server maxing
@@ -34,54 +77,11 @@ Grab the latest `LocalhostManager.exe` from the
   stay in sync across tabs. The Restart and Stop/Start columns stay a
   fixed size at the right edge, since they're click targets rather than
   information to rebalance
-- Shows local + LAN URLs so you can share a dev server on your network
-- Right-click any row for a compact **Detail** popup — every column's full
-  value with a one-click copy button, network addresses broken out one per
-  adapter (`Ethernet`, `Tailscale`, `VMware`, ...) and virtual/VM-only
-  adapters flagged in purple so you don't mistake one for a real LAN address
-- Start/Stop from the grid, the tray icon's right-click menu, or in bulk
-  via named **groups** (e.g. "frontend + backend + db"). Group membership
-  defaults to Node/dev-server ports; a "Show all listening ports" checkbox
-  in **Manage Groups** reveals every open port (Python, Docker, etc.) so
-  non-Node processes can be grouped too
-- Custom names, root-directory scoping, and a tray icon that turns red
-  when something in your tracked set goes down
 - **Search/filter box** in the toolbar — narrows the table to rows whose
   name, process, port, or project path match what you type, live as you
   type. Local to the window only; never affects what the web dashboard
   or Local Domains proxy see
-- **Health check** (opt-in, Settings ▸ Preferences): a bound port doesn't
-  prove the app behind it is actually working — a hung server still
-  holds the socket. A lightweight probe against each running project
-  catches that case and shows it ON in amber instead of green, correctly
-  matching whichever address family a project actually bound to (some
-  dev servers, Vite included, bind to the IPv6 loopback rather than
-  `127.0.0.1`)
-- **Pin** a port to keep its entry (and Restart button) around after it
-  stops, instead of it disappearing once nothing's listening — works for
-  non-Node processes too
-- **Auto Crash Restart** — opt in per project from its Detail popup to
-  relaunch automatically on an unexpected exit, capped at a configurable
-  attempts/window pair so a genuinely broken project doesn't retry forever
-- **Build & Deploy** — a per-project build-then-mirror-to-target(s)
-  recipe, run from a live shell view with its own Stop button, from a
-  toolbar button or a row's Detail popup
 - **Themes** — Light, Dark, and a Catppuccin-Mocha-inspired Terminal theme
-- Runs from the tray — closing the window just hides it
-- **Web dashboard** (new in v1.6, opt-in — off until you enable it from the
-  **Dashboard** menu): a browser view of the same table at
-  `http://localhost:3199` (port configurable), with click-to-confirm
-  Stop/Start/Restart, per-adapter clickable LAN/Tailscale links, and a
-  live status pill in the toolbar showing whether it's running
-- Single-instance protection — launching the app while it's already
-  running just shows a message instead of opening a duplicate window
-- **Local Domains** (new in v1.11, opt-in — off until you enable it from
-  the **Local Domains** menu): a reverse proxy that gives each running
-  project a friendly address, e.g. `http://bodyshop.localhost:2802/`
-  instead of a raw port - routed by hostname to whatever port that project
-  is actually on. Browser-only (Chrome/Edge/Firefox resolve `*.localhost`
-  to loopback themselves; curl/Postman/etc. can't). One-time setup, shown
-  in the dialog with a Copy button
 
 ## Local Domains
 
