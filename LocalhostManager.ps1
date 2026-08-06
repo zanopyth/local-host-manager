@@ -2174,7 +2174,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.5'
+$script:AppVersion = '1.18.6'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -4875,7 +4875,76 @@ function Show-DeployConfigDialog {
     $targetsList.BorderStyle = 'FixedSingle'
     $targetsList.BackColor = $script:Theme.CardBg
     $targetsList.ForeColor = $script:Theme.TextPrimary
+    # A full deploy target is almost always wider than the box - a plain
+    # ListBox just truncates it with no way to read the rest. Horizontal
+    # scrolling handles that, but OwnerDrawFixed (below, for the
+    # selection-color fix) makes WinForms stop auto-measuring text width
+    # for the scrollbar's extent - Update-TargetsListExtent recomputes it
+    # by hand from the widest item, called on load and after every
+    # Add/Remove.
+    $targetsList.HorizontalScrollbar = $true
+    $targetsList.DrawMode = 'OwnerDrawFixed'
+    # Native ListBox selection is the OS's SystemColors.Highlight/
+    # HighlightText - a bright system blue that never adapts to this
+    # app's Dark/Terminal themes and reads poorly against them. Owner-draw
+    # instead, using the same AccentTint-fill/Accent-text combination
+    # already used for a selected DataGridView cell elsewhere in this
+    # file (e.g. the Pin column), so it's readable in every theme and
+    # looks like the rest of the app instead of a native control.
+    $targetsList.Add_DrawItem({
+        param($s, $e)
+        if ($e.Index -lt 0) { return }
+        $isSelected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        $bg = if ($isSelected) { $script:Theme.AccentTint } else { $script:Theme.CardBg }
+        $fg = if ($isSelected) { $script:Theme.Accent } else { $script:Theme.TextPrimary }
+        $bgBrush = New-Object System.Drawing.SolidBrush($bg)
+        $e.Graphics.FillRectangle($bgBrush, $e.Bounds)
+        $bgBrush.Dispose()
+        $text = $s.Items[$e.Index].ToString()
+        $textRect = New-Object System.Drawing.Rectangle(($e.Bounds.X + 4), $e.Bounds.Y, [Math]::Max(1, $e.Bounds.Width - 4), $e.Bounds.Height)
+        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::NoClipping
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $e.Font, $textRect, $fg, $flags)
+    })
+
+    function Update-TargetsListExtent {
+        $widest = 0
+        foreach ($item in $targetsList.Items) {
+            $w = [System.Windows.Forms.TextRenderer]::MeasureText([string]$item, $targetsList.Font).Width
+            if ($w -gt $widest) { $widest = $w }
+        }
+        $targetsList.HorizontalExtent = $widest + 8
+    }
+
+    # Hover tooltip is a shortcut for reading a long path without having
+    # to scroll - IndexFromPoint plus a "did the hovered row actually
+    # change" guard, since re-calling SetToolTip on every pixel of mouse
+    # movement over the same row makes it flicker instead of just showing.
+    $targetsListTip = New-Object System.Windows.Forms.ToolTip
+    $targetsListTip.InitialDelay = 300
+    $targetsListTip.AutoPopDelay = 8000
+    # An object, not a bare variable - same reason as $state in
+    # Show-AppErrorLogViewer: a GetNewClosure()'d handler can't reassign a
+    # plain outer variable in a way the other handler below would ever
+    # see, only mutate a shared object's property.
+    $targetsHoverState = [PSCustomObject]@{ Index = -1 }
+    $targetsList.Add_MouseMove({
+        param($s, $e)
+        $idx = $s.IndexFromPoint($e.Location)
+        if ($idx -eq $targetsHoverState.Index) { return }
+        $targetsHoverState.Index = $idx
+        # If/else can't be inlined as a direct .NET method argument here -
+        # (if (...) {...} else {...}) passed straight into SetToolTip(...)
+        # parses "if" as a literal command name to invoke, not an
+        # if-expression, and throws "The term 'if' is not recognized" at
+        # runtime the first time the mouse moves over the list. Assigning
+        # the result to a variable first sidesteps the ambiguity.
+        $tipText = if ($idx -ge 0) { [string]$s.Items[$idx] } else { '' }
+        $targetsListTip.SetToolTip($s, $tipText)
+    }.GetNewClosure())
+    $targetsList.Add_MouseLeave({ $targetsHoverState.Index = -1 }.GetNewClosure())
+
     foreach ($t in @($existing.TargetDirs)) { if ($t) { [void]$targetsList.Items.Add($t) } }
+    Update-TargetsListExtent
 
     $addTargetBtn = New-Object System.Windows.Forms.Button
     $addTargetBtn.Text = 'Add...'
@@ -4885,6 +4954,7 @@ function Show-DeployConfigDialog {
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
         if ($fbd.ShowDialog() -eq 'OK' -and $fbd.SelectedPath -notin $targetsList.Items) {
             [void]$targetsList.Items.Add($fbd.SelectedPath)
+            Update-TargetsListExtent
         }
     }.GetNewClosure())
     Initialize-ModernButton -Button $addTargetBtn
@@ -4894,7 +4964,10 @@ function Show-DeployConfigDialog {
     $removeTargetBtn.Location = New-Object System.Drawing.Point(425, ($y + 30))
     $removeTargetBtn.Size = New-Object System.Drawing.Size(85, 26)
     $removeTargetBtn.Add_Click({
-        if ($targetsList.SelectedIndex -ge 0) { $targetsList.Items.RemoveAt($targetsList.SelectedIndex) }
+        if ($targetsList.SelectedIndex -ge 0) {
+            $targetsList.Items.RemoveAt($targetsList.SelectedIndex)
+            Update-TargetsListExtent
+        }
     }.GetNewClosure())
     Initialize-ModernButton -Button $removeTargetBtn
     $y += $targetsList.Height + 20
@@ -5076,7 +5149,15 @@ function Show-DeployRunDialog {
     })
 
     function Start-DeployRun {
-        if ($currentProc -and -not $currentProc.HasExited) { try { $currentProc.Kill() } catch {} }
+        # Invoke-TaskKill (taskkill /T /F), not a plain .Kill() - Kill()
+        # only terminates the cmd.exe shell process itself, not any
+        # build tool it's still actively running underneath (npm/node/
+        # webpack/vite, ...) if Run Again is clicked while a previous
+        # build hasn't finished yet. A bare Kill() would leave that build
+        # process orphaned - still writing to dist/, possibly racing the
+        # new build about to start - instead of actually stopping it.
+        # Same fix already used by the Stop Deploy button below.
+        if ($currentProc -and -not $currentProc.HasExited) { Invoke-TaskKill -ProcId $currentProc.Id -LogContext "deploy for $ProjectPath" | Out-Null }
         $rerunButton.Enabled = $false
         $stopButton.Enabled = $true
         $textBox.Clear()

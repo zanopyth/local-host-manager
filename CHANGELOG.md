@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.6] - 2026-08-06
+
+### Fixed
+- **Configure Deploy ▸ Target folders** list: the OS-default blue selection
+  highlight made the full path unreadable and there was no way to see a
+  long path that ran past the list's width. Replaced with a themed,
+  owner-drawn selection highlight that matches the app's Light/Dark/
+  Terminal themes, added a horizontal scrollbar so long paths can be
+  scrolled into view, and a hover tooltip showing the full path for
+  entries too long to fit.
+- A "The term 'if' is not recognized..." error when hovering an entry in
+  that same Target folders list - an `if`/`else` used directly as a .NET
+  method call argument doesn't parse as an if-expression in that
+  position; PowerShell tried to invoke `if` as a literal command instead.
+  Not caught by either parser (both report a clean parse) since it's a
+  runtime-only failure - found by actually exercising the hover path.
+- **Run Again** (Build & Deploy's rerun button) killed only the previous
+  run's shell process, not any build tool still running underneath it
+  (npm/node/webpack/vite, ...) - clicking Run Again while a build was
+  still in progress could leave that build process orphaned instead of
+  actually stopping it. Now uses the same full-process-tree kill as the
+  Stop Deploy button next to it.
+
 ## [1.18.5] - 2026-08-04
 
 ### Added
