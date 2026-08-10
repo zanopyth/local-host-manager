@@ -693,6 +693,54 @@ function Test-PathUnderRoot {
     return ($p -eq $r) -or $p.StartsWith("$r\")
 }
 
+function Get-CollapsedPathDisplay {
+    # Abbreviates every path segment down to its initials (splitting only on
+    # spaces - "Phone Store CRM" -> "PSC", a single-word segment like
+    # "Documents" -> "D") except the drive root (always kept as-is, since
+    # abbreviating "C:" to "C" would lose the colon) and the last 2
+    # segments - the last folder plus whatever it directly contains (a
+    # file, or a leaf folder like "dist") - which stay fully spelled out
+    # since that's the part someone actually needs to read. Used by the
+    # Configure Deploy summary table's per-row collapse toggle so a long
+    # profile path doesn't crowd out the part that actually matters.
+    param([string]$Path)
+    if (-not $Path) { return $Path }
+    $segments = @($Path.TrimEnd('\') -split '\\')
+    $keepFromEnd = 2
+    # Root (index 0) plus the last $keepFromEnd segments are never touched -
+    # if there's nothing left in between, the path is already short enough.
+    $abbreviateCount = $segments.Count - $keepFromEnd - 1
+    if ($abbreviateCount -le 0) { return $Path }
+    $result = @($segments[0])
+    for ($i = 1; $i -le $abbreviateCount; $i++) {
+        $words = @($segments[$i] -split '\s+' | Where-Object { $_ })
+        $result += (($words | ForEach-Object { $_.Substring(0, 1) }) -join '')
+    }
+    for ($i = $abbreviateCount + 1; $i -lt $segments.Count; $i++) {
+        $result += $segments[$i]
+    }
+    return ($result -join '\')
+}
+
+function Get-NearestExistingAncestor {
+    # FolderBrowserDialog.SelectedPath silently does nothing (opens at its
+    # default root instead) when set to a path that doesn't currently exist
+    # on disk - e.g. a configured build-output folder before the first
+    # build has ever run. Walking up to the nearest real ancestor means the
+    # dialog still opens as close as possible to where a field actually
+    # points, instead of landing on Desktop with no relation to it.
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    $p = $Path
+    while ($p) {
+        if (Test-Path -LiteralPath $p -PathType Container) { return $p }
+        $parent = Split-Path -Path $p -Parent
+        if (-not $parent -or $parent -eq $p) { return $null }
+        $p = $parent
+    }
+    return $null
+}
+
 # Also doubles as the "system-owned" classification for the System tab
 # (see IsSystem below) - these names never show as manageable dev-server
 # rows on Live/History, but a port bound by one of them (e.g. the kernel
@@ -2174,7 +2222,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.6'
+$script:AppVersion = '1.18.7'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -4778,6 +4826,15 @@ function New-DeployFieldRow {
     $boxY = $Y + (Get-WrappedLabelHeight -Text $LabelText -LabelFont $LabelFont -MaxWidth $LabelMaxWidth) + 2
     $box = New-Object System.Windows.Forms.TextBox
     $box.Text = $Value
+    # A TextBox too narrow for its content scrolls to show wherever the
+    # caret last landed, and setting .Text leaves the caret at the very
+    # end - so an unfocused box with a long path shows its tail
+    # ("...aming\Documents\...\tc-crm-server") instead of the start,
+    # which is almost always the more useful end to see first (drive +
+    # top-level folders). Explicitly parking the caret/selection at 0
+    # forces the visible viewport back to the beginning.
+    $box.SelectionStart = 0
+    $box.SelectionLength = 0
     $box.Location = New-Object System.Drawing.Point(15, $boxY)
     $box.Size = New-Object System.Drawing.Size(($(if ($Browse) { 405 } else { 495 })), 24)
     $box.BorderStyle = 'FixedSingle'
@@ -4792,8 +4849,13 @@ function New-DeployFieldRow {
         $browseBtn.Size = New-Object System.Drawing.Size(85, 26)
         $browseBtn.Add_Click({
             $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
-            if ($box.Text) { $fbd.SelectedPath = $box.Text }
-            if ($fbd.ShowDialog() -eq 'OK') { $box.Text = $fbd.SelectedPath }
+            $existingAncestor = Get-NearestExistingAncestor -Path $box.Text
+            if ($existingAncestor) { $fbd.SelectedPath = $existingAncestor }
+            if ($fbd.ShowDialog() -eq 'OK') {
+                $box.Text = $fbd.SelectedPath
+                $box.SelectionStart = 0
+                $box.SelectionLength = 0
+            }
         }.GetNewClosure())
         Initialize-ModernButton -Button $browseBtn
         $rowResult.Browse = $browseBtn
@@ -4819,6 +4881,69 @@ function Show-DeployConfigDialog {
     param([string]$ProjectPath, [string]$Label)
 
     $existing = $script:DeployDefs[(Get-NormalizedPath $ProjectPath)]
+
+    # Update-DeploySummary is script: scoped, not a plain nested function -
+    # confirmed by direct reproduction that a .GetNewClosure()'d scriptblock
+    # (used below so several buttons/list handlers each capture their own
+    # snapshot of loop/outer variables, e.g. the per-row toggle buttons'
+    # $capturedKey) runs in a private SessionState that cannot resolve ANY
+    # sibling function defined in the enclosing scope - regardless of
+    # definition order relative to the closure, and regardless of whether
+    # it's invoked directly or as a real WinForms event. A script: (or
+    # global:) scoped function IS visible from such a closure, and a
+    # script-scoped function can still freely call an ordinary nested
+    # function back in its own original scope (Format-SummaryPathValue
+    # below doesn't need the prefix itself for exactly that reason - it's
+    # only ever called from Update-DeploySummary, never directly from a
+    # closure). Defined up here, before any control below creates a
+    # closure, purely for readability, not because order matters anymore.
+    # The function bodies reference $workDirRow, $targetsList,
+    # $summaryValueLabels etc. that don't exist yet at this point in the
+    # script - that's fine, variable lookups happen when the function is
+    # actually *called* (after the whole dialog has finished building),
+    # not when it's defined.
+    function Format-SummaryPathValue {
+        param([string]$Path, [bool]$Collapsed)
+        if (-not $Path -or -not $Collapsed) { return $Path }
+        return Get-CollapsedPathDisplay -Path $Path
+    }
+
+    function script:Update-DeploySummary {
+        foreach ($key in $summaryToggleButtons.Keys) {
+            # Initialize-ModernButton owner-draws from Tag.DisplayText, a
+            # one-time snapshot of .Text at init - changing .Text alone after
+            # that leaves the drawn glyph stuck on '-' forever (see the copy
+            # button comment above, and the Stop All/Start All confirm-state
+            # functions, which set Tag.DisplayText + Invalidate() directly).
+            $btn = $summaryToggleButtons[$key]
+            $btn.Tag.DisplayText = if ($summaryCollapsed[$key]) { '+' } else { '-' }
+            $btn.Invalidate()
+        }
+        $tip = { param($k) if ($summaryCollapsed[$k]) { 'Show full path' } else { 'Show short path' } }
+        foreach ($key in $summaryToggleButtons.Keys) { $summaryTip.SetToolTip($summaryToggleButtons[$key], (& $tip $key)) }
+
+        $summaryValueLabels.Project.Text = Format-SummaryPathValue -Path $ProjectPath -Collapsed $summaryCollapsed.Project
+        $summaryTip.SetToolTip($summaryValueLabels.Project, $ProjectPath)
+
+        $wd = $workDirRow.Box.Text
+        $sameAsProject = $wd -and (Get-NormalizedPath $wd) -eq (Get-NormalizedPath $ProjectPath)
+        $wdDisplay = Format-SummaryPathValue -Path $wd -Collapsed $summaryCollapsed.BuildsIn
+        $summaryValueLabels.BuildsIn.Text = if ($sameAsProject) { "$wdDisplay (same as this project)" } else { $wdDisplay }
+        $summaryTip.SetToolTip($summaryValueLabels.BuildsIn, $wd)
+
+        $src = $sourceRow.Box.Text
+        $summaryValueLabels.Output.Text = Format-SummaryPathValue -Path $src -Collapsed $summaryCollapsed.Output
+        $summaryTip.SetToolTip($summaryValueLabels.Output, $src)
+
+        $targetsNow = @($targetsList.Items)
+        $targetsText = if ($targetsNow.Count -eq 0) {
+            '(none yet)'
+        } else {
+            (($targetsNow | ForEach-Object { Format-SummaryPathValue -Path $_ -Collapsed $summaryCollapsed.DeploysTo }) -join '; ')
+        }
+        $summaryValueLabels.DeploysTo.Text = $targetsText
+        $summaryTip.SetToolTip($summaryValueLabels.DeploysTo, ($targetsNow -join '; '))
+    }
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Configure Deploy - $Label"
@@ -4861,7 +4986,7 @@ function Show-DeployConfigDialog {
     $y = $sourceRow.Bottom + 16
 
     $targetsLbl = New-Object System.Windows.Forms.Label
-    $targetsLbl.Text = 'Deploy target folder(s) - each is mirrored, old files there get deleted:'
+    $targetsLbl.Text = 'Deploy target folder(s) - each is mirrored, old files there get deleted. Double-click an entry to change its path:'
     $targetsLbl.AutoSize = $true
     $targetsLbl.MaximumSize = New-Object System.Drawing.Size($labelMaxWidth, 0)
     $targetsLbl.Location = New-Object System.Drawing.Point(15, $y)
@@ -4906,7 +5031,11 @@ function Show-DeployConfigDialog {
         [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $e.Font, $textRect, $fg, $flags)
     })
 
-    function Update-TargetsListExtent {
+    # script: scope - called from GetNewClosure()'d handlers below, which
+    # can't see a plain nested function regardless of definition order.
+    # See the Update-DeploySummary comment above (near the top of this
+    # function) for why.
+    function script:Update-TargetsListExtent {
         $widest = 0
         foreach ($item in $targetsList.Items) {
             $w = [System.Windows.Forms.TextRenderer]::MeasureText([string]$item, $targetsList.Font).Width
@@ -4943,6 +5072,25 @@ function Show-DeployConfigDialog {
     }.GetNewClosure())
     $targetsList.Add_MouseLeave({ $targetsHoverState.Index = -1 }.GetNewClosure())
 
+    # Double-click an existing target to change it in place, browsing from
+    # its actual current path (via Get-NearestExistingAncestor, same as the
+    # Project/Source folder "..." buttons) - the only other way to change
+    # one was Remove + Add from scratch, which meant retyping/re-browsing a
+    # long path with no reminder of where it used to point.
+    $targetsList.Add_DoubleClick({
+        $idx = $targetsList.SelectedIndex
+        if ($idx -lt 0) { return }
+        $currentTarget = [string]$targetsList.Items[$idx]
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $existingAncestor = Get-NearestExistingAncestor -Path $currentTarget
+        if ($existingAncestor) { $fbd.SelectedPath = $existingAncestor }
+        if ($fbd.ShowDialog() -eq 'OK') {
+            $targetsList.Items[$idx] = $fbd.SelectedPath
+            Update-TargetsListExtent
+            Update-DeploySummary
+        }
+    }.GetNewClosure())
+
     foreach ($t in @($existing.TargetDirs)) { if ($t) { [void]$targetsList.Items.Add($t) } }
     Update-TargetsListExtent
 
@@ -4955,6 +5103,7 @@ function Show-DeployConfigDialog {
         if ($fbd.ShowDialog() -eq 'OK' -and $fbd.SelectedPath -notin $targetsList.Items) {
             [void]$targetsList.Items.Add($fbd.SelectedPath)
             Update-TargetsListExtent
+            Update-DeploySummary
         }
     }.GetNewClosure())
     Initialize-ModernButton -Button $addTargetBtn
@@ -4967,10 +5116,94 @@ function Show-DeployConfigDialog {
         if ($targetsList.SelectedIndex -ge 0) {
             $targetsList.Items.RemoveAt($targetsList.SelectedIndex)
             Update-TargetsListExtent
+            Update-DeploySummary
         }
     }.GetNewClosure())
     Initialize-ModernButton -Button $removeTargetBtn
     $y += $targetsList.Height + 20
+
+    # Summary table - a compact, always-current recap of what this recipe
+    # actually does end to end, since the fields above are edited one at a
+    # time and it's easy to lose track of the overall picture (this is what
+    # caused a real support question: a deploy pointed its "build runs
+    # here" folder at a backend with no build script, because nothing on
+    # screen showed all four steps together). Read-only labels with
+    # AutoEllipsis + a hover tooltip for the full value, same truncation
+    # pattern as the targets list above, rather than wrapping/growing the
+    # dialog - keeps this panel a fixed height regardless of path length.
+    $summaryLbl = New-Object System.Windows.Forms.Label
+    $summaryLbl.Text = 'Summary - what this deploy actually does:'
+    $summaryLbl.AutoSize = $true
+    $summaryLbl.MaximumSize = New-Object System.Drawing.Size($labelMaxWidth, 0)
+    $summaryLbl.Location = New-Object System.Drawing.Point(15, $y)
+    $summaryLbl.ForeColor = $script:Theme.TextDim
+    $summaryLbl.Font = $descFont
+    $y += (Get-WrappedLabelHeight -Text $summaryLbl.Text -LabelFont $descFont -MaxWidth $labelMaxWidth) + 2
+
+    $summaryPanel = New-Object System.Windows.Forms.Panel
+    $summaryPanel.Location = New-Object System.Drawing.Point(15, $y)
+    $summaryPanel.Size = New-Object System.Drawing.Size(495, 92)
+    $summaryPanel.BorderStyle = 'FixedSingle'
+    $summaryPanel.BackColor = $script:Theme.CardBg
+
+    $summaryTip = New-Object System.Windows.Forms.ToolTip
+    $summaryTip.InitialDelay = 300
+    $summaryTip.AutoPopDelay = 8000
+
+    $summaryFieldFont = New-Object System.Drawing.Font($script:Theme.FontFamily, 8, [System.Drawing.FontStyle]::Bold)
+    $summaryValueFont = New-Object System.Drawing.Font($script:Theme.FontFamily, 8)
+    $summaryRows = [ordered]@{
+        Project   = 'This project'
+        BuildsIn  = 'Build runs in'
+        Output    = 'Build output'
+        DeploysTo = 'Deploys to'
+    }
+    # Per-row collapse state (Get-CollapsedPathDisplay on/off) - a
+    # hashtable rather than a variable each toggle button's closure could
+    # reassign, same GetNewClosure() limitation as $targetsHoverState above:
+    # a plain outer variable reassigned inside one closure is invisible to
+    # every other closure and to Update-DeploySummary itself.
+    $summaryCollapsed = @{ Project = $false; BuildsIn = $false; Output = $false; DeploysTo = $false }
+    $summaryValueLabels = @{}
+    $summaryToggleButtons = @{}
+    $rowY2 = 6
+    foreach ($key in $summaryRows.Keys) {
+        $fLbl = New-Object System.Windows.Forms.Label
+        $fLbl.Text = "$($summaryRows[$key]):"
+        $fLbl.Location = New-Object System.Drawing.Point(8, $rowY2)
+        $fLbl.Size = New-Object System.Drawing.Size(96, 18)
+        $fLbl.ForeColor = $script:Theme.TextDim
+        $fLbl.Font = $summaryFieldFont
+
+        # Collapse/expand toggle sits right at the start of the value, as
+        # its own tiny button rather than folded into the value label, so
+        # clicking it can never be confused with (or interfere with)
+        # selecting/reading the path text next to it.
+        $toggleBtn = New-Object System.Windows.Forms.Button
+        $toggleBtn.Location = New-Object System.Drawing.Point(104, ($rowY2 - 1))
+        $toggleBtn.Size = New-Object System.Drawing.Size(18, 18)
+        $toggleBtn.Text = '-'
+        Initialize-ModernButton -Button $toggleBtn -Radius (Get-ThemedRadius 4)
+        $toggleBtn.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 8, [System.Drawing.FontStyle]::Bold)
+        $capturedKey = $key
+        $toggleBtn.Add_Click({ $summaryCollapsed[$capturedKey] = -not $summaryCollapsed[$capturedKey]; Update-DeploySummary }.GetNewClosure())
+        $summaryToggleButtons[$key] = $toggleBtn
+
+        $vLbl = New-Object System.Windows.Forms.Label
+        $vLbl.Location = New-Object System.Drawing.Point(126, $rowY2)
+        $vLbl.Size = New-Object System.Drawing.Size(360, 18)
+        $vLbl.AutoEllipsis = $true
+        $vLbl.ForeColor = $script:Theme.TextPrimary
+        $vLbl.Font = $summaryValueFont
+        $summaryPanel.Controls.AddRange(@($fLbl, $toggleBtn, $vLbl))
+        $summaryValueLabels[$key] = $vLbl
+        $rowY2 += 21
+    }
+
+    Update-DeploySummary
+    $workDirRow.Box.Add_TextChanged({ Update-DeploySummary }.GetNewClosure())
+    $sourceRow.Box.Add_TextChanged({ Update-DeploySummary }.GetNewClosure())
+    $y += $summaryPanel.Height + 16
 
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'Save'
@@ -4993,6 +5226,7 @@ function Show-DeployConfigDialog {
         $buildRow.Label, $buildRow.Box,
         $sourceRow.Label, $sourceRow.Box, $sourceRow.Browse,
         $targetsLbl, $targetsList, $addTargetBtn, $removeTargetBtn,
+        $summaryLbl, $summaryPanel,
         $okButton, $cancelButton
     )
     $dlg.Controls.AddRange($controls)

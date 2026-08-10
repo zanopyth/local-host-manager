@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.7] - 2026-08-10
+
+### Added
+- **Configure Deploy** gets a **Summary table** - a compact, always-current
+  recap of what a deploy recipe actually does ("This project / Build runs
+  in / Build output / Deploys to"), live-updating as the fields above are
+  edited. Flags when "Build runs in" differs from the port's own project
+  folder, so a build pointed at the wrong folder (e.g. a backend with no
+  `build` script) is obvious at a glance instead of only surfacing as an
+  `npm error Missing script`.
+- Each Summary row gets a **-/+ collapse toggle** that abbreviates a long
+  path down to initials (splitting on spaces - "Phone Store CRM" -> "PSC"),
+  keeping only the last folder and its immediate contents spelled out in
+  full - the part that's actually useful to read.
+- Target folder list entries can now be **double-clicked to edit in
+  place**, browsing from that entry's current path, instead of only
+  Remove + re-Add from scratch.
+
+### Fixed
+- Browse ("...") buttons in Configure Deploy now open at the field's
+  actual current folder - `FolderBrowserDialog.SelectedPath` silently did
+  nothing (opened at Desktop instead) when pointed at a folder that
+  doesn't exist yet, e.g. a `dist` output folder before the first build.
+  Now walks up to the nearest folder that does exist.
+- The **Project folder** and **Build output folder** text boxes showed
+  the tail end of a long path instead of the start - setting a TextBox's
+  `.Text` leaves the caret at the end, and an unfocused box scrolls to
+  wherever the caret last was. Now resets to the start on load and after
+  browsing.
+- A "term '...' is not recognized" crash when using the Summary table's
+  collapse toggle (or, latently, the target list's Add/Remove buttons) -
+  a `.GetNewClosure()`'d button handler runs in a private scope that can't
+  see a sibling function defined elsewhere in the same dialog, regardless
+  of definition order. Fixed by moving those helpers to `script:` scope.
+
 ## [1.18.6] - 2026-08-06
 
 ### Fixed

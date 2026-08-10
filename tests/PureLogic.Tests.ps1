@@ -49,7 +49,9 @@ foreach ($source in (Get-PureFunctionSource -Names @(
     'Get-RowLanInfo',
     'Merge-LiveWithHistoryFallback',
     'Get-SearchFilteredDisplay',
-    'Test-LogEntryMatchesProject'
+    'Test-LogEntryMatchesProject',
+    'Get-NearestExistingAncestor',
+    'Get-CollapsedPathDisplay'
 ))) {
     . ([scriptblock]::Create($source))
 }
@@ -318,5 +320,41 @@ Describe 'Test-LogEntryMatchesProject' {
     It 'does not match an unrelated entry' {
         $entry = [PSCustomObject]@{ Header = 'Project crashed: Full-Stack (exit code 1)'; Details = @() }
         Test-LogEntryMatchesProject -Entry $entry -Project $project | Should Be $false
+    }
+}
+
+Describe 'Get-NearestExistingAncestor' {
+    It 'returns the path itself when it already exists' {
+        Get-NearestExistingAncestor -Path $env:TEMP | Should Be $env:TEMP
+    }
+    It 'walks up to the nearest existing parent for a path that does not exist yet' {
+        $missing = Join-Path $env:TEMP 'lhm-test-does-not-exist\dist'
+        Get-NearestExistingAncestor -Path $missing | Should Be $env:TEMP
+    }
+    It 'returns $null when nothing in the chain exists (bogus drive)' {
+        Get-NearestExistingAncestor -Path 'Z:\nonexistent-xyz\dist' | Should Be $null
+    }
+    It 'returns $null for empty input' {
+        Get-NearestExistingAncestor -Path '' | Should Be $null
+    }
+}
+
+Describe 'Get-CollapsedPathDisplay' {
+    It 'abbreviates every segment but the drive root and the last 2, splitting multi-word names into initials' {
+        $path = 'C:\Users\Gaming\Documents\Phone Store CRM\phone-hub\phone-hub-server\dist'
+        Get-CollapsedPathDisplay -Path $path | Should Be 'C:\U\G\D\PSC\p\phone-hub-server\dist'
+    }
+    It 'abbreviates a multi-word project folder even when only one folder level follows it' {
+        $path = 'C:\Users\Gaming\Documents\Transaction Coordinator CRM\tc-crm-server\dist'
+        Get-CollapsedPathDisplay -Path $path | Should Be 'C:\U\G\D\TCC\tc-crm-server\dist'
+    }
+    It 'leaves a path unchanged when it already has 2 or fewer segments after the root' {
+        Get-CollapsedPathDisplay -Path 'C:\Users\Gaming' | Should Be 'C:\Users\Gaming'
+    }
+    It 'abbreviates exactly one segment once there are 3 segments after the root' {
+        Get-CollapsedPathDisplay -Path 'C:\Users\Gaming\Documents' | Should Be 'C:\U\Gaming\Documents'
+    }
+    It 'returns empty input unchanged' {
+        Get-CollapsedPathDisplay -Path '' | Should Be ''
     }
 }
