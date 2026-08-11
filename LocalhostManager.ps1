@@ -2222,7 +2222,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.7'
+$script:AppVersion = '1.18.8'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -5843,23 +5843,39 @@ function Show-RowDetail {
         $rowPanel.BackColor = if ($f.IsVirtual) { $purpleBg } else { $script:Theme.WindowBg }
 
         # Auto-Restart is the one live, clickable control in an otherwise
-        # read-only sticky-note popup - a real CheckBox instead of the
-        # usual label/value/copy-button triple, wired straight to
-        # Invoke-ToggleAutoRestart (same history.json-backed toggle Pin
-        # uses). Checked is set before the event is wired so the initial
-        # render doesn't fire a spurious toggle.
+        # read-only sticky-note popup - the same pill New-ToggleSwitch used
+        # everywhere else in the app (Settings' "Launch at startup" /
+        # "Notify me if a dev server crashes", the toolbar's node-only /
+        # groups switches), not the native Windows CheckBox this used to be,
+        # so it reads as part of the app's own theme instead of stock OS
+        # chrome. Wired straight to Invoke-ToggleAutoRestart (same
+        # history.json-backed toggle Pin uses). Checked is set via the
+        # constructor (not a later assignment) so the initial render doesn't
+        # fire a spurious toggle.
         if ($f.Label -eq 'Auto-Restart') {
-            $chk = New-Object System.Windows.Forms.CheckBox
-            $chk.Text = 'Auto Crash Restart'
-            $chk.AutoSize = $false
-            $chk.Location = New-Object System.Drawing.Point(10, 5)
-            $chk.Size = New-Object System.Drawing.Size(($dlgWidth - 20), 20)
-            $chk.ForeColor = $script:Theme.TextPrimary
-            $chk.BackColor = [System.Drawing.Color]::Transparent
-            $chk.Checked = [bool]$f.Value
+            $sw = New-ToggleSwitch -Checked ([bool]$f.Value)
+            # 27x14 - ~30% smaller than New-ToggleSwitch's 38x20 default,
+            # just for this popup instance (the shared function/Settings-
+            # dialog/toolbar switches are untouched). Paint draws relative
+            # to Width/Height so it scales cleanly; Y is nudged down 3px to
+            # stay vertically centered against the label's 20px row height.
+            $sw.Size = New-Object System.Drawing.Size(27, 14)
+            $sw.Location = New-Object System.Drawing.Point(10, 7)
+
+            $swLbl = New-Object System.Windows.Forms.Label
+            $swLbl.Text = 'Auto Crash Restart'
+            $swLbl.AutoSize = $false
+            $swLbl.Location = New-Object System.Drawing.Point(45, 4)
+            $swLbl.Size = New-Object System.Drawing.Size(($dlgWidth - 55), 20)
+            $swLbl.TextAlign = 'MiddleLeft'
+            $swLbl.ForeColor = $script:Theme.TextPrimary
+            $swLbl.BackColor = [System.Drawing.Color]::Transparent
+            Connect-ToggleLabel -Switch $sw -Label $swLbl
+
             $capturedData = $Data
-            $chk.Add_CheckedChanged({ Invoke-ToggleAutoRestart $capturedData }.GetNewClosure())
-            $rowPanel.Controls.Add($chk)
+            Set-ToggleOnChange -Switch $sw -Handler { Invoke-ToggleAutoRestart $capturedData }.GetNewClosure()
+            $rowPanel.Controls.Add($sw)
+            $rowPanel.Controls.Add($swLbl)
             $rowPanels += $rowPanel
             [void]$allValuesText.AppendLine("Auto-Restart: $(if ($f.Value) { 'Yes' } else { 'No' })")
             $rowY += $rowHeight
@@ -7420,6 +7436,15 @@ $form.Add_FormClosing({
         Stop-BackgroundPoller
         Stop-WebDashboard
         Stop-ProxyServer
+        # Application.Run returning is not enough to guarantee the ps2exe-
+        # compiled host actually terminates - see the identical comment on
+        # the duplicate-instance guard above. A lingering runspace/event
+        # subscription (dashboard/proxy teardown still in flight, or a
+        # Register-ObjectEvent watcher on a still-running managed dev
+        # server) is enough to leave a windowless, tray-icon-less zombie
+        # in Task Manager after the tray Exit click. Environment.Exit
+        # terminates the process unconditionally.
+        [System.Environment]::Exit(0)
     }
 })
 

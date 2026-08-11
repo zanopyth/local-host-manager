@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.8] - 2026-08-11
+
+### Fixed
+- Tray **Exit** now reliably terminates the process. `Application.Run`
+  returning wasn't enough for the ps2exe-compiled host to fully tear down -
+  a lingering background thread (web dashboard/proxy still finishing
+  teardown, or a `Register-ObjectEvent` watcher on a still-running managed
+  dev server) could leave a windowless, tray-icon-less `LocalhostManager.exe`
+  behind in Task Manager after clicking Exit. Now forces
+  `Environment.Exit(0)` after cleanup, the same fix already used for the
+  duplicate-instance launch guard.
+- The **Auto Crash Restart** control in the row-detail popup now uses the
+  app's own pill toggle switch (same one Settings' "Launch at startup" /
+  "Notify me if a dev server crashes" and the toolbar's node-only/groups
+  switches use) instead of a plain native Windows checkbox, sized down
+  ~30% for the compact popup and vertically centered against its label.
+
 ## [1.18.7] - 2026-08-10
 
 ### Added
