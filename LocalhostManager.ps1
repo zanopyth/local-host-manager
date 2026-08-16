@@ -2222,7 +2222,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.8'
+$script:AppVersion = '1.18.9'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2696,9 +2696,11 @@ $menuLocalDomains.Add_Click({ Show-ProxyDialog })
 $menuHelp = New-Object System.Windows.Forms.ToolStripMenuItem('Help')
 $menuHelpUpdate = New-Object System.Windows.Forms.ToolStripMenuItem('Check for Updates...')
 $menuHelpUpdate.Add_Click({ Show-UpdateCheckDialog })
+$menuHelpDocs = New-Object System.Windows.Forms.ToolStripMenuItem('Documentation')
+$menuHelpDocs.Add_Click({ Show-DocumentationDialog })
 $menuHelpAbout = New-Object System.Windows.Forms.ToolStripMenuItem('About')
 $menuHelpAbout.Add_Click({ Show-AboutDialog })
-[System.Windows.Forms.ToolStripItem[]]$menuHelpItems = @($menuHelpUpdate, (New-Object System.Windows.Forms.ToolStripSeparator), $menuHelpAbout)
+[System.Windows.Forms.ToolStripItem[]]$menuHelpItems = @($menuHelpUpdate, $menuHelpDocs, (New-Object System.Windows.Forms.ToolStripSeparator), $menuHelpAbout)
 $menuHelp.DropDownItems.AddRange($menuHelpItems)
 
 [System.Windows.Forms.ToolStripItem[]]$menuTopItems = @($menuFile, $menuSettings, $menuDashboard, $menuLocalDomains, $menuHelp)
@@ -3940,6 +3942,87 @@ function Test-HasShellChainingChars {
     param([string]$Value)
     if (-not $Value) { return $false }
     return [bool]($Value -match '[&|]|\r|\n')
+}
+
+function Get-NpmScriptNameFromCommand {
+    # Pulls the script name out of an npm/yarn/pnpm "run <script>" style
+    # BuildCommand - shared by Get-MissingBuildScriptWarning and
+    # Find-SiblingBuildFolder so both agree on what "the build script" even
+    # means for a given recipe. Returns $null for anything else (a bare
+    # "vite build", a manager subcommand like "npm install", ...) - see
+    # Get-MissingBuildScriptWarning for why those are deliberately left
+    # unvalidated rather than guessed at.
+    param([string]$BuildCommand)
+    if (-not $BuildCommand) { return $null }
+    if ($BuildCommand -notmatch '(?i)(npm|yarn|pnpm)(\.cmd)?\s+run(-script)?\s+(?<name>[^\s&|;]+)') { return $null }
+    return $Matches['name']
+}
+
+function Get-MissingBuildScriptWarning {
+    # Pre-flight check for the single most common Build & Deploy failure:
+    # BuildCommand references an npm/yarn/pnpm script name (`npm run
+    # build`, the field's own default) that doesn't actually exist in the
+    # target folder's package.json - e.g. WorkingDir points at a project
+    # scaffolded without a build step yet, or at the wrong folder entirely
+    # (a server folder instead of its frontend, the exact TC CRM mistake
+    # this was written after). Returns $null when there's nothing to warn
+    # about (script found, or the command isn't a recognizable "run a
+    # script" form); otherwise a ready-to-display message. Shared by the
+    # automatic check in Start-DeployRun and the on-demand "Validate Build
+    # Script" button in Show-DeployConfigDialog.
+    param([string]$WorkingDir, [string]$BuildCommand)
+    if (-not $WorkingDir) { return $null }
+    $scriptName = Get-NpmScriptNameFromCommand -BuildCommand $BuildCommand
+    if (-not $scriptName) { return $null }
+
+    $pkgPath = Join-Path $WorkingDir 'package.json'
+    if (-not (Test-Path $pkgPath -PathType Leaf)) {
+        return "No package.json found in `"$WorkingDir`" - is the project folder correct?"
+    }
+    try {
+        $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+    } catch {
+        return "`"$pkgPath`" is not valid JSON - can't check its scripts."
+    }
+    $scripts = @()
+    if ($pkg.PSObject.Properties.Name -contains 'scripts' -and $pkg.scripts) {
+        $scripts = @($pkg.scripts.PSObject.Properties.Name)
+    }
+    if ($scriptName -in $scripts) { return $null }
+
+    $available = if ($scripts.Count -gt 0) { $scripts -join ', ' } else { '(none defined)' }
+    return "No `"$scriptName`" script in $pkgPath. Available scripts: $available"
+}
+
+function Find-SiblingBuildFolder {
+    # Only ever called after Get-MissingBuildScriptWarning has already
+    # confirmed WorkingDir's package.json doesn't have the wanted script.
+    # Deliberately does NOT offer to fabricate a "build" script in that
+    # package.json - this app has no way to know what the right build
+    # command actually is (vite build? tsc -b && vite build? webpack?
+    # react-scripts build?), and a wrong guess would silently produce
+    # broken or empty output instead of the honest, loud failure it
+    # replaces. What it does instead: every real case hit so far (TC CRM,
+    # Body Shop, Phone Store CRM) was the recipe's Project folder pointed
+    # at a backend/server folder with no build step of its own, while a
+    # sibling "-frontend" folder right next door actually had the script
+    # all along. So this looks one level up from WorkingDir for a sibling
+    # whose OWN package.json genuinely has the script, and returns that
+    # folder only if confirmed - never a guessed name that might not even
+    # exist.
+    param([string]$WorkingDir, [string]$ScriptName)
+    if (-not $WorkingDir -or -not $ScriptName) { return $null }
+    $parent = Split-Path $WorkingDir -Parent
+    if (-not $parent -or -not (Test-Path $parent -PathType Container)) { return $null }
+    foreach ($dir in (Get-ChildItem -Path $parent -Directory -ErrorAction SilentlyContinue)) {
+        if ((Get-NormalizedPath $dir.FullName) -eq (Get-NormalizedPath $WorkingDir)) { continue }
+        $pkgPath = Join-Path $dir.FullName 'package.json'
+        if (-not (Test-Path $pkgPath -PathType Leaf)) { continue }
+        try { $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json } catch { continue }
+        $scripts = if ($pkg.PSObject.Properties.Name -contains 'scripts' -and $pkg.scripts) { @($pkg.scripts.PSObject.Properties.Name) } else { @() }
+        if ($ScriptName -in $scripts) { return $dir.FullName }
+    }
+    return $null
 }
 
 function Start-ProjectAtPath {
@@ -5205,6 +5288,50 @@ function Show-DeployConfigDialog {
     $sourceRow.Box.Add_TextChanged({ Update-DeploySummary }.GetNewClosure())
     $y += $summaryPanel.Height + 16
 
+    # On-demand twin of the automatic check Start-DeployRun runs before
+    # every real deploy - lets a recipe be sanity-checked while it's being
+    # edited (unsaved field values, straight out of the boxes below)
+    # instead of only finding out by clicking Run and hitting the raw npm
+    # error. Same Get-MissingBuildScriptWarning helper, just surfaced as a
+    # MessageBox here instead of gating a running process.
+    $validateBtn = New-Object System.Windows.Forms.Button
+    $validateBtn.Text = 'Validate Build Script'
+    $validateBtn.Location = New-Object System.Drawing.Point(15, $y)
+    $validateBtn.Size = New-Object System.Drawing.Size(150, 28)
+    $validateBtn.Add_Click({
+        $warning = Get-MissingBuildScriptWarning -WorkingDir $workDirRow.Box.Text -BuildCommand $buildRow.Box.Text
+        if (-not $warning) {
+            [System.Windows.Forms.MessageBox]::Show('Build command looks fine - the referenced script exists (or this command is not an "npm/yarn/pnpm run <script>" form this check applies to).', 'Validation Passed', 'OK', 'Information') | Out-Null
+            return
+        }
+        # Never offers to write a fake "build" script into the folder's
+        # package.json - this app can't know the right build command, and
+        # a wrong guess breaks silently instead of loudly. What it CAN do
+        # safely: every real case hit so far (TC CRM, Body Shop, Phone
+        # Store CRM) was Project folder pointed at a server folder with no
+        # build step, one level away from a "-frontend" sibling that
+        # genuinely had the script. Offer to switch to that sibling only
+        # when Find-SiblingBuildFolder has actually confirmed it has the
+        # script - never a guessed path.
+        $scriptName = Get-NpmScriptNameFromCommand -BuildCommand $buildRow.Box.Text
+        $suggestedDir = Find-SiblingBuildFolder -WorkingDir $workDirRow.Box.Text -ScriptName $scriptName
+        if ($suggestedDir) {
+            $answer = [System.Windows.Forms.MessageBox]::Show("$warning`r`n`r`nFound a sibling folder that does have a `"$scriptName`" script:`r`n$suggestedDir`r`n`r`nSwitch Project folder (and Build output folder) to it?", 'Build Script Not Found', 'YesNo', 'Warning')
+            if ($answer -eq 'Yes') {
+                $workDirRow.Box.Text = $suggestedDir
+                $workDirRow.Box.SelectionStart = 0
+                $workDirRow.Box.SelectionLength = 0
+                $sourceRow.Box.Text = Join-Path $suggestedDir 'dist'
+                $sourceRow.Box.SelectionStart = 0
+                $sourceRow.Box.SelectionLength = 0
+                Update-DeploySummary
+            }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show($warning, 'Build Script Not Found', 'OK', 'Warning') | Out-Null
+        }
+    }.GetNewClosure())
+    Initialize-ModernButton -Button $validateBtn
+
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = 'Save'
     $okButton.Location = New-Object System.Drawing.Point(340, $y)
@@ -5227,7 +5354,7 @@ function Show-DeployConfigDialog {
         $sourceRow.Label, $sourceRow.Box, $sourceRow.Browse,
         $targetsLbl, $targetsList, $addTargetBtn, $removeTargetBtn,
         $summaryLbl, $summaryPanel,
-        $okButton, $cancelButton
+        $validateBtn, $okButton, $cancelButton
     )
     $dlg.Controls.AddRange($controls)
     $dlg.AcceptButton = $okButton
@@ -5414,6 +5541,18 @@ function Show-DeployRunDialog {
             $rerunButton.Enabled = $true
             $stopButton.Enabled = $false
             Write-AppErrorLog -Context "Refused to run deploy for $ProjectPath - recipe contains shell chaining characters" -Level Warning
+            return
+        }
+
+        $missingScriptWarning = Get-MissingBuildScriptWarning -WorkingDir $workDir -BuildCommand $buildCmd
+        if ($missingScriptWarning) {
+            $suggestedDir = Find-SiblingBuildFolder -WorkingDir $workDir -ScriptName (Get-NpmScriptNameFromCommand -BuildCommand $buildCmd)
+            $suggestionText = if ($suggestedDir) { " A sibling folder has it: `"$suggestedDir`" - fix the Project folder in C-Deploy." } else { '' }
+            $statusLbl.Text = "Refused to run: $missingScriptWarning$suggestionText"
+            $statusLbl.ForeColor = $script:Theme.Danger
+            $rerunButton.Enabled = $true
+            $stopButton.Enabled = $false
+            Write-AppErrorLog -Context "Refused to run deploy for $ProjectPath - $missingScriptWarning$suggestionText" -Level Warning
             return
         }
 
@@ -6100,6 +6239,169 @@ function Register-SystemGridEvents {
 Register-GridEvents -Grid $liveGrid
 Register-GridEvents -Grid $historyGrid
 Register-SystemGridEvents -Grid $systemGrid
+
+function Show-DocumentationDialog {
+    # In-app knowledge base for recurring, non-obvious problems - starts
+    # with just the "Missing script" build failure (the C-Deploy
+    # pre-flight check and Validate Build Script button above catch this
+    # live, but a popup is easy to dismiss without reading, and this is
+    # where "why did this happen and how do I fix it by hand" lives for
+    # later reference). Topic list on the left, plain-text body on the
+    # right; deliberately just an array of {Title;Body} so a future topic
+    # is a few lines added here, not new UI.
+    $topics = @(
+        [PSCustomObject]@{
+            Title = 'Missing build script (npm error)'
+            Body  = @'
+WHAT YOU SAW
+
+  npm error Missing script: "build"
+  npm error
+  npm error To see a list of scripts, run:
+  npm error   npm run
+
+WHY THIS HAPPENS
+
+  The Build & Deploy recipe's "Build command" runs `npm run build` in
+  the recipe's "Project folder" - but that folder's package.json has no
+  "build" entry under "scripts". This usually means one of:
+
+   1. "Project folder" points at the wrong folder (e.g. a server folder
+      instead of its frontend - the server's package.json was never
+      meant to have a build step).
+   2. The project is newly scaffolded and nobody has added a build
+      script to its package.json yet.
+   3. The build script exists, just under a different name
+      (build:prod, build:client, compile, ...).
+
+HOW TO FIX IT MANUALLY
+
+   1. Open package.json in the folder shown as "Project folder" in
+      C-Deploy (Configure Deploy) for this project.
+   2. Look at the "scripts" section.
+        - If "build" is missing entirely, add one, e.g. for a Vite
+          project:  "build": "vite build"
+        - If it exists under another name, either rename it to
+          "build", or change the recipe's Build command to call that
+          name instead (e.g. `npm run build:prod`).
+   3. If "Project folder" is simply the wrong folder, fix that path in
+      C-Deploy instead - nothing about package.json needs to change.
+
+HOW THIS APP CATCHES IT NOW
+
+  Before a deploy actually runs, it reads package.json in the recipe's
+  Project folder and confirms the script named in the Build command
+  exists, refusing to run (with this same explanation, in the deploy
+  window's status line) instead of letting the raw npm error appear.
+  Use the "Validate Build Script" button in Configure Deploy to check a
+  recipe any time, without running a real deploy.
+
+  It will NOT generate a fake "build" script for you - there's no way
+  to know the right build command from here (vite build? tsc -b &&
+  vite build? webpack? react-scripts build?), and guessing wrong would
+  fail silently with broken output instead of this loud, honest error.
+
+  What it does instead: if a sibling folder next to the wrong Project
+  folder actually has the script (the real cause every time this has
+  come up - Project folder pointed at a server folder, and the real
+  frontend with the script was one level away), it's offered as a
+  one-click fix - "Validate Build Script" will ask to switch Project
+  folder (and Build output folder) to it.
+'@
+        }
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Documentation'
+    $dlg.Size = New-Object System.Drawing.Size(780, 520)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.MinimumSize = New-Object System.Drawing.Size(520, 320)
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $bodyBox = New-Object System.Windows.Forms.TextBox
+    $bodyBox.Multiline = $true
+    $bodyBox.ReadOnly = $true
+    $bodyBox.ScrollBars = 'Vertical'
+    $bodyBox.WordWrap = $false
+    $bodyBox.Dock = 'Fill'
+    $bodyBox.BorderStyle = 'None'
+    $bodyBox.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $bodyBox.BackColor = $script:Theme.WindowBg
+    $bodyBox.ForeColor = $script:Theme.TextPrimary
+
+    $topicList = New-Object System.Windows.Forms.ListBox
+    $topicList.Dock = 'Left'
+    # 320, not the original 240 - too narrow, it was ellipsizing the first
+    # topic's title down to something unreadable. Widened plus a hover
+    # tooltip below as a safety net for whatever gets added here later.
+    $topicList.Width = 320
+    $topicList.BorderStyle = 'FixedSingle'
+    $topicList.BackColor = $script:Theme.CardBg
+    $topicList.ForeColor = $script:Theme.TextPrimary
+    # Font must be set explicitly, and before ItemHeight below - left to
+    # inherit ambiently from the parent (theme font, larger than the
+    # ListBox's own pre-parented default), OwnerDrawFixed's ItemHeight
+    # gets computed once from the smaller default font and never
+    # revisited, clipping descenders (the "g" in "Missing") against a row
+    # that's a couple pixels too short for the font actually drawn.
+    $topicList.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    # Same owner-draw selection-color fix as the C-Deploy targets list
+    # above - native ListBox selection is the OS system-highlight color,
+    # which never adapts to this app's Dark/Terminal themes.
+    $topicList.DrawMode = 'OwnerDrawFixed'
+    $topicList.ItemHeight = [System.Windows.Forms.TextRenderer]::MeasureText('Ag', $topicList.Font).Height + 8
+    $topicList.Add_DrawItem({
+        param($s, $e)
+        if ($e.Index -lt 0) { return }
+        $isSelected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+        $bg = if ($isSelected) { $script:Theme.AccentTint } else { $script:Theme.CardBg }
+        $fg = if ($isSelected) { $script:Theme.Accent } else { $script:Theme.TextPrimary }
+        $bgBrush = New-Object System.Drawing.SolidBrush($bg)
+        $e.Graphics.FillRectangle($bgBrush, $e.Bounds)
+        $bgBrush.Dispose()
+        $text = $s.Items[$e.Index].ToString()
+        $textRect = New-Object System.Drawing.Rectangle(($e.Bounds.X + 6), $e.Bounds.Y, [Math]::Max(1, $e.Bounds.Width - 10), $e.Bounds.Height)
+        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::WordEllipsis
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $e.Font, $textRect, $fg, $flags)
+    })
+    foreach ($t in $topics) { [void]$topicList.Items.Add($t.Title) }
+    $topicList.Add_SelectedIndexChanged({
+        if ($topicList.SelectedIndex -ge 0) { $bodyBox.Text = $topics[$topicList.SelectedIndex].Body }
+    }.GetNewClosure())
+
+    # Hover tooltip for the full title, same pattern as the C-Deploy
+    # targets list - a safety net for any future topic title too long to
+    # fit even the widened 320px column.
+    $topicListTip = New-Object System.Windows.Forms.ToolTip
+    $topicListTip.InitialDelay = 300
+    $topicListTip.AutoPopDelay = 8000
+    $topicHoverState = [PSCustomObject]@{ Index = -1 }
+    $topicList.Add_MouseMove({
+        param($s, $e)
+        $idx = $s.IndexFromPoint($e.Location)
+        if ($idx -eq $topicHoverState.Index) { return }
+        $topicHoverState.Index = $idx
+        $tipText = if ($idx -ge 0) { [string]$s.Items[$idx] } else { '' }
+        $topicListTip.SetToolTip($s, $tipText)
+    }.GetNewClosure())
+    $topicList.Add_MouseLeave({ $topicHoverState.Index = -1 }.GetNewClosure())
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = 'Close'
+    $closeButton.Dock = 'Bottom'
+    $closeButton.Height = 34
+    $closeButton.Add_Click({ $dlg.Close() })
+    Initialize-ModernButton -Button $closeButton
+
+    $dlg.Controls.Add($bodyBox)
+    $dlg.Controls.Add($topicList)
+    $dlg.Controls.Add($closeButton)
+
+    $topicList.SelectedIndex = 0
+    $dlg.ShowDialog($form) | Out-Null
+}
 
 function Show-AboutDialog {
     $dlg = New-Object System.Windows.Forms.Form

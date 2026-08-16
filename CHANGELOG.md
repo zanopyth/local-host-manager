@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.18.9] - 2026-08-16
+
+### Added
+- Build & Deploy now runs a pre-flight check before every deploy: it reads
+  `package.json` in the recipe's Project folder and confirms the script
+  named in the Build command (`npm/yarn/pnpm run <script>`) actually
+  exists, refusing to run with a clear explanation instead of surfacing
+  the raw `npm error Missing script` failure.
+- Configure Deploy has a new **Validate Build Script** button to run the
+  same check on demand, against the dialog's current (even unsaved)
+  field values.
+- If the named script is missing, both the pre-flight check and Validate
+  Build Script now look for a sibling folder that actually has it (e.g. a
+  `-frontend` folder next to a `-server` folder the recipe was mistakenly
+  pointed at) and offer a one-click fix to switch Project folder /
+  Build output folder to it - confirmed against that folder's own
+  `package.json`, never guessed. It will not fabricate a fake `build`
+  script, since there's no reliable way to know the right build command
+  from here.
+- New **Help → Documentation** menu item: an in-app knowledge base
+  starting with an entry on the "Missing script" build failure - what it
+  means, how to fix it manually, and how the app now catches it.
+
+### Fixed
+- Two Build & Deploy recipes (Body Shop, Phone Store CRM) had their
+  Project folder pointed at the server folder instead of the actual
+  frontend with the build script - found via the new pre-flight check and
+  corrected.
+
 ## [1.18.8] - 2026-08-11
 
 ### Fixed
