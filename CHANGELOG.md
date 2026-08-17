@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.19.1] - 2026-08-17
+
+### Fixed
+- Manage Groups' scrollbar occasionally flashed the native scrollbar
+  alongside the themed one on the very first scroll after opening the
+  dialog. Fixed properly this time with `BeginUpdate`/`EndUpdate`
+  (`WM_SETREDRAW`) around every scroll-position and content change, which
+  suppresses the intermediate native repaint entirely instead of just
+  reacting to it faster.
+- `Enable-TextBoxScrollBar`'s Win32 `SendMessage` calls now fail silently
+  instead of throwing if a TextBox/RichTextBox's handle goes stale mid-
+  event (e.g. a live-tail timer ticking as its dialog closes), matching
+  the guarded pattern already used by the grid and ListBox variants.
+- Themed checkbox's checkmark now picks black or white by the actual
+  contrast against the active theme's accent color, instead of always
+  white (which read poorly against Terminal theme's lighter accent).
+- `Get-MissingBuildScriptWarning` now reports the real reason when
+  package.json can't be read (permissions, file lock, ...) instead of
+  always claiming it's invalid JSON.
+
+### Changed
+- Deduplicated the mouse-wheel notch/direction math (previously copy-
+  pasted identically across the grid, TextBox, and ListBox scrollbar
+  handlers) into a shared `Get-WheelScrollLines` helper, and the owner-
+  drawn "themed selection" ListBox item painter (C-Deploy's target list,
+  Documentation's topic list) into a shared `Invoke-ThemedListItemDraw`.
+- Added Pester coverage for this session's new pure-logic functions
+  (`Get-WheelScrollLines`, `Get-NpmScriptNameFromCommand`,
+  `Get-ReadableTextColor`) to `tests/PureLogic.Tests.ps1`.
+
 ## [1.19.0] - 2026-08-16
 
 ### Added

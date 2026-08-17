@@ -2219,7 +2219,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.19.0'
+$script:AppVersion = '1.19.1'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2438,6 +2438,19 @@ function Connect-ToggleLabel {
     $Label.Add_Click({ Invoke-ToggleClick -Switch $Switch }.GetNewClosure())
 }
 
+function Get-ReadableTextColor {
+    # Standard perceptual-luminance threshold for "is this background
+    # light enough that dark text/glyphs read better on it than white" -
+    # Terminal theme's Accent is a noticeably lighter pastel blue than
+    # Dark/Light's, so a checkmark hardcoded to white loses contrast
+    # there specifically. Picking per-theme instead of always assuming
+    # white keeps it readable regardless of which accent color is active.
+    param([System.Drawing.Color]$BackgroundColor)
+    $luminance = (0.299 * $BackgroundColor.R + 0.587 * $BackgroundColor.G + 0.114 * $BackgroundColor.B) / 255
+    if ($luminance -gt 0.6) { return [System.Drawing.Color]::Black }
+    return [System.Drawing.Color]::White
+}
+
 function New-ThemedCheckBox {
     # A themed square checkbox - same owner-drawn Panel + paired Label
     # architecture as New-ToggleSwitch above, for a setting that's actually
@@ -2463,7 +2476,7 @@ function New-ThemedCheckBox {
         $g.DrawRectangle($borderPen, 0, 0, ($s.Width - 1), ($s.Height - 1))
         $borderPen.Dispose()
         if ($isOn) {
-            $checkPen = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 2)
+            $checkPen = New-Object System.Drawing.Pen((Get-ReadableTextColor -BackgroundColor $script:Theme.Accent), 2)
             $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
             [System.Drawing.Point[]]$checkPoints = @(
                 (New-Object System.Drawing.Point(3, 8)),
@@ -3213,6 +3226,47 @@ Update-ScopeLabel
 $script:ColIdx = @{ Status = 0; Port = 1; Pin = 2; CustomName = 3; Process = 4; PID = 5; Cpu = 6; Mem = 7; LocalUrl = 8; LanUrls = 9; ProjectPath = 10; Log = 11; Action = 12 }
 $dgvDoubleBufferProp = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
 
+function Get-WheelScrollLines {
+    # Converts a MouseEventArgs.Delta into a signed item count to scroll -
+    # shared by every themed scrollbar's MouseWheel handler (DataGridView
+    # row index, TextBox/RichTextBox line index, ListBox item index all
+    # use the same conversion). One Windows wheel "notch" is 120 delta
+    # units; each notch moves $LinesPerNotch items, signed by which way
+    # the wheel turned (negative Delta = wheel down = move forward).
+    param([int]$Delta, [int]$LinesPerNotch = 3)
+    $notches = [Math]::Max(1, [int]([Math]::Abs($Delta) / 120))
+    $dir = if ($Delta -gt 0) { -1 } else { 1 }
+    return $LinesPerNotch * $notches * $dir
+}
+
+function Invoke-ThemedListItemDraw {
+    # Shared OwnerDrawFixed item painter for a themed ListBox - native
+    # ListBox selection is the OS's SystemColors.Highlight/HighlightText,
+    # a bright system blue that never adapts to this app's Dark/Terminal
+    # themes; this paints the same AccentTint-fill/Accent-text combination
+    # used for a selected DataGridView cell elsewhere instead. $LeftPad/
+    # $RightPad let each caller match its own layout (C-Deploy's target
+    # list vs Documentation's topic list use slightly different insets);
+    # -Ellipsis truncates long text with "..." instead of letting it run
+    # past the edge uncut - the target list wants the latter (a
+    # horizontal scrollbar is there to reach the rest), the topic list
+    # the former (fixed-width column, full text is in its hover tooltip
+    # instead).
+    param($Sender, $EventArgs, [int]$LeftPad = 4, [int]$RightPad = 0, [switch]$Ellipsis)
+    if ($EventArgs.Index -lt 0) { return }
+    $isSelected = ($EventArgs.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+    $bg = if ($isSelected) { $script:Theme.AccentTint } else { $script:Theme.CardBg }
+    $fg = if ($isSelected) { $script:Theme.Accent } else { $script:Theme.TextPrimary }
+    $bgBrush = New-Object System.Drawing.SolidBrush($bg)
+    $EventArgs.Graphics.FillRectangle($bgBrush, $EventArgs.Bounds)
+    $bgBrush.Dispose()
+    $text = $Sender.Items[$EventArgs.Index].ToString()
+    $textRect = New-Object System.Drawing.Rectangle(($EventArgs.Bounds.X + $LeftPad), $EventArgs.Bounds.Y, [Math]::Max(1, $EventArgs.Bounds.Width - $LeftPad - $RightPad), $EventArgs.Bounds.Height)
+    $clipFlag = if ($Ellipsis) { [System.Windows.Forms.TextFormatFlags]::WordEllipsis } else { [System.Windows.Forms.TextFormatFlags]::NoClipping }
+    $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor $clipFlag
+    [System.Windows.Forms.TextRenderer]::DrawText($EventArgs.Graphics, $text, $EventArgs.Font, $textRect, $fg, $flags)
+}
+
 function New-ThemedScrollBar {
     # Generic themed vertical scrollbar - track/thumb painted from
     # $script:Theme (the only way to genuinely match the Terminal/Dark/
@@ -3235,13 +3289,19 @@ function New-ThemedScrollBar {
     # Enable-ListBoxScrollBar's use of it - hiding the native ScrollBar
     # there isn't a one-time fix, so it has to be redone on every update).
     param([scriptblock]$GetInfo, [scriptblock]$SetFirst, [scriptblock]$Refresh)
+    # Named rather than an inline literal purely so every themed scrollbar
+    # in the app (grid/TextBox/ListBox alike, since they all go through
+    # this one function) is guaranteed the same width by construction,
+    # not by remembering to type the same number everywhere.
+    $scrollBarWidthPx = 10
     $bar = New-Object System.Windows.Forms.Panel
     $bar.Dock = 'Right'
-    $bar.Width = 10
+    $bar.Width = $scrollBarWidthPx
     $bar.Tag = [PSCustomObject]@{
         GetInfo = $GetInfo; SetFirst = $SetFirst; Refresh = $Refresh
         ThumbRect = $null; MaxFirst = 0; TrackRange = 0
         Dragging = $false; Hover = $false; DragStartY = 0; DragStartFirst = 0
+        Primed = $false
     }
     $bar.Add_Paint({
         param($s, $e)
@@ -3327,6 +3387,26 @@ function Update-ThemedScrollBar {
         $Bar.Tag.ThumbRect = $null
         return
     }
+    if (-not $Bar.Tag.Primed -and $Bar.Tag.Refresh) {
+        # First time this ListBox-backed bar has ever actually had enough
+        # content to need scrolling: settle WinForms' own "does this list
+        # need its native scrollbar" discovery right now instead of
+        # leaving it for the user's first real scroll gesture. A TopIndex
+        # change re-adds WS_VSCROLL (see Hide-ListBoxNativeScrollBar) and
+        # WinForms paints that native scrollbar synchronously as part of
+        # the same call, before Refresh above gets a chance to hide it
+        # again - invisible here only because this first call typically
+        # happens during dialog setup, before ShowDialog. Nudging the
+        # scroll position once and back means that discovery-and-repaint
+        # already happened by the time the user can actually see the
+        # window, instead of flashing on their first real scroll.
+        $Bar.Tag.Primed = $true
+        $originalFirst = [int]$info.First
+        & $Bar.Tag.SetFirst ([Math]::Min($total - $shown, $originalFirst + 1))
+        & $Bar.Tag.SetFirst $originalFirst
+        & $Bar.Tag.Refresh
+        $info = & $Bar.Tag.GetInfo
+    }
     $Bar.Visible = $true
     $trackHeight = $Bar.ClientSize.Height
     $thumbHeight = [Math]::Max(20, [int]($trackHeight * $shown / $total))
@@ -3406,28 +3486,42 @@ function Enable-TextBoxScrollBar {
     $msgGetFirstVisibleLine = $script:EM_GETFIRSTVISIBLELINE
     $msgLineScroll = $script:EM_LINESCROLL
 
+    # Every SendMessage call below is guarded - unlike a managed property
+    # access, a Win32 call against a Handle that's gone stale (control
+    # disposed while a Resize/TextChanged/MouseWheel event was still in
+    # flight, e.g. a live-tail timer ticking just as its owning dialog
+    # closes) throws instead of quietly no-oping. Enable-GridScrollBar's
+    # FirstDisplayedScrollingRowIndex setter and Enable-ListBoxScrollBar's
+    # TopIndex setter already guard the equivalent call the same way; this
+    # brings the TextBox/RichTextBox variant in line with both siblings
+    # instead of being the one that can crash an event handler.
     $getInfo = {
-        $total = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetLineCount, [IntPtr]::Zero, [IntPtr]::Zero)
-        $first = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
+        try {
+            $total = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetLineCount, [IntPtr]::Zero, [IntPtr]::Zero)
+            $first = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
+        } catch {
+            $total = 0
+            $first = 0
+        }
         $lineHeight = [Math]::Max(1, $TextBox.Font.Height)
         $shown = [Math]::Max(1, [int]($TextBox.ClientSize.Height / $lineHeight))
         [PSCustomObject]@{ First = $first; Total = $total; Shown = $shown }
     }.GetNewClosure()
     $setFirst = {
         param($n)
-        $current = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
-        $delta = $n - $current
-        if ($delta -eq 0) { return }
-        [LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$delta) | Out-Null
+        try {
+            $current = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
+            $delta = $n - $current
+            if ($delta -eq 0) { return }
+            [LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$delta) | Out-Null
+        } catch {}
     }.GetNewClosure()
     $bar = New-ThemedScrollBar -GetInfo $getInfo -SetFirst $setFirst
 
     $TextBox.Add_MouseWheel({
         param($s, $e)
-        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
-        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
-        $lines = 3 * $notches * $dir
-        [LocalhostManager.EditScroll]::SendMessage($s.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$lines) | Out-Null
+        $lines = Get-WheelScrollLines -Delta $e.Delta
+        try { [LocalhostManager.EditScroll]::SendMessage($s.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$lines) | Out-Null } catch {}
         Update-ThemedScrollBar -Bar $bar
         if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
     }.GetNewClosure())
@@ -3476,17 +3570,36 @@ function Enable-ListBoxScrollBar {
         $shown = [Math]::Max(1, [int]($ListBox.ClientSize.Height / $itemH))
         [PSCustomObject]@{ First = [Math]::Max(0, $ListBox.TopIndex); Total = $ListBox.Items.Count; Shown = $shown }
     }.GetNewClosure()
-    $setFirst = { param($n) try { $ListBox.TopIndex = $n } catch {} }.GetNewClosure()
+    # BeginUpdate/EndUpdate (WM_SETREDRAW under the hood) bracket every
+    # TopIndex change - not just the Hide-ListBoxNativeScrollBar re-strip
+    # call, but the change itself, with the re-strip happening BEFORE
+    # EndUpdate re-enables painting. A TopIndex change re-adds WS_VSCROLL
+    # (see Hide-ListBoxNativeScrollBar) and WinForms paints that native
+    # scrollbar SYNCHRONOUSLY as part of the same call - before this
+    # function's own code below ever gets a chance to react and hide it
+    # again, so reacting fast still isn't fast enough to avoid a visible
+    # frame. Suppressing all painting for the whole bracket means the one
+    # paint that eventually happens (at EndUpdate) already reflects the
+    # corrected, native-scrollbar-hidden state - there's no intermediate
+    # frame left to flash.
+    $setFirst = {
+        param($n)
+        $ListBox.BeginUpdate()
+        try { $ListBox.TopIndex = $n } catch {}
+        Hide-ListBoxNativeScrollBar -ListBox $ListBox
+        $ListBox.EndUpdate()
+    }.GetNewClosure()
     $refresh = { Hide-ListBoxNativeScrollBar -ListBox $ListBox }.GetNewClosure()
     $bar = New-ThemedScrollBar -GetInfo $getInfo -SetFirst $setFirst -Refresh $refresh
 
     $ListBox.Add_MouseWheel({
         param($s, $e)
-        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
-        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
         $maxTop = [Math]::Max(0, $s.Items.Count - 1)
-        $newTop = [Math]::Max(0, [Math]::Min($maxTop, $s.TopIndex + (3 * $notches * $dir)))
+        $newTop = [Math]::Max(0, [Math]::Min($maxTop, $s.TopIndex + (Get-WheelScrollLines -Delta $e.Delta)))
+        $s.BeginUpdate()
         try { $s.TopIndex = $newTop } catch {}
+        Hide-ListBoxNativeScrollBar -ListBox $s
+        $s.EndUpdate()
         Update-ThemedScrollBar -Bar $bar
         if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
     }.GetNewClosure())
@@ -3670,12 +3783,10 @@ function New-PortsGrid {
     $g.Add_MouseWheel({
         param($s, $e)
         if ($s.RowCount -le 0) { return }
-        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
-        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
         $shown = $s.DisplayedRowCount($true)
         $maxFirst = [Math]::Max(0, $s.RowCount - $shown)
         $current = [Math]::Max(0, $s.FirstDisplayedScrollingRowIndex)
-        $newFirst = [Math]::Max(0, [Math]::Min($maxFirst, $current + (3 * $notches * $dir)))
+        $newFirst = [Math]::Max(0, [Math]::Min($maxFirst, $current + (Get-WheelScrollLines -Delta $e.Delta)))
         try { $s.FirstDisplayedScrollingRowIndex = $newFirst } catch {}
         Update-GridScrollBar -Grid $s
         if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
@@ -4373,7 +4484,12 @@ function Get-MissingBuildScriptWarning {
         return "No package.json found in `"$WorkingDir`" - is the project folder correct?"
     }
     try {
-        $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+        $raw = Get-Content $pkgPath -Raw -ErrorAction Stop
+    } catch {
+        return "Could not read `"$pkgPath`" ($($_.Exception.Message)) - can't check its scripts."
+    }
+    try {
+        $pkg = $raw | ConvertFrom-Json
     } catch {
         return "`"$pkgPath`" is not valid JSON - can't check its scripts."
     }
@@ -5498,17 +5614,7 @@ function Show-DeployConfigDialog {
     # looks like the rest of the app instead of a native control.
     $targetsList.Add_DrawItem({
         param($s, $e)
-        if ($e.Index -lt 0) { return }
-        $isSelected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
-        $bg = if ($isSelected) { $script:Theme.AccentTint } else { $script:Theme.CardBg }
-        $fg = if ($isSelected) { $script:Theme.Accent } else { $script:Theme.TextPrimary }
-        $bgBrush = New-Object System.Drawing.SolidBrush($bg)
-        $e.Graphics.FillRectangle($bgBrush, $e.Bounds)
-        $bgBrush.Dispose()
-        $text = $s.Items[$e.Index].ToString()
-        $textRect = New-Object System.Drawing.Rectangle(($e.Bounds.X + 4), $e.Bounds.Y, [Math]::Max(1, $e.Bounds.Width - 4), $e.Bounds.Height)
-        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::NoClipping
-        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $e.Font, $textRect, $fg, $flags)
+        Invoke-ThemedListItemDraw -Sender $s -EventArgs $e -LeftPad 4 -RightPad 0
     })
 
     # script: scope - called from GetNewClosure()'d handlers below, which
@@ -6753,17 +6859,7 @@ HOW THIS APP CATCHES IT NOW
     $topicList.ItemHeight = [System.Windows.Forms.TextRenderer]::MeasureText('Ag', $topicList.Font).Height + 8
     $topicList.Add_DrawItem({
         param($s, $e)
-        if ($e.Index -lt 0) { return }
-        $isSelected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
-        $bg = if ($isSelected) { $script:Theme.AccentTint } else { $script:Theme.CardBg }
-        $fg = if ($isSelected) { $script:Theme.Accent } else { $script:Theme.TextPrimary }
-        $bgBrush = New-Object System.Drawing.SolidBrush($bg)
-        $e.Graphics.FillRectangle($bgBrush, $e.Bounds)
-        $bgBrush.Dispose()
-        $text = $s.Items[$e.Index].ToString()
-        $textRect = New-Object System.Drawing.Rectangle(($e.Bounds.X + 6), $e.Bounds.Y, [Math]::Max(1, $e.Bounds.Width - 10), $e.Bounds.Height)
-        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::WordEllipsis
-        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $e.Font, $textRect, $fg, $flags)
+        Invoke-ThemedListItemDraw -Sender $s -EventArgs $e -LeftPad 6 -RightPad 4 -Ellipsis
     })
     foreach ($t in $topics) { [void]$topicList.Items.Add($t.Title) }
     $topicList.Add_SelectedIndexChanged({
@@ -7837,6 +7933,13 @@ function Show-ManageGroupsDialog {
             if ($filter) { $state.KnownProjects | Where-Object { $_.Label -like "*$filter*" } }
             else { $state.KnownProjects }
         )
+        # BeginUpdate/EndUpdate around the whole repopulation, same reason
+        # as Enable-ListBoxScrollBar's SetFirst - Items.Clear()/Add() and
+        # SetItemChecked all independently re-add WS_VSCROLL and paint the
+        # native scrollbar synchronously, and re-stripping it only after
+        # EndUpdate re-enables painting means that one eventual repaint
+        # already reflects the corrected state.
+        $projList.BeginUpdate()
         $projList.Items.Clear()
         foreach ($p in $state.FilteredProjects) { [void]$projList.Items.Add($p.Label) }
         for ($i = 0; $i -lt $state.FilteredProjects.Count; $i++) {
@@ -7845,6 +7948,8 @@ function Show-ManageGroupsDialog {
                 $projList.SetItemChecked($i, $true)
             }
         }
+        Hide-ListBoxNativeScrollBar -ListBox $projList
+        $projList.EndUpdate()
         Update-ThemedScrollBar -Bar $projScroll.Bar
     }
 

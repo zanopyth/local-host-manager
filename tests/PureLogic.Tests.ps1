@@ -19,6 +19,10 @@
 # `Should Be` still works there too, so no changes needed.
 
 $script:AppPath = Join-Path $PSScriptRoot '..\LocalhostManager.ps1'
+# Get-ReadableTextColor (below) is the first function in this suite that
+# touches System.Drawing - the real app loads it as a side effect of its
+# own WinForms startup code, which this suite deliberately never runs.
+Add-Type -AssemblyName System.Drawing
 
 # Returns the source text of each named top-level function, pulled out of
 # LocalhostManager.ps1 via the AST. Deliberately just returns text rather
@@ -51,7 +55,10 @@ foreach ($source in (Get-PureFunctionSource -Names @(
     'Get-SearchFilteredDisplay',
     'Test-LogEntryMatchesProject',
     'Get-NearestExistingAncestor',
-    'Get-CollapsedPathDisplay'
+    'Get-CollapsedPathDisplay',
+    'Get-WheelScrollLines',
+    'Get-NpmScriptNameFromCommand',
+    'Get-ReadableTextColor'
 ))) {
     . ([scriptblock]::Create($source))
 }
@@ -356,5 +363,68 @@ Describe 'Get-CollapsedPathDisplay' {
     }
     It 'returns empty input unchanged' {
         Get-CollapsedPathDisplay -Path '' | Should Be ''
+    }
+}
+
+Describe 'Get-WheelScrollLines' {
+    # Windows wheel convention: positive Delta is the wheel rotated away
+    # from the user (scroll up/back), negative is toward the user (scroll
+    # down/forward) - the sign of the return value is deliberately the
+    # opposite of Delta's, since "scroll down" means the first-visible
+    # index should increase.
+    It 'moves forward (positive) for one wheel-down notch (negative Delta)' {
+        Get-WheelScrollLines -Delta -120 | Should Be 3
+    }
+    It 'moves backward (negative) for one wheel-up notch (positive Delta)' {
+        Get-WheelScrollLines -Delta 120 | Should Be -3
+    }
+    It 'scales with multiple notches reported in one event' {
+        Get-WheelScrollLines -Delta -360 | Should Be 9
+    }
+    It 'still counts as at least one notch for a Delta smaller than 120' {
+        Get-WheelScrollLines -Delta -40 | Should Be 3
+    }
+    It 'honors a custom LinesPerNotch' {
+        Get-WheelScrollLines -Delta -120 -LinesPerNotch 1 | Should Be 1
+    }
+}
+
+Describe 'Get-NpmScriptNameFromCommand' {
+    It 'extracts the script name from a plain npm run command' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'npm run build' | Should Be 'build'
+    }
+    It 'extracts the script name from npm run-script' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'npm run-script build' | Should Be 'build'
+    }
+    It 'works for yarn and pnpm too, including a colon in the script name' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'yarn run build:prod' | Should Be 'build:prod'
+        Get-NpmScriptNameFromCommand -BuildCommand 'pnpm run build' | Should Be 'build'
+    }
+    It 'stops at a chaining operator rather than swallowing the rest of the line' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'npm run build && echo done' | Should Be 'build'
+    }
+    It 'returns $null for a bare build command with no manager' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'vite build' | Should Be $null
+    }
+    It 'returns $null for a manager subcommand that is not "run"' {
+        Get-NpmScriptNameFromCommand -BuildCommand 'npm install' | Should Be $null
+    }
+    It 'returns $null for empty input' {
+        Get-NpmScriptNameFromCommand -BuildCommand '' | Should Be $null
+    }
+}
+
+Describe 'Get-ReadableTextColor' {
+    It 'picks black for a light background (Terminal theme''s Accent)' {
+        Get-ReadableTextColor -BackgroundColor ([System.Drawing.Color]::FromArgb(0x89, 0xB4, 0xFA)) | Should Be ([System.Drawing.Color]::Black)
+    }
+    It 'picks white for a darker background (Dark theme''s Accent)' {
+        Get-ReadableTextColor -BackgroundColor ([System.Drawing.Color]::FromArgb(0x58, 0x65, 0xF2)) | Should Be ([System.Drawing.Color]::White)
+    }
+    It 'picks white for pure black' {
+        Get-ReadableTextColor -BackgroundColor ([System.Drawing.Color]::Black) | Should Be ([System.Drawing.Color]::White)
+    }
+    It 'picks black for pure white' {
+        Get-ReadableTextColor -BackgroundColor ([System.Drawing.Color]::White) | Should Be ([System.Drawing.Color]::Black)
     }
 }
