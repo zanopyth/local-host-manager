@@ -101,6 +101,44 @@ Add-Type -Name DwmApi -Namespace LocalhostManager -MemberDefinition @"
 public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 "@
 
+# Backs the themed scrollbar's TextBox/RichTextBox variant (see
+# Enable-TextBoxScrollBar) and its ListBox variant (Enable-ListBoxScrollBar).
+# A multiline TextBox/RichTextBox has no managed "which line is on top" or
+# "scroll to this line" API - only the underlying Win32 Edit/RichEdit window
+# does, via these three messages - so driving it means talking to the
+# window directly. A ListBox's native vertical scrollbar, unlike its
+# content scrolling (TopIndex, a real managed property), also has no
+# managed way to hide just that one style bit - GetWindowLongPtr/
+# SetWindowLongPtr strip WS_VSCROLL from GWL_STYLE directly.
+# EM_LINESCROLL's line count goes in lParam directly (verified empirically
+# against both a plain TextBox and a RichTextBox - passing the signed line
+# count as-is moves the first-visible-line by exactly that amount, positive
+# or negative; MSDN's own wording ("HIWORD specifies lines to scroll")
+# describes a different, HIWORD-packed convention that does NOT hold for
+# either control here - a packed value there was observed to snap straight
+# to the first/last line instead of scrolling by N), so no MAKELPARAM-style
+# bit-packing is needed - just cast the delta to IntPtr.
+Add-Type -Name EditScroll -Namespace LocalhostManager -MemberDefinition @"
+[DllImport("user32.dll", CharSet = CharSet.Auto)]
+public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+[DllImport("user32.dll")]
+public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+[DllImport("user32.dll")]
+public static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+[DllImport("user32.dll")]
+public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+"@
+$script:EM_GETFIRSTVISIBLELINE = 0x00CE
+$script:EM_GETLINECOUNT = 0x00BA
+$script:EM_LINESCROLL = 0x00B6
+$script:GWL_STYLE = -16
+$script:WS_VSCROLL = 0x00200000
+$script:SWP_FRAMECHANGED = 0x0020
+$script:SWP_NOMOVE_NOSIZE_NOZORDER = 0x0001 -bor 0x0002 -bor 0x0004
+
 # WinForms client-area colors never reach the native title bar/window frame
 # Windows itself draws - that's DWM chrome, opted into dark rendering via
 # this specific attribute (Windows 10 2004+ and all of Windows 11). Without
@@ -115,47 +153,6 @@ function Set-DarkTitleBar {
     } catch {}
 }
 
-Add-Type -Name ScrollBarTheme -Namespace LocalhostManager -MemberDefinition @"
-[DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
-public static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
-
-public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
-
-[DllImport("user32.dll")]
-public static extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam);
-
-[DllImport("user32.dll", CharSet = CharSet.Auto)]
-public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
-"@
-
-# The DataGridView's scrollbars (the horizontal one is the visible offender
-# - a plain white/light native bar no matter the app's theme, since
-# there's no managed API to recolor a native ScrollBar control) are real
-# child ScrollBar windows, not owner-drawn. SetWindowTheme's undocumented
-# but long-stable "DarkMode_Explorer" subapp name is what Windows' own
-# dark mode uses for exactly this class - not a pixel-exact Catppuccin
-# Mocha match (Windows renders its own fixed dark gray, not our theme's
-# specific hues), but a real dark scrollbar instead of a jarring white
-# one. Has to be re-run whenever a scrollbar could have newly appeared,
-# not just once at grid creation - DataGridView doesn't create the
-# ScrollBar child window until a scrollbar first actually becomes
-# necessary, so an earlier EnumChildWindows pass simply won't find it yet.
-function Set-DarkScrollBars {
-    param($Control)
-    if (-not $script:Theme.IsDark) { return }
-    try {
-        $callback = {
-            param($hWnd, $lParam)
-            $sb = New-Object System.Text.StringBuilder 256
-            [LocalhostManager.ScrollBarTheme]::GetClassName($hWnd, $sb, 256) | Out-Null
-            if ($sb.ToString() -eq 'ScrollBar') {
-                [LocalhostManager.ScrollBarTheme]::SetWindowTheme($hWnd, 'DarkMode_Explorer', $null) | Out-Null
-            }
-            return $true
-        }
-        [LocalhostManager.ScrollBarTheme]::EnumChildWindows($Control.Handle, $callback, [IntPtr]::Zero) | Out-Null
-    } catch {}
-}
 
 # Recolors MenuStrip/ContextMenuStrip chrome (dropdown background, image
 # margin, hover/press highlight, borders) for the dark theme — the default
@@ -2222,7 +2219,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.18.9'
+$script:AppVersion = '1.19.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2439,6 +2436,76 @@ function Connect-ToggleLabel {
     param($Switch, $Label)
     $Label.Cursor = [System.Windows.Forms.Cursors]::Hand
     $Label.Add_Click({ Invoke-ToggleClick -Switch $Switch }.GetNewClosure())
+}
+
+function New-ThemedCheckBox {
+    # A themed square checkbox - same owner-drawn Panel + paired Label
+    # architecture as New-ToggleSwitch above, for a setting that's actually
+    # a checkbox (an independent on/off condition, e.g. Manage Groups'
+    # "Show All Ports"), not an immediate action a pill-shaped switch fits
+    # better. Deliberately always a plain square (no Theme.Radius pill/
+    # rounding branch like the toggle switch has) - a checkbox reads fine
+    # as a square in every theme, including Light/Dark, not just Terminal.
+    param([bool]$Checked = $false)
+    $cb = New-Object System.Windows.Forms.Panel
+    $cb.Size = New-Object System.Drawing.Size(16, 16)
+    $cb.Tag = [PSCustomObject]@{ Checked = $Checked; OnChange = $null }
+    $cb.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $cb.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $isOn = $s.Tag.Checked
+        $fillColor = if ($isOn) { $script:Theme.Accent } else { $script:Theme.CardBg }
+        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+        $g.FillRectangle($fillBrush, 0, 0, ($s.Width - 1), ($s.Height - 1))
+        $fillBrush.Dispose()
+        $borderPen = New-Object System.Drawing.Pen($script:Theme.Border, 1)
+        $g.DrawRectangle($borderPen, 0, 0, ($s.Width - 1), ($s.Height - 1))
+        $borderPen.Dispose()
+        if ($isOn) {
+            $checkPen = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 2)
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            [System.Drawing.Point[]]$checkPoints = @(
+                (New-Object System.Drawing.Point(3, 8)),
+                (New-Object System.Drawing.Point(6, 12)),
+                (New-Object System.Drawing.Point(13, 3))
+            )
+            $g.DrawLines($checkPen, $checkPoints)
+            $checkPen.Dispose()
+        }
+    })
+    $cb.Add_Click({ param($s, $e) Invoke-ThemedCheckBoxClick -CheckBox $s })
+    return $cb
+}
+
+function Invoke-ThemedCheckBoxClick {
+    param($CheckBox)
+    $CheckBox.Tag.Checked = -not $CheckBox.Tag.Checked
+    $CheckBox.Invalidate()
+    if ($CheckBox.Tag.OnChange) { & $CheckBox.Tag.OnChange }
+}
+
+function Get-ThemedCheckBoxChecked {
+    param($CheckBox)
+    return [bool]$CheckBox.Tag.Checked
+}
+
+function Set-ThemedCheckBoxChecked {
+    param($CheckBox, [bool]$Value)
+    $CheckBox.Tag.Checked = $Value
+    $CheckBox.Invalidate()
+}
+
+function Set-ThemedCheckBoxOnChange {
+    param($CheckBox, [scriptblock]$Handler)
+    $CheckBox.Tag.OnChange = $Handler
+}
+
+function Connect-ThemedCheckBoxLabel {
+    # Lets clicking the caption label toggle the checkbox next to it too.
+    param($CheckBox, $Label)
+    $Label.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Label.Add_Click({ Invoke-ThemedCheckBoxClick -CheckBox $CheckBox }.GetNewClosure())
 }
 
 # ---------------------------------------------------------------------------
@@ -3049,7 +3116,11 @@ function Update-SystemTabState {
     # inert and swaps in an explanatory placeholder instead of an empty grid.
     $show = [bool]$script:Settings.ShowSystemPorts
     Set-CustomTabEnabled -TabSet $script:MainTabs -Index 2 -Enabled $show
-    $systemGrid.Visible = $show
+    # Toggles the scroll wrapper, not $systemGrid directly - $systemGrid
+    # is nested inside it now (see New-PortsGrid), and hiding just the
+    # grid would leave the wrapper's own background (and scrollbar strip)
+    # covering the placeholder label underneath.
+    $systemGrid.Tag.ScrollWrapper.Visible = $show
     $systemPlaceholderLabel.Visible = -not $show
 }
 
@@ -3141,6 +3212,291 @@ Update-ScopeLabel
 # index map instead of per-grid column objects.
 $script:ColIdx = @{ Status = 0; Port = 1; Pin = 2; CustomName = 3; Process = 4; PID = 5; Cpu = 6; Mem = 7; LocalUrl = 8; LanUrls = 9; ProjectPath = 10; Log = 11; Action = 12 }
 $dgvDoubleBufferProp = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+
+function New-ThemedScrollBar {
+    # Generic themed vertical scrollbar - track/thumb painted from
+    # $script:Theme (the only way to genuinely match the Terminal/Dark/
+    # Light palette; WinForms has no managed API to recolor a real native
+    # ScrollBar control, and SetWindowTheme's DarkMode_Explorer, this
+    # app's previous approach, only ever gets Windows' own fixed dark
+    # gray). Supports drag-to-scroll and click-track-to-page. Entirely
+    # driven through two caller-supplied scriptblocks rather than any one
+    # control's specific API - GetInfo returns the current
+    # @{First;Total;Shown} in item-index terms (which item is first
+    # visible, how many items total, how many fit on screen at once),
+    # SetFirst is called with a single already-clamped target index to
+    # actually move the content. Shared by every control this app themes
+    # this way (DataGridView via Enable-GridScrollBar, multiline TextBox/
+    # RichTextBox via Enable-TextBoxScrollBar, ListBox via
+    # Enable-ListBoxScrollBar) instead of near-identical copies of this
+    # paint/drag logic for each. Refresh is optional - a scriptblock
+    # Update-ThemedScrollBar runs before every recompute, for state a
+    # control's own internals can silently reassert on their own (see
+    # Enable-ListBoxScrollBar's use of it - hiding the native ScrollBar
+    # there isn't a one-time fix, so it has to be redone on every update).
+    param([scriptblock]$GetInfo, [scriptblock]$SetFirst, [scriptblock]$Refresh)
+    $bar = New-Object System.Windows.Forms.Panel
+    $bar.Dock = 'Right'
+    $bar.Width = 10
+    $bar.Tag = [PSCustomObject]@{
+        GetInfo = $GetInfo; SetFirst = $SetFirst; Refresh = $Refresh
+        ThumbRect = $null; MaxFirst = 0; TrackRange = 0
+        Dragging = $false; Hover = $false; DragStartY = 0; DragStartFirst = 0
+    }
+    $bar.Add_Paint({
+        param($s, $e)
+        $trackBrush = New-Object System.Drawing.SolidBrush($script:Theme.PanelBg)
+        $e.Graphics.FillRectangle($trackBrush, $s.ClientRectangle)
+        $trackBrush.Dispose()
+        if (-not $s.Tag.ThumbRect) { return }
+        $thumbColor = if ($s.Tag.Dragging -or $s.Tag.Hover) { $script:Theme.Accent } else { $script:Theme.Border }
+        $thumbBrush = New-Object System.Drawing.SolidBrush($thumbColor)
+        $e.Graphics.FillRectangle($thumbBrush, $s.Tag.ThumbRect)
+        $thumbBrush.Dispose()
+    })
+    $bar.Add_MouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $rect = $s.Tag.ThumbRect
+        if (-not $rect) { return }
+        if ($e.Y -ge $rect.Top -and $e.Y -le $rect.Bottom) {
+            $info = & $s.Tag.GetInfo
+            $s.Tag.Dragging = $true
+            $s.Tag.DragStartY = $e.Y
+            $s.Tag.DragStartFirst = [Math]::Max(0, [int]$info.First)
+            $s.Capture = $true
+            $s.Invalidate()
+            return
+        }
+        # Clicked the track above/below the thumb - page toward the click.
+        $info = & $s.Tag.GetInfo
+        $page = [Math]::Max(1, [int]$info.Shown)
+        $dir = if ($e.Y -lt $rect.Top) { -1 } else { 1 }
+        $newFirst = [Math]::Max(0, [Math]::Min($s.Tag.MaxFirst, [int]$info.First + ($dir * $page)))
+        & $s.Tag.SetFirst $newFirst
+        Update-ThemedScrollBar -Bar $s
+    }.GetNewClosure())
+    $bar.Add_MouseMove({
+        param($s, $e)
+        if (-not $s.Tag.Dragging) {
+            $rect = $s.Tag.ThumbRect
+            $overThumb = [bool]($rect -and $e.Y -ge $rect.Top -and $e.Y -le $rect.Bottom)
+            if ($overThumb -ne $s.Tag.Hover) { $s.Tag.Hover = $overThumb; $s.Invalidate() }
+            return
+        }
+        if ($s.Tag.TrackRange -le 0) { return }
+        $deltaY = $e.Y - $s.Tag.DragStartY
+        $deltaRows = [int][Math]::Round($deltaY * $s.Tag.MaxFirst / $s.Tag.TrackRange)
+        $newFirst = [Math]::Max(0, [Math]::Min($s.Tag.MaxFirst, $s.Tag.DragStartFirst + $deltaRows))
+        & $s.Tag.SetFirst $newFirst
+        Update-ThemedScrollBar -Bar $s
+    }.GetNewClosure())
+    $bar.Add_MouseUp({
+        param($s, $e)
+        if (-not $s.Tag.Dragging) { return }
+        $s.Tag.Dragging = $false
+        $s.Capture = $false
+        $s.Invalidate()
+    }.GetNewClosure())
+    $bar.Add_MouseLeave({
+        param($s, $e)
+        if ($s.Tag.Dragging -or -not $s.Tag.Hover) { return }
+        $s.Tag.Hover = $false
+        $s.Invalidate()
+    }.GetNewClosure())
+    return $bar
+}
+
+function Update-ThemedScrollBar {
+    # Recomputes $Bar's thumb size/position from its own GetInfo
+    # scriptblock and repaints it. Item-count-based, not pixel-exact - for
+    # the grid, DisplayedRowCount/RowCount already account for variable
+    # row heights internally, the same approximation a native scrollbar
+    # itself effectively makes. Must be re-run whenever what's visible can
+    # have changed: content change, control resize, or the content
+    # actually scrolling (wheel/keyboard/drag) - see each Enable-*
+    # function for exactly which events it's wired to.
+    param($Bar)
+    if (-not $Bar -or $Bar.IsDisposed) { return }
+    if ($Bar.Tag.Refresh) { & $Bar.Tag.Refresh }
+    $info = & $Bar.Tag.GetInfo
+    $total = [int]$info.Total
+    $shown = [int]$info.Shown
+    if ($total -le 0 -or $shown -ge $total) {
+        $Bar.Visible = $false
+        $Bar.Tag.ThumbRect = $null
+        return
+    }
+    $Bar.Visible = $true
+    $trackHeight = $Bar.ClientSize.Height
+    $thumbHeight = [Math]::Max(20, [int]($trackHeight * $shown / $total))
+    $maxFirst = $total - $shown
+    $first = [Math]::Max(0, [int]$info.First)
+    $trackRange = $trackHeight - $thumbHeight
+    $thumbTop = if ($maxFirst -gt 0 -and $trackRange -gt 0) { [int]($trackRange * $first / $maxFirst) } else { 0 }
+    $Bar.Tag.ThumbRect = New-Object System.Drawing.Rectangle(1, $thumbTop, ([Math]::Max(1, $Bar.ClientSize.Width - 2)), $thumbHeight)
+    $Bar.Tag.MaxFirst = $maxFirst
+    $Bar.Tag.TrackRange = $trackRange
+    $Bar.Invalidate()
+}
+
+function Enable-GridScrollBar {
+    # Wires the generic themed scrollbar to a DataGridView - GetInfo reads
+    # FirstDisplayedScrollingRowIndex/RowCount/DisplayedRowCount, SetFirst
+    # writes FirstDisplayedScrollingRowIndex (guarded - it throws given an
+    # out-of-range or momentarily-invalid index). Column widths are always
+    # Fill mode (see AutoSizeColumnsMode in New-PortsGrid) so a horizontal
+    # scrollbar can never occur here - only vertical needs this.
+    param($Grid)
+    $getInfo = {
+        [PSCustomObject]@{
+            First = [Math]::Max(0, $Grid.FirstDisplayedScrollingRowIndex)
+            Total = $Grid.RowCount
+            Shown = $(if ($Grid.RowCount -gt 0) { $Grid.DisplayedRowCount($true) } else { 0 })
+        }
+    }.GetNewClosure()
+    $setFirst = { param($n) try { $Grid.FirstDisplayedScrollingRowIndex = $n } catch {} }.GetNewClosure()
+    return New-ThemedScrollBar -GetInfo $getInfo -SetFirst $setFirst
+}
+
+function Update-GridScrollBar {
+    # Thin by-grid convenience wrapper around Update-ThemedScrollBar, kept
+    # so Render-Grid and the grid's own Resize/Scroll/MouseWheel handlers
+    # (New-PortsGrid) can address "the scrollbar for this grid" without
+    # each holding onto the bar Panel directly - it's reached via
+    # $Grid.Tag.VScrollBar (see New-PortsGrid).
+    param($Grid)
+    Update-ThemedScrollBar -Bar $Grid.Tag.VScrollBar
+}
+
+function Enable-TextBoxScrollBar {
+    # Same themed-scrollbar treatment as the grid's, for a multiline
+    # TextBox or RichTextBox (both are Win32 Edit-family windows and
+    # answer the same EM_* messages) - hides the native scrollbar
+    # ($TextBox.ScrollBars = 'None') and drives scroll position via
+    # SendMessage instead of a managed API, since neither control exposes
+    # "which line is on top" or "scroll to this line" directly.
+    # ScrollToCaret()/AppendText's own auto-scroll keep working unchanged
+    # - EM_SCROLLCARET (what those call internally) isn't gated by the
+    # ScrollBars style, only the visible chrome is. Also restores mouse
+    # wheel scrolling: with ScrollBars set to 'None', the control's own
+    # built-in wheel handling stops doing anything (the same underlying
+    # quirk hit on the DataGridView - see New-PortsGrid's MouseWheel
+    # handler), so wheel input has to be done by hand here too, via
+    # EM_LINESCROLL rather than a managed API for the same reason as
+    # SetFirst below.
+    param($TextBox)
+    $TextBox.ScrollBars = 'None'
+    $wrapper = New-Object System.Windows.Forms.Panel
+    $wrapper.BackColor = $TextBox.BackColor
+
+    # Local copies of the $script:-scoped message constants, made BEFORE
+    # any .GetNewClosure() call below - verified empirically that a bare
+    # $script:-prefixed VARIABLE (unlike a $script:-prefixed FUNCTION,
+    # which resolves fine) reads back as $null from inside a
+    # GetNewClosure()'d scriptblock, since GetNewClosure() gives the block
+    # its own isolated SessionState where "script scope" means the
+    # closure's own, not this file's. That silently turned every
+    # SendMessage call below into msg=0 (WM_NULL, a harmless no-op) - the
+    # actual reason the themed scrollbar never showed or scrolled for any
+    # TextBox/RichTextBox. A plain local variable, by contrast, IS
+    # captured correctly by GetNewClosure() (that's its whole purpose), so
+    # closures reference these instead of the $script: originals.
+    $msgGetLineCount = $script:EM_GETLINECOUNT
+    $msgGetFirstVisibleLine = $script:EM_GETFIRSTVISIBLELINE
+    $msgLineScroll = $script:EM_LINESCROLL
+
+    $getInfo = {
+        $total = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetLineCount, [IntPtr]::Zero, [IntPtr]::Zero)
+        $first = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
+        $lineHeight = [Math]::Max(1, $TextBox.Font.Height)
+        $shown = [Math]::Max(1, [int]($TextBox.ClientSize.Height / $lineHeight))
+        [PSCustomObject]@{ First = $first; Total = $total; Shown = $shown }
+    }.GetNewClosure()
+    $setFirst = {
+        param($n)
+        $current = [int][LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgGetFirstVisibleLine, [IntPtr]::Zero, [IntPtr]::Zero)
+        $delta = $n - $current
+        if ($delta -eq 0) { return }
+        [LocalhostManager.EditScroll]::SendMessage($TextBox.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$delta) | Out-Null
+    }.GetNewClosure()
+    $bar = New-ThemedScrollBar -GetInfo $getInfo -SetFirst $setFirst
+
+    $TextBox.Add_MouseWheel({
+        param($s, $e)
+        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
+        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
+        $lines = 3 * $notches * $dir
+        [LocalhostManager.EditScroll]::SendMessage($s.Handle, $msgLineScroll, [IntPtr]::Zero, [IntPtr]$lines) | Out-Null
+        Update-ThemedScrollBar -Bar $bar
+        if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
+    }.GetNewClosure())
+    $TextBox.Add_Resize({ Update-ThemedScrollBar -Bar $bar }.GetNewClosure())
+    $TextBox.Add_TextChanged({ Update-ThemedScrollBar -Bar $bar }.GetNewClosure())
+
+    $wrapper.Controls.Add($TextBox)
+    $wrapper.Controls.Add($bar)
+    Update-ThemedScrollBar -Bar $bar
+    return [PSCustomObject]@{ Wrapper = $wrapper; Bar = $bar }
+}
+
+function Hide-ListBoxNativeScrollBar {
+    # Clears WS_VSCROLL from a ListBox/CheckedListBox's own window style -
+    # a purely cosmetic style bit; TopIndex-based scrolling isn't gated by
+    # it. NOT a one-time fix despite that - verified empirically that
+    # WinForms' ListBox re-adds this style itself (independently of our
+    # GWL_STYLE write) whenever Items changes OR TopIndex is set, silently
+    # undoing a single removal at setup time. Called every time
+    # Update-ThemedScrollBar recomputes (see its Refresh param) so it's
+    # continually re-suppressed instead of winning only until the next
+    # scroll or item change brings the native chrome back.
+    param($ListBox)
+    try {
+        $style = [LocalhostManager.EditScroll]::GetWindowLongPtr($ListBox.Handle, $script:GWL_STYLE)
+        if (([int64]$style -band [int64]$script:WS_VSCROLL) -eq 0) { return }
+        $newStyle = [IntPtr]([int64]$style -band (-bnot [int64]$script:WS_VSCROLL))
+        [LocalhostManager.EditScroll]::SetWindowLongPtr($ListBox.Handle, $script:GWL_STYLE, $newStyle) | Out-Null
+        [LocalhostManager.EditScroll]::SetWindowPos($ListBox.Handle, [IntPtr]::Zero, 0, 0, 0, 0, ($script:SWP_NOMOVE_NOSIZE_NOZORDER -bor $script:SWP_FRAMECHANGED)) | Out-Null
+    } catch {}
+}
+
+function Enable-ListBoxScrollBar {
+    # Same treatment for a ListBox/CheckedListBox - hides the native
+    # vertical scrollbar (Hide-ListBoxNativeScrollBar) and drives position
+    # via TopIndex, which unlike a TextBox/RichTextBox IS a real managed
+    # property here - no Win32 messages needed to move it, only to
+    # repeatedly hide the native chrome (see Hide-ListBoxNativeScrollBar).
+    param($ListBox)
+    Hide-ListBoxNativeScrollBar -ListBox $ListBox
+    $wrapper = New-Object System.Windows.Forms.Panel
+    $wrapper.BackColor = $ListBox.BackColor
+
+    $getInfo = {
+        $itemH = [Math]::Max(1, $ListBox.ItemHeight)
+        $shown = [Math]::Max(1, [int]($ListBox.ClientSize.Height / $itemH))
+        [PSCustomObject]@{ First = [Math]::Max(0, $ListBox.TopIndex); Total = $ListBox.Items.Count; Shown = $shown }
+    }.GetNewClosure()
+    $setFirst = { param($n) try { $ListBox.TopIndex = $n } catch {} }.GetNewClosure()
+    $refresh = { Hide-ListBoxNativeScrollBar -ListBox $ListBox }.GetNewClosure()
+    $bar = New-ThemedScrollBar -GetInfo $getInfo -SetFirst $setFirst -Refresh $refresh
+
+    $ListBox.Add_MouseWheel({
+        param($s, $e)
+        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
+        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
+        $maxTop = [Math]::Max(0, $s.Items.Count - 1)
+        $newTop = [Math]::Max(0, [Math]::Min($maxTop, $s.TopIndex + (3 * $notches * $dir)))
+        try { $s.TopIndex = $newTop } catch {}
+        Update-ThemedScrollBar -Bar $bar
+        if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
+    }.GetNewClosure())
+    $ListBox.Add_Resize({ Update-ThemedScrollBar -Bar $bar }.GetNewClosure())
+
+    $wrapper.Controls.Add($ListBox)
+    $wrapper.Controls.Add($bar)
+    Update-ThemedScrollBar -Bar $bar
+    return [PSCustomObject]@{ Wrapper = $wrapper; Bar = $bar }
+}
 
 function New-PortsGrid {
     $g = New-Object System.Windows.Forms.DataGridView
@@ -3289,8 +3645,41 @@ function New-PortsGrid {
     $g.AllowUserToOrderColumns = $true
     $dgvDoubleBufferProp.SetValue($g, $true, $null)
     $g.Dock = 'Fill'
-    Set-DarkScrollBars -Control $g
-    $g.Add_Resize({ param($s, $e) Set-DarkScrollBars -Control $s })
+
+    # Native vertical scrollbar replaced by Enable-GridScrollBar's
+    # owner-drawn one (see New-ThemedScrollBar's comment for why) - $g
+    # itself stays Dock='Fill', now inside $scrollWrapper alongside the
+    # scrollbar strip instead of directly in its TabPage. Add order
+    # matters here: $g (Fill) added before $vScrollBar (Right) so Fill
+    # claims the leftover space AFTER the strip's dock is reserved - see
+    # the identical Fill-then-edge ordering already used for
+    # Show-DeployRunDialog's layout.
+    $g.ScrollBars = 'None'
+    $scrollWrapper = New-Object System.Windows.Forms.Panel
+    $scrollWrapper.BackColor = $script:Theme.CardBg
+    $vScrollBar = Enable-GridScrollBar -Grid $g
+    $scrollWrapper.Controls.Add($g)
+    $scrollWrapper.Controls.Add($vScrollBar)
+    $g.Add_Resize({ param($s, $e) Update-GridScrollBar -Grid $s })
+    $g.Add_Scroll({ param($s, $e) Update-GridScrollBar -Grid $s })
+    # ScrollBars='None' also silences the grid's own built-in mouse-wheel
+    # handling (it appears to gate on the native scrollbar's presence
+    # internally, not just its visibility) - wheel input has to be done
+    # by hand here instead, in the same row-index terms as everything
+    # else in Enable-GridScrollBar.
+    $g.Add_MouseWheel({
+        param($s, $e)
+        if ($s.RowCount -le 0) { return }
+        $notches = [Math]::Max(1, [int]([Math]::Abs($e.Delta) / 120))
+        $dir = if ($e.Delta -gt 0) { -1 } else { 1 }
+        $shown = $s.DisplayedRowCount($true)
+        $maxFirst = [Math]::Max(0, $s.RowCount - $shown)
+        $current = [Math]::Max(0, $s.FirstDisplayedScrollingRowIndex)
+        $newFirst = [Math]::Max(0, [Math]::Min($maxFirst, $current + (3 * $notches * $dir)))
+        try { $s.FirstDisplayedScrollingRowIndex = $newFirst } catch {}
+        Update-GridScrollBar -Grid $s
+        if ($e -is [System.Windows.Forms.HandledMouseEventArgs]) { $e.Handled = $true }
+    })
 
     # Column-resize handles in the header are invisible by default here
     # (ColumnHeadersBorderStyle is 'None', same reason as CellBorderStyle
@@ -3299,10 +3688,11 @@ function New-PortsGrid {
     # leaked vertical lines CellBorderStyle used to produce). Hand-drawn
     # dividers instead, and only while the mouse is actually over the
     # header bar, so the normal borderless look is undisturbed the rest
-    # of the time. $g.Tag (unused otherwise - row-level Tag is a
-    # different object, see Add-DataRow/Add-SeparatorRow) tracks hover
-    # state; CellPainting below does the actual drawing.
-    $g.Tag = [PSCustomObject]@{ HeaderHovered = $false }
+    # of the time. $g.Tag - row-level Tag is a different object, see
+    # Add-DataRow/Add-SeparatorRow - tracks header hover state plus the
+    # scroll wrapper/bar built above, so callers that only have $g (every
+    # existing reference in this file) can still reach both.
+    $g.Tag = [PSCustomObject]@{ HeaderHovered = $false; ScrollWrapper = $scrollWrapper; VScrollBar = $vScrollBar }
     $g.Add_MouseMove({
         param($s, $e)
         $overHeader = $e.Y -ge 0 -and $e.Y -lt $s.ColumnHeadersHeight
@@ -3533,8 +3923,10 @@ Update-ColumnLayout
 $script:MainTabs = New-CustomTabControl -Labels @('Live', 'History', 'System')
 $script:MainTabs.Root.Anchor = 'Top,Bottom,Left,Right'
 
-$script:MainTabs.Pages[0].Controls.Add($liveGrid)
-$script:MainTabs.Pages[1].Controls.Add($historyGrid)
+$liveGrid.Tag.ScrollWrapper.Dock = 'Fill'
+$historyGrid.Tag.ScrollWrapper.Dock = 'Fill'
+$script:MainTabs.Pages[0].Controls.Add($liveGrid.Tag.ScrollWrapper)
+$script:MainTabs.Pages[1].Controls.Add($historyGrid.Tag.ScrollWrapper)
 
 $systemPlaceholderLabel = New-Object System.Windows.Forms.Label
 $systemPlaceholderLabel.Text = "System-owned ports are hidden.`r`nEnable `"Show system-owned ports`" in Settings > Preferences to view them here."
@@ -3544,7 +3936,8 @@ $systemPlaceholderLabel.ForeColor = $script:Theme.TextDim
 $systemPlaceholderLabel.BackColor = $script:Theme.CardBg
 $systemPlaceholderLabel.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9.5)
 
-$script:MainTabs.Pages[2].Controls.Add($systemGrid)
+$systemGrid.Tag.ScrollWrapper.Dock = 'Fill'
+$script:MainTabs.Pages[2].Controls.Add($systemGrid.Tag.ScrollWrapper)
 $script:MainTabs.Pages[2].Controls.Add($systemPlaceholderLabel)
 
 $gridTop = $menuStrip.Height + $topPanel.Height
@@ -3814,9 +4207,9 @@ function Render-Grid {
         $Grid.ResumeLayout()
     }
     # A row-count/content change can introduce or remove a scrollbar just
-    # like a resize can - see Set-DarkScrollBars for why this has to be
+    # like a resize can - see Update-GridScrollBar for why this has to be
     # re-run rather than done once.
-    Set-DarkScrollBars -Control $Grid
+    Update-GridScrollBar -Grid $Grid
 }
 
 function Update-TabHeaders {
@@ -4575,7 +4968,9 @@ function Show-LogViewer {
 
     [System.Windows.Forms.Control[]]$bottomControls = @($copyButton, $closeButton)
     $bottomPanel.Controls.AddRange($bottomControls)
-    $dlg.Controls.Add($textBox)
+    $textScroll = Enable-TextBoxScrollBar -TextBox $textBox
+    $textScroll.Wrapper.Dock = 'Fill'
+    $dlg.Controls.Add($textScroll.Wrapper)
     $dlg.Controls.Add($bottomPanel)
 
     function Update-LogText {
@@ -4665,7 +5060,9 @@ function Show-AppErrorLogViewer {
     # against that wrong width, and once bottomPanel gets its real ~760px
     # docked width the anchor math throws them far off to the right,
     # outside the visible window - which is exactly why they went missing.
-    $dlg.Controls.Add($rtb)
+    $rtbScroll = Enable-TextBoxScrollBar -TextBox $rtb
+    $rtbScroll.Wrapper.Dock = 'Fill'
+    $dlg.Controls.Add($rtbScroll.Wrapper)
     $dlg.Controls.Add($bottomPanel)
     $dlg.Controls.Add($filterPanel)
 
@@ -5484,7 +5881,9 @@ function Show-DeployRunDialog {
 
     [System.Windows.Forms.Control[]]$bottomControls = @($rerunButton, $stopButton, $closeButton)
     $bottomPanel.Controls.AddRange($bottomControls)
-    $dlg.Controls.Add($textBox)
+    $textScroll = Enable-TextBoxScrollBar -TextBox $textBox
+    $textScroll.Wrapper.Dock = 'Fill'
+    $dlg.Controls.Add($textScroll.Wrapper)
     $dlg.Controls.Add($statusLbl)
     $dlg.Controls.Add($infoLbl)
     $dlg.Controls.Add($bottomPanel)
@@ -6368,7 +6767,19 @@ HOW THIS APP CATCHES IT NOW
     })
     foreach ($t in $topics) { [void]$topicList.Items.Add($t.Title) }
     $topicList.Add_SelectedIndexChanged({
-        if ($topicList.SelectedIndex -ge 0) { $bodyBox.Text = $topics[$topicList.SelectedIndex].Body }
+        if ($topicList.SelectedIndex -lt 0) { return }
+        # Topic bodies are @'...'@ here-strings, whose embedded line breaks
+        # are whatever's literally saved in this .ps1 file on disk - not
+        # guaranteed to be `r`n. The native Edit control behind bodyBox
+        # (EM_GETLINECOUNT/EM_LINESCROLL, see Enable-TextBoxScrollBar) only
+        # recognizes `r`n as a line break; a bare `n survives as valid,
+        # visually-wrapping text but isn't counted as a real line, which is
+        # what made the themed scrollbar never appear/scroll for this
+        # dialog specifically. Normalize (collapse any existing `r`n to `n,
+        # then expand every `n to `r`n) so it's correct regardless of the
+        # source file's own line-ending convention.
+        $body = ($topics[$topicList.SelectedIndex].Body -replace "`r`n", "`n") -replace "`n", "`r`n"
+        $bodyBox.Text = $body
     }.GetNewClosure())
 
     # Hover tooltip for the full title, same pattern as the C-Deploy
@@ -6395,8 +6806,20 @@ HOW THIS APP CATCHES IT NOW
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton
 
-    $dlg.Controls.Add($bodyBox)
-    $dlg.Controls.Add($topicList)
+    $bodyScroll = Enable-TextBoxScrollBar -TextBox $bodyBox
+    $bodyScroll.Wrapper.Dock = 'Fill'
+    # topicList was built with Dock='Left'/Width=320 against the dialog
+    # directly - now it's one level deeper (inside its own wrapper next to
+    # the scrollbar strip), so IT needs Dock='Fill' to claim the wrapper's
+    # full remaining space (after the strip's Right dock reserves 10px),
+    # and the *wrapper* takes over the original Left/320 positioning
+    # against the dialog instead.
+    $topicList.Dock = 'Fill'
+    $topicScroll = Enable-ListBoxScrollBar -ListBox $topicList
+    $topicScroll.Wrapper.Dock = 'Left'
+    $topicScroll.Wrapper.Width = 320
+    $dlg.Controls.Add($bodyScroll.Wrapper)
+    $dlg.Controls.Add($topicScroll.Wrapper)
     $dlg.Controls.Add($closeButton)
 
     $topicList.SelectedIndex = 0
@@ -7198,19 +7621,35 @@ function Show-ProxyDialog {
 }
 
 function Get-KnownProjects {
+    # Used by Manage Groups. -OnlyNode $false ("Show all listening ports")
+    # used to still be quietly incomplete two different ways: Build-Rows
+    # unconditionally drops IsSystem rows regardless of OnlyNode (System/
+    # svchost/lsass - the same ones the main window's System tab shows),
+    # and any row - system or not - with no ProjectPath (a live process
+    # whose PEB read failed, e.g. one running in a sandboxed/restricted
+    # context - see Merge-LiveWithHistoryFallback) was silently skipped
+    # below, since a path is what a Group entry has always been keyed by.
+    # Both are now included instead of dropped, each marked Groupable =
+    # $false - Show-ManageGroupsDialog lists them (so "show all" is
+    # actually all) but keeps their checkbox from being checked, since
+    # Start All/Stop All/Pin all all need a real project path to act on
+    # and these don't have one.
     param([bool]$OnlyNode = $true)
     $allRows = @(Build-Rows -OnlyNode $OnlyNode -RootDir '')
+    if (-not $OnlyNode) { $allRows += @(Build-SystemRows) }
     $seen = @{}
     $projects = @()
     foreach ($r in $allRows) {
-        if (-not $r.ProjectPath) { continue }
-        $key = Get-NormalizedPath $r.ProjectPath
+        $groupable = [bool]$r.ProjectPath
+        $key = if ($groupable) { Get-NormalizedPath $r.ProjectPath } else { "port:$($r.Port)" }
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
-        $label = if ($r.CustomName) { $r.CustomName } else { Split-Path -Leaf $r.ProjectPath }
+        $label = if ($r.CustomName) { $r.CustomName } elseif ($groupable) { Split-Path -Leaf $r.ProjectPath } else { $r.ProcessName }
+        $labelSuffix = if ($groupable) { '' } else { ' - no project path, not groupable' }
         $projects += [PSCustomObject]@{
             ProjectPath = $r.ProjectPath
-            Label       = "$label (port $($r.Port))"
+            Label       = "$label (port $($r.Port))$labelSuffix"
+            Groupable   = $groupable
         }
     }
     return $projects | Sort-Object Label
@@ -7318,49 +7757,142 @@ function Show-ManageGroupsDialog {
     $projLabel.Size = New-Object System.Drawing.Size(200, 20)
     $projLabel.ForeColor = $script:Theme.TextPrimary
 
-    $showAllCheck = New-Object System.Windows.Forms.CheckBox
-    $showAllCheck.Text = 'Show all listening ports (not just Node/dev servers)'
-    $showAllCheck.Location = New-Object System.Drawing.Point(15, 92)
-    $showAllCheck.Size = New-Object System.Drawing.Size(415, 20)
-    $showAllCheck.ForeColor = $script:Theme.TextPrimary
+    $showAllCheck = New-ThemedCheckBox
+    $showAllCheck.Location = New-Object System.Drawing.Point(15, 94)
+    $showAllLbl = New-Object System.Windows.Forms.Label
+    $showAllLbl.Text = 'Show All Ports'
+    $showAllLbl.Location = New-Object System.Drawing.Point(37, 92)
+    $showAllLbl.Size = New-Object System.Drawing.Size(200, 20)
+    $showAllLbl.TextAlign = 'MiddleLeft'
+    $showAllLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ThemedCheckBoxLabel -CheckBox $showAllCheck -Label $showAllLbl
 
-    $pinGroupCheck = New-Object System.Windows.Forms.CheckBox
-    $pinGroupCheck.Text = 'Pin all ports in this group (keeps them listed even after they stop)'
-    $pinGroupCheck.Location = New-Object System.Drawing.Point(15, 114)
-    $pinGroupCheck.Size = New-Object System.Drawing.Size(415, 20)
-    $pinGroupCheck.ForeColor = $script:Theme.TextPrimary
+    $pinGroupCheck = New-ThemedCheckBox
+    $pinGroupCheck.Location = New-Object System.Drawing.Point(15, 116)
+    $pinGroupLbl = New-Object System.Windows.Forms.Label
+    $pinGroupLbl.Text = 'Pin All Ports'
+    $pinGroupLbl.Location = New-Object System.Drawing.Point(37, 114)
+    $pinGroupLbl.Size = New-Object System.Drawing.Size(200, 20)
+    $pinGroupLbl.TextAlign = 'MiddleLeft'
+    $pinGroupLbl.ForeColor = $script:Theme.TextPrimary
+    Connect-ThemedCheckBoxLabel -CheckBox $pinGroupCheck -Label $pinGroupLbl
+
+    # Same style as the main window's search box (searchBox, near the top
+    # toolbar) - most useful once Show All is on and the list is long
+    # enough that finding one specific port by scrolling gets tedious, but
+    # left available regardless rather than showing/hiding it on toggle.
+    $searchLbl = New-Object System.Windows.Forms.Label
+    $searchLbl.Text = 'Search:'
+    $searchLbl.Location = New-Object System.Drawing.Point(15, 139)
+    $searchLbl.Size = New-Object System.Drawing.Size(55, 20)
+    $searchLbl.TextAlign = 'MiddleLeft'
+    $searchLbl.ForeColor = $script:Theme.TextPrimary
+
+    $searchBox = New-Object System.Windows.Forms.TextBox
+    $searchBox.Location = New-Object System.Drawing.Point(74, 136)
+    $searchBox.Size = New-Object System.Drawing.Size(356, 24)
+    $searchBox.BackColor = $script:Theme.CardBg
+    $searchBox.ForeColor = $script:Theme.TextPrimary
+    $searchBox.BorderStyle = 'FixedSingle'
 
     $projList = New-Object System.Windows.Forms.CheckedListBox
-    $projList.Location = New-Object System.Drawing.Point(15, 140)
-    $projList.Size = New-Object System.Drawing.Size(415, 236)
     $projList.CheckOnClick = $true
     $projList.BorderStyle = 'FixedSingle'
     $projList.BackColor = $script:Theme.CardBg
     $projList.ForeColor = $script:Theme.TextPrimary
+    # Absolute-positioned (Location/Size, no Dock) like everything else in
+    # this dialog - Enable-ListBoxScrollBar's wrapper takes over that
+    # original position, and projList itself switches to Dock='Fill'
+    # relative to the wrapper instead (same swap as Show-DocumentationDialog's
+    # topicList).
+    $projList.Dock = 'Fill'
+    $projScroll = Enable-ListBoxScrollBar -ListBox $projList
+    # y=166 (was 140) to make room for the search row above; bottom edge
+    # held at the same 376 the original 140+236 box ended at, so the
+    # buttons below and the dialog's own size don't have to move.
+    $projScroll.Wrapper.Location = New-Object System.Drawing.Point(15, 166)
+    $projScroll.Wrapper.Size = New-Object System.Drawing.Size(415, 210)
+
+    $notGroupableTip = New-Object System.Windows.Forms.ToolTip
+    $notGroupableTip.InitialDelay = 200
+    $notGroupableTip.AutoPopDelay = 4000
 
     # Boxed in a hashtable so event handlers (each running in their own
-    # PowerShell scope) can update it in place without needing $script: scope.
-    $state = @{ KnownProjects = @(Get-KnownProjects -OnlyNode $true) }
-    foreach ($p in $state.KnownProjects) { $projList.Items.Add($p.Label) | Out-Null }
-
-    function Set-CheckedFromGroup {
-        param([string]$GroupName)
-        for ($i = 0; $i -lt $projList.Items.Count; $i++) { $projList.SetItemChecked($i, $false) }
-        if (-not $GroupName -or -not $script:Groups.ContainsKey($GroupName)) { return }
-        $paths = @($script:Groups[$GroupName] | ForEach-Object { Get-NormalizedPath $_ })
-        for ($i = 0; $i -lt $state.KnownProjects.Count; $i++) {
-            if ($paths -contains (Get-NormalizedPath $state.KnownProjects[$i].ProjectPath)) { $projList.SetItemChecked($i, $true) }
-        }
+    # PowerShell scope) can update it in place without needing $script:
+    # scope. KnownProjects is always the FULL set for the current Show
+    # All state (search only affects FilteredProjects/what's displayed);
+    # CheckedPaths is normalized-path membership, independent of both
+    # Show All and search, so toggling either never loses a check the
+    # user already made. FilteredProjects gives ItemCheck/Save a 1:1 map
+    # to whatever's actually showing in $projList right now.
+    $state = @{
+        KnownProjects    = @(Get-KnownProjects -OnlyNode $true)
+        FilteredProjects = @()
+        CheckedPaths     = (New-Object System.Collections.Generic.HashSet[string])
     }
 
-    $nameCombo.Add_SelectedIndexChanged({ Set-CheckedFromGroup -GroupName $nameCombo.Text })
-
-    $showAllCheck.Add_CheckedChanged({
-        $state.KnownProjects = @(Get-KnownProjects -OnlyNode (-not $showAllCheck.Checked))
+    function Render-ProjectList {
+        $filter = $searchBox.Text.Trim()
+        $state.FilteredProjects = @(
+            if ($filter) { $state.KnownProjects | Where-Object { $_.Label -like "*$filter*" } }
+            else { $state.KnownProjects }
+        )
         $projList.Items.Clear()
-        foreach ($p in $state.KnownProjects) { $projList.Items.Add($p.Label) | Out-Null }
-        Set-CheckedFromGroup -GroupName $nameCombo.Text
+        foreach ($p in $state.FilteredProjects) { [void]$projList.Items.Add($p.Label) }
+        for ($i = 0; $i -lt $state.FilteredProjects.Count; $i++) {
+            $p = $state.FilteredProjects[$i]
+            if ($p.Groupable -and $state.CheckedPaths.Contains((Get-NormalizedPath $p.ProjectPath))) {
+                $projList.SetItemChecked($i, $true)
+            }
+        }
+        Update-ThemedScrollBar -Bar $projScroll.Bar
+    }
+
+    function Sync-CheckedPathsFromGroup {
+        param([string]$GroupName)
+        $state.CheckedPaths = New-Object System.Collections.Generic.HashSet[string]
+        if ($GroupName -and $script:Groups.ContainsKey($GroupName)) {
+            foreach ($p in $script:Groups[$GroupName]) { [void]$state.CheckedPaths.Add((Get-NormalizedPath $p)) }
+        }
+        Render-ProjectList
+    }
+
+    Render-ProjectList
+
+    # Checking/unchecking a row updates CheckedPaths, the actual source of
+    # truth Save reads from - not the listbox's own checked state, which
+    # only ever reflects whatever subset the current search happens to be
+    # showing. A path-less (Groupable = $false) row's checkbox is
+    # forcibly reverted the moment it's checked, with a tooltip
+    # explaining why, rather than silently letting it be added to a group
+    # Start All/Stop All/Pin all could never actually act on.
+    $projList.Add_ItemCheck({
+        param($s, $e)
+        if ($e.Index -ge $state.FilteredProjects.Count) { return }
+        $p = $state.FilteredProjects[$e.Index]
+        if (-not $p.Groupable) {
+            $e.NewValue = [System.Windows.Forms.CheckState]::Unchecked
+            $notGroupableTip.Show("No project folder found for this port - can't be added to a group.", $projList, 4000)
+            return
+        }
+        $norm = Get-NormalizedPath $p.ProjectPath
+        if ($e.NewValue -eq [System.Windows.Forms.CheckState]::Checked) { [void]$state.CheckedPaths.Add($norm) }
+        else { [void]$state.CheckedPaths.Remove($norm) }
     })
+
+    $nameCombo.Add_SelectedIndexChanged({ Sync-CheckedPathsFromGroup -GroupName $nameCombo.Text })
+    $searchBox.Add_TextChanged({ Render-ProjectList })
+
+    # No .GetNewClosure() - this only needs the normal lexical scoping a
+    # plain scriptblock already has (same as the original native
+    # Add_CheckedChanged handler this replaces), and GetNewClosure() would
+    # actually break it here: it isolates the block from sibling nested
+    # functions like Render-ProjectList (see the New-PortsGrid comment on
+    # Update-DeploySummary for the established reason why).
+    Set-ThemedCheckBoxOnChange -CheckBox $showAllCheck -Handler {
+        $state.KnownProjects = @(Get-KnownProjects -OnlyNode (-not (Get-ThemedCheckBoxChecked -CheckBox $showAllCheck)))
+        Render-ProjectList
+    }
 
     $saveButton = New-Object System.Windows.Forms.Button
     $saveButton.Text = 'Save Group'
@@ -7373,17 +7905,19 @@ function Show-ManageGroupsDialog {
             [System.Windows.Forms.MessageBox]::Show('Enter a group name.', 'Cannot Save', 'OK', 'Warning') | Out-Null
             return
         }
-        $paths = @()
-        for ($i = 0; $i -lt $state.KnownProjects.Count; $i++) {
-            if ($projList.GetItemChecked($i)) { $paths += $state.KnownProjects[$i].ProjectPath }
-        }
+        # Read from CheckedPaths (normalized) against the FULL KnownProjects
+        # list, not $projList's own current items - a search filter could
+        # be narrowing what's actually displayed right now, and a check
+        # made before typing into Search must still be saved even though
+        # that row isn't currently visible.
+        $paths = @($state.KnownProjects | Where-Object { $_.Groupable -and $state.CheckedPaths.Contains((Get-NormalizedPath $_.ProjectPath)) } | ForEach-Object { $_.ProjectPath })
         $script:Groups[$name] = $paths
         Save-Groups $script:Groups
         if (-not $nameCombo.Items.Contains($name)) { $nameCombo.Items.Add($name) | Out-Null }
         Update-GroupsButtonText
 
         $pinnedNote = ''
-        if ($pinGroupCheck.Checked -and $paths.Count -gt 0) {
+        if ((Get-ThemedCheckBoxChecked -CheckBox $pinGroupCheck) -and $paths.Count -gt 0) {
             $pinnedCount = Set-GroupPortsPinned -ProjectPaths $paths
             $pinnedNote = " Pinned $pinnedCount port(s) on record for this group."
         }
@@ -7405,7 +7939,7 @@ function Show-ManageGroupsDialog {
         Save-Groups $script:Groups
         $nameCombo.Items.Remove($name)
         $nameCombo.Text = ''
-        Set-CheckedFromGroup -GroupName ''
+        Sync-CheckedPathsFromGroup -GroupName ''
         if ($script:SelectedGroups -contains $name) {
             $script:SelectedGroups = @($script:SelectedGroups | Where-Object { $_ -ne $name })
             $script:Settings.SelectedGroups = $script:SelectedGroups
@@ -7422,7 +7956,7 @@ function Show-ManageGroupsDialog {
     $closeButton.Add_Click({ $dlg.Close() })
     Initialize-ModernButton -Button $closeButton
 
-    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $showAllCheck, $pinGroupCheck, $projList, $saveButton, $deleteButton, $closeButton)
+    [System.Windows.Forms.Control[]]$dlgControls = @($nameLabel, $nameCombo, $projLabel, $showAllCheck, $showAllLbl, $pinGroupCheck, $pinGroupLbl, $searchLbl, $searchBox, $projScroll.Wrapper, $saveButton, $deleteButton, $closeButton)
     $dlg.Controls.AddRange($dlgControls)
     $dlg.ShowDialog($form) | Out-Null
 }

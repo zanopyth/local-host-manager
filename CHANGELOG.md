@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.19.0] - 2026-08-16
+
+### Added
+- Themed scrollbar everywhere the app previously showed a native one: the
+  Live/History/System grids, the per-project Log Viewer, the Error &
+  Crash Log, Deploy Run's console output, Documentation's body/topic
+  list, Configure Deploy's target list, and Manage Groups' project
+  checklist all now use a custom owner-drawn scrollbar that actually
+  matches the Terminal/Dark/Light palette, with drag, click-to-page, and
+  mouse wheel support.
+- Manage Groups: "Show All Ports" now genuinely shows everything
+  listening - previously it silently dropped system-owned ports (System/
+  svchost/lsass) and any live process whose project folder couldn't be
+  read. Both are now listed (so "show all" is honest about what's
+  actually there); a port with no project path can't be checked into a
+  group, since Start All/Stop All/Pin all need a real path to act on.
+- Manage Groups: new search box above the project list, filtering live
+  as you type - most useful once Show All Ports is on and the list gets
+  long. Checked state now survives searching and toggling Show All
+  without losing a selection.
+- Manage Groups' "Show all listening ports"/"Pin all ports" checkboxes
+  restyled to match the app's own square themed checkbox design, with
+  shorter labels ("Show All Ports" / "Pin All Ports").
+
+### Fixed
+- Grid mouse wheel scrolling, broken by the native-scrollbar removal
+  above, restored via a manual wheel handler (DataGridView's own built-in
+  wheel handling turns out to be gated on the native scrollbar's
+  presence, not just its visibility).
+- Two real bugs found while chasing "the new scrollbar doesn't actually
+  scroll": `EM_LINESCROLL`'s line-count parameter belongs in the LOWORD,
+  not the HIWORD as commonly documented (verified empirically against a
+  real TextBox/RichTextBox); and `$script:`-scoped variables (unlike
+  `$script:`-scoped functions) silently resolve to `$null` inside a
+  `.GetNewClosure()`'d scriptblock, which had been turning every themed
+  scrollbar's Win32 message into a no-op.
+- A CheckedListBox's native vertical scrollbar reappears on its own
+  whenever its Items change or TopIndex is set, undoing a one-time style
+  removal - now reapplied on every scrollbar update instead.
+
 ## [1.18.9] - 2026-08-16
 
 ### Added
