@@ -2406,7 +2406,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.20.0'
+$script:AppVersion = '1.21.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -6926,6 +6926,61 @@ Register-GridEvents -Grid $liveGrid
 Register-GridEvents -Grid $historyGrid
 Register-SystemGridEvents -Grid $systemGrid
 
+function Set-DocumentationBody {
+    # Renders a topic's plain-text Body into a RichTextBox with a
+    # minimalist-terminal look - each ALL-CAPS section header (e.g. "WHAT
+    # YOU SAW") bolded in the theme's accent color with a thin rule
+    # underneath, everything else left as plain themed body text -
+    # instead of one flat, undifferentiated block of monospace text.
+    #
+    # Deliberately a rendering pass over the existing plain-text Body
+    # strings, not a change to their content or a new markup syntax to
+    # write topics in - every topic already happens to write its section
+    # headers as a standalone, unindented, all-uppercase line (with every
+    # other line indented at least two spaces), so that convention alone
+    # is enough to detect a header line reliably without annotating
+    # anything by hand.
+    param($RichTextBox, [string]$Body)
+    $RichTextBox.Clear()
+
+    $headerFont = New-Object System.Drawing.Font($RichTextBox.Font, [System.Drawing.FontStyle]::Bold)
+    $ruleWidth = 74
+    $rule = [string]::new([char]0x2500, $ruleWidth)
+
+    $lines = (($Body -replace "`r`n", "`n") -replace "`n", "`r`n") -split "`r`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        $isLast = ($i -eq $lines.Count - 1)
+        $suffix = if ($isLast) { '' } else { "`r`n" }
+
+        # A header line: non-empty, no leading whitespace (every body/list
+        # line is indented), and entirely uppercase (no lowercase letters
+        # anywhere in it - punctuation/digits/apostrophes are untouched by
+        # ToUpperInvariant so they never disqualify a line on their own).
+        $isHeader = [bool]$line -and ($line -notmatch '^\s') -and ($line -ceq $line.ToUpperInvariant()) -and ($line -cne $line.ToLowerInvariant())
+
+        $RichTextBox.SelectionStart = $RichTextBox.TextLength
+        $RichTextBox.SelectionLength = 0
+        if ($isHeader) {
+            $RichTextBox.SelectionColor = $script:Theme.Accent
+            $RichTextBox.SelectionFont = $headerFont
+            $RichTextBox.AppendText($line + "`r`n")
+            $RichTextBox.SelectionStart = $RichTextBox.TextLength
+            $RichTextBox.SelectionLength = 0
+            $RichTextBox.SelectionColor = $script:Theme.Border
+            $RichTextBox.SelectionFont = $RichTextBox.Font
+            $RichTextBox.AppendText($rule + $suffix)
+        } else {
+            $RichTextBox.SelectionColor = $script:Theme.TextPrimary
+            $RichTextBox.SelectionFont = $RichTextBox.Font
+            $RichTextBox.AppendText($line + $suffix)
+        }
+    }
+
+    $RichTextBox.SelectionStart = 0
+    $RichTextBox.SelectionLength = 0
+}
+
 function Show-DocumentationDialog {
     # In-app knowledge base for recurring, non-obvious problems - starts
     # with just the "Missing script" build failure (the C-Deploy
@@ -6995,24 +7050,374 @@ HOW THIS APP CATCHES IT NOW
   folder (and Build output folder) to it.
 '@
         }
+        [PSCustomObject]@{
+            Title = 'Start All / Stop All: what actually gets included'
+            Body  = @'
+WHAT THEY DO
+
+  Start All / Stop All act only on whatever group(s) are selected in the
+  Groups menu, and only on projects in that selection with a known
+  Project Path (a path-less port can't be started/stopped this way -
+  see the "no path" warnings elsewhere in this app).
+
+WHY THE COUNT CAN LOOK OFF
+
+  A project can have more than one port remembered in its history at
+  once - most commonly a prod + test port convention, or a leftover
+  entry from before a rename. Each remembered port is its own row in
+  the grid, but starting "the project" is still one action - so Start
+  All collapses every OFF row for the same Project Path down to just
+  one (the lowest/primary port) before acting, and its "Starting N/M"
+  counter reflects that collapsed count, not the raw row count you'd
+  see by adding up every port for every project in the group.
+
+  Stop All does NOT collapse this way - every ON row is a real, distinct
+  running process with its own PID, so if a project genuinely has both
+  its prod and test copies running at once, Stop All stops both; that's
+  two separate things to actually stop, not a duplicate.
+
+HOW TO CHECK WHAT A GROUP WILL ACTUALLY TOUCH
+
+  Open Manage Groups and look at the checked projects for that group -
+  that checklist is the real source of truth Start All/Stop All read
+  from (via each project's Project Path), not anything derived from the
+  grid's current view or filters.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Port collision: "Already Running?" vs "Port In Use"'
+            Body  = @'
+WHAT YOU SAW
+
+  A dialog asking "Kill it and start fresh?" or "Kill that process and
+  start anyway?" right when you tried to Start/Restart a project.
+
+WHY THIS HAPPENS
+
+  Before actually launching a project, this app checks whether its
+  target port already has something listening on it:
+
+   - "Already Running?" means the thing on that port looks like the
+     SAME project (matching Project Path), just not one this app
+     started/is tracking - e.g. it was left running from a manual
+     launch, an earlier session, or a crash of this app itself.
+   - "Port In Use" means something else entirely - unrelated to this
+     project - already has that port, and starting now would almost
+     certainly fail immediately with an address-in-use error.
+
+WHAT "YES" ACTUALLY DOES
+
+  Force-kills whichever process is currently holding the port (taskkill
+  /T /F on its whole process tree), waits briefly for it to actually
+  exit, then proceeds with the start. This is NOT reversible - if that
+  process had unsaved state or was doing something important, it's
+  gone. "No" cancels the start entirely and leaves the existing process
+  alone.
+
+HOW A "CRASH" CAN SHOW UP AS THIS INSTEAD
+
+  If a project's own process exits almost immediately after being
+  started and its recent output mentions an address conflict
+  (EADDRINUSE etc.), this app logs and notifies that as a port
+  conflict rather than a generic crash - so an unexplained near-instant
+  "crash" right after Starting is very often actually this same
+  scenario, just discovered one step later.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Auto Crash Restart: what counts as a crash'
+            Body  = @'
+WHAT IT DOES
+
+  Per-project, opt-in (toggled from that row's Detail popup or context
+  menu). When enabled, if the project's process exits on its own -
+  never when you clicked Stop yourself - this app automatically starts
+  it again using the same command line it was last seen running with.
+
+WHAT DOES NOT COUNT AS A CRASH
+
+  Only processes this app itself launched are tracked closely enough
+  to tell "exited on its own" apart from "the user stopped it" at all.
+  A project that was already running before this app opened, or one
+  started manually outside it, has no such tracking - stopping it from
+  the grid just force-kills it by PID, and if it happens to exit on its
+  own, Auto Crash Restart never sees it and does nothing.
+
+THE RETRY LIMIT
+
+  A genuinely crash-looping project (bad code, a permanently-taken
+  port, ...) doesn't get restarted forever. By default, this app allows
+  5 restart attempts within a rolling 5-minute window (both configurable
+  in Settings > Preferences) before giving up and just logging/
+  notifying instead of trying again. The window is tracked per project
+  (by its normalized path), not per process, so it survives across the
+  several process restarts it's actually counting.
+
+NOTIFICATIONS
+
+  Both a crash and a "gave up restarting" event show a tray balloon tip
+  if Settings > Preferences > Crash Notifications is on (it is by
+  default), and always get written to the app's own error log
+  regardless of that setting - Help > View Error Log to check history
+  even with notifications off.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Pinning a port'
+            Body  = @'
+WHAT IT DOES
+
+  The pin icon on a row keeps that port's row visible in the grid even
+  when a filter would otherwise hide it - specifically Dev Servers Only
+  (a pinned non-Node port still shows) and root-directory scoping. It
+  does NOT affect Start All/Stop All, Auto Crash Restart, or anything
+  about the actual process - it is purely a "never hide this one" flag.
+
+HOW IT'S STORED
+
+  Pinned is saved in history.json, keyed by PORT NUMBER, alongside that
+  port's remembered Project Path/process name/Auto Restart flag - not
+  tied to the process's identity or the project's path directly. If a
+  completely different project later reuses that same port number, it
+  would inherit that row's pinned state until explicitly unpinned,
+  since the key is the port, not "this specific project."
+
+MANAGE GROUPS' "PIN GROUP" CHECKBOX
+
+  Saving a group with "Pin projects in this group" checked pins every
+  port currently on record for each project in that group in one step -
+  a shortcut for the same per-row toggle, not a separate mechanism.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Live tab vs History tab'
+            Body  = @'
+WHAT EACH ONE SHOWS
+
+  Live = actually listening right now. Every Live row comes from a real
+  scan of this PC's TCP listeners at the moment the grid refreshed -
+  it is ground truth, not a cache of "what this app started."
+
+  History = everything else this app remembers (Status OFF or CRASHED) -
+  ports it has seen a project running on before, kept in history.json
+  so Start All, Auto Crash Restart, Pin, Custom Names, and Groups all
+  still have something to act on once a project isn't running.
+
+WHY A PROJECT CAN DISAPPEAR FROM HISTORY
+
+  History only remembers a port's LAST known occupant. If a different
+  project later starts on that same port number, its entry overwrites
+  the previous project's history for that port - the old project's row
+  won't reappear in History until it's actually run again (on some
+  port). There is currently no manual "forget this port" action; the
+  entry is simply replaced the next time that port is used by anything.
+
+WHY A ROW CAN JUMP BETWEEN TABS ON REFRESH
+
+  A row moves from History to Live the instant its process starts
+  listening (detected on the next background poll, typically within a
+  couple seconds), and moves back to History the moment that listener
+  goes away - there's no manual step involved, and a project restarting
+  quickly can appear to just "stay put" if the poll lands in between.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Web Dashboard has no login - treat its URL like a key'
+            Body  = @'
+WHAT IT IS
+
+  Dashboard menu > enable it, pick a port (3199 by default). Off by
+  default - nothing listens on any port until you turn it on. Once
+  enabled, it serves a read-only-looking table of every tracked project
+  PLUS working Stop/Start/Restart buttons for them, reachable from any
+  browser that can reach that port - this PC, and (once you've set up
+  reachability, e.g. a Tailscale/VPN address) your LAN or Tailnet too.
+
+WHY THIS MATTERS
+
+  There is no username/password/token - anyone who can open that URL
+  can stop, start, or restart any project this app is tracking. This is
+  fine on a private home network reached only by devices you trust; it
+  is NOT something to expose to the open internet (e.g. via port
+  forwarding) or a shared/public network.
+
+WHAT IT WILL AND WON'T DO ON A REMOTE CLICK
+
+  Stop/Restart from the dashboard first confirms the process it's about
+  to touch is still the exact one this app is currently tracking for
+  that port (by PID) - refusing rather than guessing if something
+  changed underneath it. Start/Restart likewise refuses for any project
+  with no known start command on record, same as the desktop grid.
+
+HOW TO SEE THE ACTUAL ADDRESS
+
+  Open the Detail popup on any running project's row in the main grid -
+  it lists the exact dashboard address(es) once Reachability is
+  configured, rather than requiring you to work it out by hand.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Local Domains: friendly *.localhost addresses'
+            Body  = @'
+WHAT IT DOES
+
+  Settings > Local Domains, off by default. Once enabled, each running
+  project gets a friendly address like http://my_project.localhost:PORT/
+  instead of a raw port number - PORT here is the Local Domains proxy's
+  own port (2802 by default), not the project's own port.
+
+WHERE IT WORKS (AND WHERE IT DOESN'T)
+
+  Browser-only, this PC only. Chrome/Edge/Firefox all resolve any
+  *.localhost hostname straight to loopback on their own, with no hosts-
+  file edit needed - that's the whole trick. It will NOT work from
+  another device on the LAN, and will NOT work from non-browser tools
+  like curl, Postman, or a backend service making its own HTTP calls,
+  since those don't apply the same *.localhost resolution rule browsers
+  do.
+
+ONE-TIME SETUP, PER PORT
+
+  Binding a port for "any hostname" (what routing by *.localhost name
+  actually needs) requires either running as Administrator every time,
+  or granting that one URL ACL once via
+  `netsh http add urlacl url=http://+:PORT/ user=Everyone` (the Local
+  Domains dialog has a Copy button for the exact command with your
+  current port already filled in). This is loopback-only - it does not
+  open a firewall port or expose anything to other devices, it just
+  lets Local Domains bind without elevating every time.
+
+HOW THE ADDRESS IS BUILT
+
+  The "my_project" part is derived from the project's folder name (or
+  its Custom Name if set), lowercased with anything that isn't a letter/
+  number collapsed to a single hyphen - see any running project's
+  Detail popup for its exact, already-computed address rather than
+  guessing the slug by hand.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Backup & Restore: what is (and is not) included'
+            Body  = @'
+WHAT GETS BACKED UP
+
+  File > Backup zips up exactly four files from this app's data folder
+  (%LOCALAPPDATA%\LocalhostManager): settings.json, groups.json,
+  history.json, and customnames.json - covering your Preferences,
+  Groups, port/project history (incl. Pinned and Auto Restart flags),
+  and Custom Names.
+
+WHAT IS NOT BACKED UP
+
+  Build & Deploy recipes (deploydefs.json - Project folder, Build
+  command, Build output folder, and Deploy target folder(s) for every
+  project configured in C-Deploy) are stored separately and are NOT
+  included in a Backup, and therefore NOT restored by Restore either.
+  If you're migrating to a new PC or recovering from a wipe, re-enter
+  your deploy recipes by hand afterward - Restore will bring back
+  everything else, but not those.
+
+WHAT RESTORE ACTUALLY DOES
+
+  Restoring replaces all four of the files above with whatever was in
+  the backup .zip, then restarts the app to load them - this cannot be
+  undone, and there's no "undo restore" beyond having a more recent
+  backup of your own to restore over it again.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Build & Deploy (C-Deploy): the three folders'
+            Body  = @'
+THE THREE PATHS A RECIPE NEEDS
+
+   1. Project folder - where the Build command actually runs (e.g. a
+      frontend folder with its own package.json).
+   2. Build output folder (source) - where that build command writes
+      its finished output (e.g. a Vite/CRA "dist" or "build" folder).
+   3. Deploy target folder(s) - one or more destination folders (e.g. a
+      server's "public" folder) that end up as a copy of #2.
+
+WHY TARGET FOLDERS ARE DESTRUCTIVE - READ BEFORE YOUR FIRST DEPLOY
+
+  Every Deploy target folder is MIRRORED, not merged: this app makes
+  each target folder's contents match the Build output folder exactly,
+  which means files already in a target folder that aren't part of the
+  new build get DELETED. Never point a Deploy target folder at a folder
+  that also holds files you didn't build here (someone else's uploads,
+  a folder shared with something else, etc.) - anything extra in there
+  will be removed on the next deploy.
+
+VALIDATE BUILD SCRIPT
+
+  The Validate Build Script button checks - without actually running a
+  deploy - that the Build command's script name really exists in the
+  Project folder's package.json, catching the single most common deploy
+  failure (see the "Missing build script" topic) before it happens for
+  real.
+
+MULTIPLE TARGETS
+
+  A single recipe can list more than one Deploy target folder (e.g.
+  mirroring the same build to both a local server and a staging copy)-
+  one deploy run updates all of them from the same build output.
+'@
+        }
+        [PSCustomObject]@{
+            Title = 'Custom Names follow the project, not the port'
+            Body  = @'
+HOW A CUSTOM NAME IS KEYED
+
+  Setting a Custom Name on a row saves it keyed by that row's Project
+  Path (normalized, case-insensitive) - NOT by port number. That means:
+
+   - The same project keeps its Custom Name automatically no matter
+     which port it happens to be running on this time.
+   - A different project that later reuses the same port number does
+     NOT inherit the old name - it starts with none, as expected.
+
+THE ONE EXCEPTION: PATH-LESS ROWS
+
+  A row with no known Project Path (nothing this app has ever resolved
+  a folder for) has nothing stable to key a name by, so its Custom Name
+  falls back to being keyed by port number instead - "port:<n>". If
+  that same port later gets a real Project Path resolved for it (e.g.
+  the app finally captures its command line), the name keyed to the old
+  "port:<n>" entry will NOT automatically carry over to the new path-
+  keyed entry - it would need to be re-entered once.
+'@
+        }
     )
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Documentation'
-    $dlg.Size = New-Object System.Drawing.Size(780, 520)
+    # Wide enough that bodyBox's ~80-column hand-wrapped topic text (see
+    # its Consolas 9pt font below) fits without needing the native
+    # horizontal scrollbar WordWrap=false otherwise forces into view - was
+    # 780 total (topicList's 320 left ~450px for body, only ~63 columns).
+    $dlg.Size = New-Object System.Drawing.Size(960, 520)
     $dlg.StartPosition = 'CenterParent'
-    $dlg.MinimumSize = New-Object System.Drawing.Size(520, 320)
+    $dlg.MinimumSize = New-Object System.Drawing.Size(700, 320)
     $dlg.BackColor = $script:Theme.WindowBg
     $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
     Set-DarkTitleBar -FormControl $dlg
 
-    $bodyBox = New-Object System.Windows.Forms.TextBox
-    $bodyBox.Multiline = $true
+    # RichTextBox, not a plain TextBox - Set-DocumentationBody below needs
+    # per-run SelectionColor/SelectionFont to bold+color each section
+    # header and underline it with a thin rule, which a plain TextBox has
+    # no way to do (one uniform font/color for its entire content).
+    # Enable-TextBoxScrollBar already explicitly supports both (see its
+    # own comment - both are Win32 Edit-family windows).
+    $bodyBox = New-Object System.Windows.Forms.RichTextBox
     $bodyBox.ReadOnly = $true
     $bodyBox.ScrollBars = 'Vertical'
     $bodyBox.WordWrap = $false
     $bodyBox.Dock = 'Fill'
     $bodyBox.BorderStyle = 'None'
+    # RichTextBox auto-underlines anything that looks like a URL by
+    # default - several topics quote literal http://... examples as plain
+    # text, not links, and that auto-styling would fight the per-line
+    # coloring below.
+    $bodyBox.DetectUrls = $false
     $bodyBox.Font = New-Object System.Drawing.Font('Consolas', 9)
     $bodyBox.BackColor = $script:Theme.WindowBg
     $bodyBox.ForeColor = $script:Theme.TextPrimary
@@ -7052,11 +7457,11 @@ HOW THIS APP CATCHES IT NOW
         # recognizes `r`n as a line break; a bare `n survives as valid,
         # visually-wrapping text but isn't counted as a real line, which is
         # what made the themed scrollbar never appear/scroll for this
-        # dialog specifically. Normalize (collapse any existing `r`n to `n,
-        # then expand every `n to `r`n) so it's correct regardless of the
-        # source file's own line-ending convention.
-        $body = ($topics[$topicList.SelectedIndex].Body -replace "`r`n", "`n") -replace "`n", "`r`n"
-        $bodyBox.Text = $body
+        # dialog specifically. Set-DocumentationBody normalizes this
+        # itself (collapse any existing `r`n to `n, then expand every `n
+        # to `r`n) so it's correct regardless of the source file's own
+        # line-ending convention.
+        Set-DocumentationBody -RichTextBox $bodyBox -Body $topics[$topicList.SelectedIndex].Body
     }.GetNewClosure())
 
     # Hover tooltip for the full title, same pattern as the C-Deploy

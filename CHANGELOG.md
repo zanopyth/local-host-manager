@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.21.0] - 2026-08-19
+
+### Added
+- 10 new Documentation tab topics covering the app's least-obvious
+  behaviors and sharpest edges: Start All/Stop All's group scope and the
+  historical-duplicate-port count fix, the "Already Running?" vs "Port In
+  Use" collision dialogs, Auto Crash Restart's managed-process caveat and
+  retry limit, what Pinning actually does (and how it's keyed by port),
+  Live vs History tab semantics, the Web Dashboard's lack of
+  authentication, Local Domains' one-time `netsh` setup and browser-only
+  reach, exactly what Backup/Restore does and does not cover (Build &
+  Deploy recipes are NOT backed up), C-Deploy's three folders and why
+  Deploy target folders are destructive (mirrored, not merged), and how
+  Custom Names are keyed by project path rather than port.
+
+- Documentation topic bodies now render with a minimalist-terminal look
+  instead of one flat block of monospace text: `Set-DocumentationBody`
+  reads the plain-text topic content and bolds each ALL-CAPS section
+  header in the theme's accent color with a thin horizontal rule (─)
+  underneath it, entirely by detecting the existing "unindented,
+  all-uppercase line" convention every topic already follows - no new
+  markup, no change to any topic's actual text. The topic body is now a
+  RichTextBox instead of a plain TextBox to make the per-line
+  color/weight possible.
+
+### Fixed
+- The Documentation dialog's topic body used a fixed-width, non-wrapping
+  TextBox (to preserve the hand-formatted indentation of the topic text)
+  against a body pane only ~450px wide - well short of the ~570px an
+  80-column Consolas line actually needs, forcing a horizontal scrollbar
+  to read anything past roughly column 63. Widened the dialog (780px
+  total -> 960px) so the body pane comfortably fits the full width
+  without scrolling.
+
 ## [1.20.0] - 2026-08-19
 
 ### Added
