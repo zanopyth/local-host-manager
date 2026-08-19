@@ -5,6 +5,69 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project follows [Semantic Versioning](https://semver.org/).
 
+## [1.20.0] - 2026-08-19
+
+### Added
+- Every confirm/info/error dialog is now a themed `Show-ThemedMessageBox`
+  matching the app's active theme (dark title bar and body alike), instead
+  of the native `MessageBox.Show` - which only ever picked up dark mode on
+  its title bar (`Set-DarkTitleBar`'s DWM call) and always rendered its
+  body as a plain white Windows dialog no matter the theme, since that
+  body is drawn by Windows itself. New `Draw-MessageBoxIcon` gives each
+  one a small filled-circle badge (i/!/?/×) in the theme's Accent/Warning/
+  Danger colors in place of the stock Win32 icons. Two call sites stay on
+  the native dialog deliberately (documented inline): the single-instance
+  guard, which runs before `$script:Theme` exists, and the top-level
+  startup-error catch, which must not depend on anything startup itself
+  might have failed to set up.
+
+### Fixed
+- Start All counted (and started) the same project once per historical
+  port entry (e.g. a prod + test port convention, or a leftover row from
+  before a rename) instead of once per project - a group of ~10 real
+  projects could inflate to 30 "projects" and launch several of them
+  twice or three times over, which was very likely also the cause of the
+  app appearing to hang partway through a run (duplicate launches
+  colliding on ports and popping blocking confirmation dialogs). Start All
+  now collapses to one action per project path.
+- Start All/Stop All are now guarded against reentrancy: both buttons are
+  disabled and a busy flag is held for the duration of a run, so a second,
+  still-queued click can no longer start a nested run while the first is
+  mid-loop.
+
+- The busy indicator (and Start All/Stop All by extension) used to keep
+  animating behind the "Started N of M" summary dialog until it was
+  dismissed, since it only stopped in a `finally` that ran after that
+  blocking `MessageBox.Show` returned. It's now stopped, and the buttons
+  re-enabled, right after the loop finishes and before that dialog is
+  shown - same fix applied to the single Start/Stop/Restart error dialogs
+  in `Invoke-ToggleAction`/`Invoke-Restart`, which had the identical bug.
+- Start All/Stop All's busy indicator was sweeping one full clockwise
+  revolution per project (indeterminate mode looping the whole time),
+  which read as "restarting" rather than "progressing." It's now
+  determinate for a batch run - `Start-ActionBusyIndicator -Determinate`
+  skips the free-running timer and `Set-ActionBusyProgress` drives the
+  ring directly from completed/total, so it fills exactly once across the
+  whole group.
+
+### Added
+- Start All/Stop All now light the same busy indicator already used for a
+  single Start/Stop/Restart (next to the toolbar, below the dashboard
+  status pill) for the duration of the run, instead of giving no feedback
+  at all. The Start All/Stop All buttons themselves are unchanged - no
+  animation on the buttons.
+- Redesigned the indicator itself (`Draw-SquareRingProgress`): a plain
+  outer square outline and a smaller inner square outline, with the band
+  between them filling red clockwise from 12 o'clock as progress
+  advances - not a filled pie disc.
+
+### Changed
+- `Start-GroupAll`/`Stop-GroupAll` now pump the message loop
+  (`Application.DoEvents()`) once per project - the same idiom
+  `Wait-UiResponsive` already used elsewhere in this file - so the busy
+  indicator's ring actually gets to repaint between items instead of the
+  UI freezing for the whole loop.
+
 ## [1.19.1] - 2026-08-17
 
 ### Fixed

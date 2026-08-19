@@ -486,9 +486,9 @@ function Export-AppBackup {
         }
         if (Test-Path $sfd.FileName) { Remove-Item $sfd.FileName -Force }
         [System.IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $sfd.FileName)
-        [System.Windows.Forms.MessageBox]::Show("Backed up $included file(s) to:`n$($sfd.FileName)", 'Backup Complete', 'OK', 'Information') | Out-Null
+        Show-ThemedMessageBox -Message "Backed up $included file(s) to:`n$($sfd.FileName)" -Title 'Backup Complete' | Out-Null
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Backup failed: $($_.Exception.Message)", 'Backup Failed', 'OK', 'Error') | Out-Null
+        Show-ThemedMessageBox -Message "Backup failed: $($_.Exception.Message)" -Title 'Backup Failed' -Icon Error | Out-Null
     } finally {
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -499,9 +499,7 @@ function Import-AppBackup {
     $ofd.Filter = 'Localhost Manager Backup (*.lhmbackup;*.zip)|*.lhmbackup;*.zip|All files (*.*)|*.*'
     if ($ofd.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
-    $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "This replaces your current settings, groups, port history, and custom names with the backup's, then restarts the app. This can't be undone. Continue?",
-        'Restore Backup', 'YesNo', 'Warning')
+    $confirm = Show-ThemedMessageBox -Message "This replaces your current settings, groups, port history, and custom names with the backup's, then restarts the app. This can't be undone. Continue?" -Title 'Restore Backup' -Buttons YesNo -Icon Warning
     if ($confirm -ne 'Yes') { return }
 
     $tempDir = Join-Path $env:TEMP "LHM-Restore-$([guid]::NewGuid())"
@@ -518,12 +516,12 @@ function Import-AppBackup {
             }
         }
         if ($restored -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("That file doesn't look like a Localhost Manager backup - none of the expected files ($($script:BackupFileNames -join ', ')) were found inside it.", 'Restore Failed', 'OK', 'Warning') | Out-Null
+            Show-ThemedMessageBox -Message "That file doesn't look like a Localhost Manager backup - none of the expected files ($($script:BackupFileNames -join ', ')) were found inside it." -Title 'Restore Failed' -Icon Warning | Out-Null
             return
         }
         Restart-App
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Restore failed: $($_.Exception.Message)", 'Restore Failed', 'OK', 'Error') | Out-Null
+        Show-ThemedMessageBox -Message "Restore failed: $($_.Exception.Message)" -Title 'Restore Failed' -Icon Error | Out-Null
     } finally {
         if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -1393,6 +1391,9 @@ function Build-SystemRows {
 $script:SingleInstanceCreatedNew = $false
 $script:SingleInstanceMutex = New-Object System.Threading.Mutex($true, 'LocalhostManager_SingleInstance_Mutex', [ref]$script:SingleInstanceCreatedNew)
 if (-not $script:SingleInstanceCreatedNew) {
+    # Stays on the native MessageBox deliberately - $script:Theme isn't set
+    # up yet this early (that happens further below), and Show-ThemedMessageBox
+    # depends on it.
     [System.Windows.Forms.MessageBox]::Show('Localhost Manager is already running. Check your system tray.', 'Localhost Manager', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     # Plain `exit` only unwinds the PowerShell pipeline - in the ps2exe-
     # compiled .exe it does not reliably tear down the host process this
@@ -1731,6 +1732,47 @@ function Draw-SplitModeButtonContent {
     Draw-ToolbarIcon -Graphics $g -Icon 'Check' -Rect $rightIconRect -Color ([System.Drawing.Color]::White) -Alpha 1.0
 }
 
+function Draw-SquareRingProgress {
+    # Progress ring for the busy indicator: a plain outer square outline
+    # and a smaller inner square outline, with the band between them
+    # filled red clockwise from 12 o'clock as Progress (0..1) advances -
+    # not a filled pie disc, just the space between the two squares.
+    # Built as Region math (outer minus inner, intersected with a
+    # generously oversized pie wedge) rather than clipping a Graphics
+    # object, since a Region can be Excluded/Intersected directly.
+    param($Graphics, [System.Drawing.Rectangle]$OuterRect, [System.Drawing.Rectangle]$InnerRect, [double]$Progress, [System.Drawing.Color]$RingColor, [System.Drawing.Color]$FillColor)
+    $g = $Graphics
+
+    $ringPen = New-Object System.Drawing.Pen($RingColor, 1.2)
+    $g.DrawRectangle($ringPen, $OuterRect)
+    $g.DrawRectangle($ringPen, $InnerRect)
+    $ringPen.Dispose()
+
+    $sweepAngle = 360.0 * [Math]::Max(0.0, [Math]::Min(1.0, $Progress))
+    if ($sweepAngle -le 0.001) { return }
+
+    $outerRectF = New-Object System.Drawing.RectangleF($OuterRect.X, $OuterRect.Y, $OuterRect.Width, $OuterRect.Height)
+    $innerRectF = New-Object System.Drawing.RectangleF($InnerRect.X, $InnerRect.Y, $InnerRect.Width, $InnerRect.Height)
+    $band = New-Object System.Drawing.Region($outerRectF)
+    $band.Exclude($innerRectF)
+
+    # Oversized square pie, centered on OuterRect, so its straight edges
+    # always reach past every corner - Intersect then trims the band down
+    # to just the swept slice of it.
+    $cx = $OuterRect.X + $OuterRect.Width / 2.0
+    $cy = $OuterRect.Y + $OuterRect.Height / 2.0
+    $r = [Math]::Sqrt([Math]::Pow($OuterRect.Width, 2) + [Math]::Pow($OuterRect.Height, 2))
+    $piePath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $piePath.AddPie(($cx - $r), ($cy - $r), ($r * 2), ($r * 2), -90.0, $sweepAngle)
+    $band.Intersect($piePath)
+
+    $fillBrush = New-Object System.Drawing.SolidBrush($FillColor)
+    $g.FillRegion($fillBrush, $band)
+    $fillBrush.Dispose()
+    $piePath.Dispose()
+    $band.Dispose()
+}
+
 function Get-ButtonPaintColors {
     # Resolves the fill/border/text colors for one paint of a non-split-mode
     # button, given its current owner-drawn state (see Initialize-ModernButton's
@@ -1836,6 +1878,151 @@ function Initialize-ModernButton {
 
         $path.Dispose()
     })
+}
+
+function Draw-MessageBoxIcon {
+    # Small filled circle + bold single-glyph badge (i/!/?/x) in the same
+    # semantic colors (Accent/Warning/Danger) already used everywhere else
+    # in this theme, instead of the native MessageBox's stock Win32 icons.
+    param($Graphics, [System.Drawing.RectangleF]$Rect, [string]$Icon)
+    $Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $color = switch ($Icon) {
+        'Error'   { $script:Theme.Danger }
+        'Warning' { $script:Theme.Warning }
+        default   { $script:Theme.Accent }
+    }
+    $symbol = switch ($Icon) {
+        'Error'    { [string][char]0x00D7 }
+        'Warning'  { '!' }
+        'Question' { '?' }
+        default    { 'i' }
+    }
+    $brush = New-Object System.Drawing.SolidBrush($color)
+    $Graphics.FillEllipse($brush, $Rect)
+    $brush.Dispose()
+
+    $fg = Get-ReadableTextColor -BackgroundColor $color
+    $font = New-Object System.Drawing.Font($script:Theme.FontFamily, ($Rect.Height * 0.52), [System.Drawing.FontStyle]::Bold)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $fgBrush = New-Object System.Drawing.SolidBrush($fg)
+    $Graphics.DrawString($symbol, $font, $fgBrush, $Rect, $sf)
+    $fgBrush.Dispose()
+    $font.Dispose()
+    $sf.Dispose()
+}
+
+function Show-ThemedMessageBox {
+    # Themed replacement for [System.Windows.Forms.MessageBox]::Show. Every
+    # other dialog in this app is already a custom-drawn Form that follows
+    # the active theme; the native MessageBox was the one holdout - it
+    # always renders as a plain white Windows dialog no matter the theme,
+    # since only its title bar picks up dark mode (Set-DarkTitleBar's DWM
+    # call) - the body is Windows' own drawing and never reads app colors.
+    # Returns 'OK', 'Yes', or 'No' - the same strings callers already
+    # compared the native dialog's result against, so call sites only need
+    # their MessageBox::Show swapped for this, nothing else.
+    param(
+        [string]$Message,
+        [string]$Title,
+        [ValidateSet('OK', 'YesNo')][string]$Buttons = 'OK',
+        [ValidateSet('Information', 'Warning', 'Error', 'Question')][string]$Icon = 'Information'
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $script:Theme.WindowBg
+    $dlg.Font = New-Object System.Drawing.Font($script:Theme.FontFamily, 9)
+    Set-DarkTitleBar -FormControl $dlg
+
+    $iconSize = 32
+    $marginX = 20
+    $textGap = 14
+    $maxTextWidth = 320
+    # TextRenderer (GDI), not Graphics.MeasureString (GDI+) - matches what
+    # a Label actually renders with pixel-for-pixel, so the measured size
+    # below isn't a guess the way mixing the two measurement APIs would be
+    # (see Draw-ButtonLayer's comment on that exact GenericTypographic trap).
+    $oneLine = [System.Windows.Forms.TextRenderer]::MeasureText($Message, $dlg.Font, (New-Object System.Drawing.Size(0, 0)), [System.Windows.Forms.TextFormatFlags]::SingleLine)
+    $textWidth = [Math]::Min($maxTextWidth, [Math]::Max(150, $oneLine.Width + 4))
+    $wrapped = [System.Windows.Forms.TextRenderer]::MeasureText($Message, $dlg.Font, (New-Object System.Drawing.Size($textWidth, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak)
+    $textHeight = [Math]::Max($iconSize, $wrapped.Height)
+
+    $iconPanel = New-Object System.Windows.Forms.Panel
+    $iconPanel.Location = New-Object System.Drawing.Point($marginX, 20)
+    $iconPanel.Size = New-Object System.Drawing.Size($iconSize, $iconSize)
+    $iconPanel.Add_Paint({
+        param($s, $e)
+        Draw-MessageBoxIcon -Graphics $e.Graphics -Rect (New-Object System.Drawing.RectangleF(0, 0, $s.Width, $s.Height)) -Icon $Icon
+    }.GetNewClosure())
+
+    $msgLabel = New-Object System.Windows.Forms.Label
+    $msgLabel.Text = $Message
+    $msgLabel.Location = New-Object System.Drawing.Point(($marginX + $iconSize + $textGap), 20)
+    $msgLabel.Size = New-Object System.Drawing.Size($textWidth, $textHeight)
+    $msgLabel.ForeColor = $script:Theme.TextPrimary
+
+    $btnWidth = 90
+    $btnHeight = 30
+    $btnGap = 10
+    $buttonsWidth = if ($Buttons -eq 'YesNo') { $btnWidth * 2 + $btnGap } else { $btnWidth }
+    $contentWidth = $marginX + $iconSize + $textGap + $textWidth + $marginX
+    $dlgWidth = [Math]::Max($contentWidth, $buttonsWidth + $marginX * 2)
+    $buttonY = 20 + $textHeight + 24
+    $dlg.ClientSize = New-Object System.Drawing.Size($dlgWidth, ($buttonY + $btnHeight + 20))
+
+    if ($Buttons -eq 'YesNo') {
+        $noBtn = New-Object System.Windows.Forms.Button
+        $noBtn.Text = 'No'
+        $noBtn.Size = New-Object System.Drawing.Size($btnWidth, $btnHeight)
+        $noBtn.Location = New-Object System.Drawing.Point(($dlgWidth - $marginX - $btnWidth), $buttonY)
+        $noBtn.DialogResult = [System.Windows.Forms.DialogResult]::No
+        Initialize-ModernButton -Button $noBtn
+
+        $yesBtn = New-Object System.Windows.Forms.Button
+        $yesBtn.Text = 'Yes'
+        $yesBtn.Size = New-Object System.Drawing.Size($btnWidth, $btnHeight)
+        $yesBtn.Location = New-Object System.Drawing.Point(($noBtn.Location.X - $btnGap - $btnWidth), $buttonY)
+        $yesBtn.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        Initialize-ModernButton -Button $yesBtn -Variant 'Accent'
+
+        $dlg.Controls.AddRange(@($iconPanel, $msgLabel, $yesBtn, $noBtn))
+        $dlg.AcceptButton = $yesBtn
+        $dlg.CancelButton = $noBtn
+    } else {
+        $okBtn = New-Object System.Windows.Forms.Button
+        $okBtn.Text = 'OK'
+        $okBtn.Size = New-Object System.Drawing.Size($btnWidth, $btnHeight)
+        $okBtn.Location = New-Object System.Drawing.Point(($dlgWidth - $marginX - $btnWidth), $buttonY)
+        $okBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        Initialize-ModernButton -Button $okBtn -Variant 'Accent'
+
+        $dlg.Controls.AddRange(@($iconPanel, $msgLabel, $okBtn))
+        $dlg.AcceptButton = $okBtn
+        $dlg.CancelButton = $okBtn
+    }
+
+    # Parented to whichever window is currently active/focused (which may
+    # already be another themed dialog, not the main window) rather than
+    # always $form, so a confirmation raised from inside e.g. Manage Groups
+    # nests under (and is modal to) that dialog instead of the main window
+    # behind it - the same "active window" behavior the parameterless
+    # native MessageBox.Show already had.
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if (-not $owner) { $owner = $form }
+    $dlgResult = if ($owner) { $dlg.ShowDialog($owner) } else { $dlg.ShowDialog() }
+
+    switch ($dlgResult) {
+        ([System.Windows.Forms.DialogResult]::Yes) { return 'Yes' }
+        ([System.Windows.Forms.DialogResult]::No)  { return 'No' }
+        default { return 'OK' }
+    }
 }
 
 # Fully custom tab strip, used instead of the native TabControl. TabControl
@@ -2219,7 +2406,7 @@ $script:AppDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else 
 # Single source of truth for the version shown in About and compared
 # against GitHub's latest release tag by the update checker - bump this
 # (and CHANGELOG.md) on every release instead of editing the About label.
-$script:AppVersion = '1.19.1'
+$script:AppVersion = '1.20.0'
 $script:UpdateRepo = 'zanopyth/local-host-manager'
 
 function Get-AppIcon {
@@ -2598,14 +2785,14 @@ function New-DashboardPill {
 }
 
 function New-ActionBusyIndicator {
-    # Same ring+dot look as the dashboard pill above (square in Terminal
-    # theme, rounded otherwise - both just read $script:Theme.Radius),
-    # repurposed as a busy light: hidden at rest, shown and blinking
-    # red/green for the duration of a Start/Stop/Restart action so a
-    # Wait-UiResponsive pause reads as "working" instead of "frozen".
+    # Busy light: hidden at rest, shown for the duration of a
+    # Start/Stop/Restart action (single or, via Start-GroupAll/Stop-
+    # GroupAll, the whole batch) as a plain outer square + smaller inner
+    # square, with the band between the two filling red clockwise from 12
+    # o'clock as Progress (0..1) advances - see Draw-SquareRingProgress.
     $ind = New-Object System.Windows.Forms.Panel
     $ind.Size = New-Object System.Drawing.Size(34, 28)
-    $ind.Tag = [PSCustomObject]@{ Lit = $false }
+    $ind.Tag = [PSCustomObject]@{ Progress = 0.0 }
     $ind.Visible = $false
     $ind.Cursor = [System.Windows.Forms.Cursors]::Default
 
@@ -2622,47 +2809,16 @@ function New-ActionBusyIndicator {
 
         # -1 matters: without it, a container sized to exactly match the
         # ring (23x23, same as New-DashboardPill's own control) produces a
-        # path whose bottom/right edge sits at pixel 23 - one past the
+        # rect whose bottom/right edge sits at pixel 23 - one past the
         # last valid column/row (0-22) - so the 1px pen stroke along that
-        # edge gets clipped at the control boundary, leaving only the
-        # top/left of the ring visible. Same -1 New-DashboardPill already
-        # uses for exactly this reason.
+        # edge gets clipped at the control boundary. Same -1 New-
+        # DashboardPill already uses for exactly this reason.
         $size = [Math]::Min($s.Width, $s.Height) - 1
-        $rect = New-Object System.Drawing.Rectangle((($s.Width - $size) / 2), (($s.Height - $size) / 2), $size, $size)
-        $d = $rect.Height
-        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        if ($script:Theme.Radius -le 0) {
-            $path.AddRectangle($rect)
-        } else {
-            $path.AddArc($rect.X, $rect.Y, $d, $d, 90, 180)
-            $path.AddArc($rect.Right - $d, $rect.Y, $d, $d, 270, 180)
-            $path.CloseFigure()
-        }
+        $outerRect = New-Object System.Drawing.Rectangle((($s.Width - $size) / 2), (($s.Height - $size) / 2), $size, $size)
+        $inset = [Math]::Max(4, [int]($size * 0.3))
+        $innerRect = New-Object System.Drawing.Rectangle(($outerRect.X + $inset), ($outerRect.Y + $inset), ($size - 2 * $inset), ($size - 2 * $inset))
 
-        $ringColor = if ($t.Lit) { $script:Theme.Success } else { $script:Theme.Danger }
-        $fillColor = if ($t.Lit) { $script:Theme.SuccessTint } else { $script:Theme.DangerTint }
-
-        $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
-        $g.FillPath($fillBrush, $path)
-        $fillBrush.Dispose()
-
-        $borderPen = New-Object System.Drawing.Pen($ringColor, 1)
-        $g.DrawPath($borderPen, $path)
-        $borderPen.Dispose()
-
-        $dotSize = 8.0
-        $cx = $rect.X + ($rect.Width / 2.0)
-        $cy = $rect.Y + ($rect.Height / 2.0)
-        $dotRect = New-Object System.Drawing.RectangleF(($cx - $dotSize / 2.0), ($cy - $dotSize / 2.0), $dotSize, $dotSize)
-        $dotBrush = New-Object System.Drawing.SolidBrush($ringColor)
-        if ($script:Theme.Radius -le 0) {
-            $g.FillRectangle($dotBrush, $dotRect.X, $dotRect.Y, $dotRect.Width, $dotRect.Height)
-        } else {
-            $g.FillEllipse($dotBrush, $dotRect)
-        }
-        $dotBrush.Dispose()
-
-        $path.Dispose()
+        Draw-SquareRingProgress -Graphics $g -OuterRect $outerRect -InnerRect $innerRect -Progress $t.Progress -RingColor $script:Theme.Border -FillColor $script:Theme.Danger
     })
 
     return $ind
@@ -2906,20 +3062,38 @@ $script:ActionBusyTip = New-Object System.Windows.Forms.ToolTip
 $script:ActionBusyTip.InitialDelay = 300
 $script:ActionBusyTip.SetToolTip($script:ActionBusyIndicator, 'Working...')
 
+# 30ms/0.05 per tick sweeps one full clockwise revolution in ~600ms - fast
+# enough to read as continuously "alive" through even a single Stop/Start's
+# 400-800ms Wait-UiResponsive pause, instead of the old 350ms on/off blink.
 $script:ActionBusyTimer = New-Object System.Windows.Forms.Timer
-$script:ActionBusyTimer.Interval = 350
+$script:ActionBusyTimer.Interval = 30
 $script:ActionBusyTimer.Add_Tick({
     $t = $script:ActionBusyIndicator.Tag
-    $t.Lit = -not $t.Lit
+    $t.Progress += 0.05
+    if ($t.Progress -gt 1.0) { $t.Progress -= 1.0 }
     $script:ActionBusyIndicator.Invalidate()
 })
 
 function Start-ActionBusyIndicator {
-    if ($script:ActionBusyTimer.Enabled) { return }
-    $script:ActionBusyIndicator.Tag.Lit = $true
+    # -Determinate is for Start-GroupAll/Stop-GroupAll, which know a real
+    # completed/total and drive the ring via Set-ActionBusyProgress instead
+    # - it skips the free-running sweep timer so the ring fills once across
+    # the whole batch instead of looping a full revolution per project.
+    # Without it (a single Start/Stop/Restart, no known total), the timer
+    # keeps the ring sweeping continuously so the action still reads as
+    # "alive" rather than a static light.
+    param([switch]$Determinate)
+    $script:ActionBusyTimer.Stop()
+    $script:ActionBusyIndicator.Tag.Progress = 0.0
     $script:ActionBusyIndicator.Visible = $true
     $script:ActionBusyIndicator.Invalidate()
-    $script:ActionBusyTimer.Start()
+    if (-not $Determinate) { $script:ActionBusyTimer.Start() }
+}
+
+function Set-ActionBusyProgress {
+    param([double]$Progress)
+    $script:ActionBusyIndicator.Tag.Progress = $Progress
+    $script:ActionBusyIndicator.Invalidate()
 }
 
 function Stop-ActionBusyIndicator {
@@ -4946,7 +5120,7 @@ function Test-PortCollision {
         $title = 'Port In Use'
         $message = "Port $Port is already in use by $who, which doesn't look related to $Label. Starting now will very likely fail immediately.`n`nKill that process and start anyway?"
     }
-    $confirm = [System.Windows.Forms.MessageBox]::Show($message, $title, 'YesNo', 'Warning')
+    $confirm = Show-ThemedMessageBox -Message $message -Title $title -Buttons YesNo -Icon Warning
     if ($confirm -ne 'Yes') { return $false }
 
     Invoke-TaskKill -ProcId $info.ProcId -LogContext "port $Port" | Out-Null
@@ -4965,28 +5139,33 @@ function Invoke-ToggleAction {
     $script:ActionBusy = $true
     try {
         if ($data.Status -eq 'ON') {
-            $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "Stop $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
-                'Confirm Stop', 'YesNo', 'Warning')
+            $confirm = Show-ThemedMessageBox -Message "Stop $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?" -Title 'Confirm Stop' -Buttons YesNo -Icon Warning
             if ($confirm -ne 'Yes') { return }
             Start-ActionBusyIndicator
-            if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
-                [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+            $ok = Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath
+            # Stopped here, before the possible error dialog below - not in
+            # the outer finally - so the ring isn't still animating behind
+            # a modal the user hasn't dismissed yet.
+            Stop-ActionBusyIndicator
+            if (-not $ok) {
+                Show-ThemedMessageBox -Message 'Could not stop process.' -Title 'Error' -Icon Error | Out-Null
             }
         } else {
             if (-not $data.ProjectPath) {
-                [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Start', 'OK', 'Warning') | Out-Null
+                Show-ThemedMessageBox -Message 'No known project path for this port.' -Title 'Cannot Start' -Icon Warning | Out-Null
                 return
             }
             if (-not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-                [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
+                Show-ThemedMessageBox -Message "This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time." -Title 'No Known Start Command' -Icon Warning | Out-Null
                 return
             }
-            Start-ActionBusyIndicator
             $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
             if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
-            if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-                [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
+            Start-ActionBusyIndicator
+            $ok = Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine
+            Stop-ActionBusyIndicator
+            if (-not $ok) {
+                Show-ThemedMessageBox -Message 'Could not start project.' -Title 'Error' -Icon Error | Out-Null
             }
         }
         Wait-UiResponsive -Milliseconds 800
@@ -5000,35 +5179,37 @@ function Invoke-ToggleAction {
 function Invoke-Restart {
     param($data)
     if (-not $data.ProjectPath) {
-        [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Restart', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message 'No known project path for this port.' -Title 'Cannot Restart' -Icon Warning | Out-Null
         return
     }
     if ($data.Status -ne 'ON' -and -not (Test-ProjectStartable -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-        [System.Windows.Forms.MessageBox]::Show("This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time.", 'No Known Start Command', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message "This isn't an npm project (no package.json) and hasn't been seen running since command-line capture was added, so there's no known command to start it with. Run it manually once while it's live and LocalhostManager will remember it for next time." -Title 'No Known Start Command' -Icon Warning | Out-Null
         return
     }
     if ($script:ActionBusy) { return }
     $script:ActionBusy = $true
     try {
         if ($data.Status -eq 'ON') {
-            $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "Restart $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?",
-                'Confirm Restart', 'YesNo', 'Warning')
+            $confirm = Show-ThemedMessageBox -Message "Restart $($data.ProcessName) (PID $($data.ProcId)) listening on port $($data.Port)?" -Title 'Confirm Restart' -Buttons YesNo -Icon Warning
             if ($confirm -ne 'Yes') { return }
             Start-ActionBusyIndicator
-            if (-not (Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath)) {
-                [System.Windows.Forms.MessageBox]::Show('Could not stop process.', 'Error', 'OK', 'Error') | Out-Null
+            $stopOk = Stop-ProjectById -ProcId $data.ProcId -ProjectPath $data.ProjectPath
+            Stop-ActionBusyIndicator
+            if (-not $stopOk) {
+                Show-ThemedMessageBox -Message 'Could not stop process.' -Title 'Error' -Icon Error | Out-Null
                 return
             }
             Wait-UiResponsive -Milliseconds 800
         }
 
-        Start-ActionBusyIndicator
         $label = if ($data.CustomName) { $data.CustomName } else { Split-Path -Leaf $data.ProjectPath }
         if (-not (Test-PortCollision -ProjectPath $data.ProjectPath -Port ([int]$data.Port) -Label $label)) { return }
 
-        if (-not (Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine)) {
-            [System.Windows.Forms.MessageBox]::Show('Could not start project.', 'Error', 'OK', 'Error') | Out-Null
+        Start-ActionBusyIndicator
+        $startOk = Start-ProjectAtPath -ProjectPath $data.ProjectPath -CommandLine $data.CommandLine
+        Stop-ActionBusyIndicator
+        if (-not $startOk) {
+            Show-ThemedMessageBox -Message 'Could not start project.' -Title 'Error' -Icon Error | Out-Null
         }
         Wait-UiResponsive -Milliseconds 800
         Refresh-Grid
@@ -5374,7 +5555,7 @@ function Show-AppErrorLogViewer {
     $projectCombo.Add_SelectedIndexChanged({ Update-AppLogText })
 
     $clearButton.Add_Click({
-        $confirm = [System.Windows.Forms.MessageBox]::Show('Clear the error log? This cannot be undone.', 'Clear Log', 'YesNo', 'Warning')
+        $confirm = Show-ThemedMessageBox -Message 'Clear the error log? This cannot be undone.' -Title 'Clear Log' -Buttons YesNo -Icon Warning
         if ($confirm -ne 'Yes') { return }
         try { if (Test-Path $script:AppLogPath) { Clear-Content -Path $script:AppLogPath -Force } } catch {}
         Update-AppLogText
@@ -5804,7 +5985,7 @@ function Show-DeployConfigDialog {
     $validateBtn.Add_Click({
         $warning = Get-MissingBuildScriptWarning -WorkingDir $workDirRow.Box.Text -BuildCommand $buildRow.Box.Text
         if (-not $warning) {
-            [System.Windows.Forms.MessageBox]::Show('Build command looks fine - the referenced script exists (or this command is not an "npm/yarn/pnpm run <script>" form this check applies to).', 'Validation Passed', 'OK', 'Information') | Out-Null
+            Show-ThemedMessageBox -Message 'Build command looks fine - the referenced script exists (or this command is not an "npm/yarn/pnpm run <script>" form this check applies to).' -Title 'Validation Passed' | Out-Null
             return
         }
         # Never offers to write a fake "build" script into the folder's
@@ -5819,7 +6000,7 @@ function Show-DeployConfigDialog {
         $scriptName = Get-NpmScriptNameFromCommand -BuildCommand $buildRow.Box.Text
         $suggestedDir = Find-SiblingBuildFolder -WorkingDir $workDirRow.Box.Text -ScriptName $scriptName
         if ($suggestedDir) {
-            $answer = [System.Windows.Forms.MessageBox]::Show("$warning`r`n`r`nFound a sibling folder that does have a `"$scriptName`" script:`r`n$suggestedDir`r`n`r`nSwitch Project folder (and Build output folder) to it?", 'Build Script Not Found', 'YesNo', 'Warning')
+            $answer = Show-ThemedMessageBox -Message "$warning`r`n`r`nFound a sibling folder that does have a `"$scriptName`" script:`r`n$suggestedDir`r`n`r`nSwitch Project folder (and Build output folder) to it?" -Title 'Build Script Not Found' -Buttons YesNo -Icon Warning
             if ($answer -eq 'Yes') {
                 $workDirRow.Box.Text = $suggestedDir
                 $workDirRow.Box.SelectionStart = 0
@@ -5830,7 +6011,7 @@ function Show-DeployConfigDialog {
                 Update-DeploySummary
             }
         } else {
-            [System.Windows.Forms.MessageBox]::Show($warning, 'Build Script Not Found', 'OK', 'Warning') | Out-Null
+            Show-ThemedMessageBox -Message $warning -Title 'Build Script Not Found' -Icon Warning | Out-Null
         }
     }.GetNewClosure())
     Initialize-ModernButton -Button $validateBtn
@@ -5865,7 +6046,7 @@ function Show-DeployConfigDialog {
 
     if ($dlg.Tag -ne 'OK') { return $null }
     if (-not $workDirRow.Box.Text -or -not $sourceRow.Box.Text -or $targetsList.Items.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('The project folder, the build output folder, and at least one deploy target folder are all required.', 'Missing Folder', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message 'The project folder, the build output folder, and at least one deploy target folder are all required.' -Title 'Missing Folder' -Icon Warning | Out-Null
         return $null
     }
 
@@ -6152,7 +6333,7 @@ function Invoke-DeployForProject {
     # Show-DeployConfigDialog).
     param([string]$ProjectPath, [string]$Label, [string]$Port)
     if (-not $ProjectPath) {
-        [System.Windows.Forms.MessageBox]::Show('No known project path for this port.', 'Cannot Deploy', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message 'No known project path for this port.' -Title 'Cannot Deploy' -Icon Warning | Out-Null
         return
     }
     $key = Get-NormalizedPath $ProjectPath
@@ -7460,7 +7641,7 @@ function Show-SettingsDialog {
         Refresh-Grid
 
         if ($themeChanged) {
-            $restart = [System.Windows.Forms.MessageBox]::Show('Restart Localhost Manager now to apply the new theme?', 'Theme Changed', 'YesNo', 'Question')
+            $restart = Show-ThemedMessageBox -Message 'Restart Localhost Manager now to apply the new theme?' -Title 'Theme Changed' -Buttons YesNo -Icon Question
             if ($restart -eq 'Yes') { Restart-App }
         }
     }
@@ -8007,7 +8188,7 @@ function Show-ManageGroupsDialog {
     $saveButton.Add_Click({
         $name = $nameCombo.Text.Trim()
         if (-not $name) {
-            [System.Windows.Forms.MessageBox]::Show('Enter a group name.', 'Cannot Save', 'OK', 'Warning') | Out-Null
+            Show-ThemedMessageBox -Message 'Enter a group name.' -Title 'Cannot Save' -Icon Warning | Out-Null
             return
         }
         # Read from CheckedPaths (normalized) against the FULL KnownProjects
@@ -8027,7 +8208,7 @@ function Show-ManageGroupsDialog {
             $pinnedNote = " Pinned $pinnedCount port(s) on record for this group."
         }
         Refresh-Grid
-        [System.Windows.Forms.MessageBox]::Show("Saved group '$name' with $($paths.Count) project(s).$pinnedNote", 'Saved', 'OK', 'Information') | Out-Null
+        Show-ThemedMessageBox -Message "Saved group '$name' with $($paths.Count) project(s).$pinnedNote" -Title 'Saved' | Out-Null
     })
 
     $deleteButton = New-Object System.Windows.Forms.Button
@@ -8038,7 +8219,7 @@ function Show-ManageGroupsDialog {
     $deleteButton.Add_Click({
         $name = $nameCombo.Text.Trim()
         if (-not $name -or -not $script:Groups.ContainsKey($name)) { return }
-        $confirm = [System.Windows.Forms.MessageBox]::Show("Delete group '$name'?", 'Confirm Delete', 'YesNo', 'Warning')
+        $confirm = Show-ThemedMessageBox -Message "Delete group '$name'?" -Title 'Confirm Delete' -Buttons YesNo -Icon Warning
         if ($confirm -ne 'Yes') { return }
         $script:Groups.Remove($name)
         Save-Groups $script:Groups
@@ -8066,12 +8247,19 @@ function Show-ManageGroupsDialog {
     $dlg.ShowDialog($form) | Out-Null
 }
 
+# Guards Start-GroupAll/Stop-GroupAll against reentrancy - each pumps the
+# message loop once per item (see the DoEvents comment below), which would
+# otherwise let a second, still-queued click on Start All/Stop All start a
+# nested run of one of these functions while the first is mid-loop.
+$script:GroupActionBusy = $false
+
 function Start-GroupAll {
     param([string[]]$Names)
+    if ($script:GroupActionBusy) { return }
 
     $Names = @($Names | Where-Object { $_ -and $script:Groups.ContainsKey($_) })
     if ($Names.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Pick at least one group first (or create one via Manage Groups).', 'No Group Selected', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message 'Pick at least one group first (or create one via Manage Groups).' -Title 'No Group Selected' -Icon Warning | Out-Null
         return
     }
     $label = $Names -join ', '
@@ -8080,19 +8268,48 @@ function Start-GroupAll {
     $allRows = @(Build-Rows -OnlyNode $false -RootDir '')
     $toStart = @($allRows | Where-Object { $_.Status -eq 'OFF' -and $_.ProjectPath -and $paths.Contains((Get-NormalizedPath $_.ProjectPath)) })
 
+    # A stopped project can have more than one historical port entry (e.g.
+    # a prod + test port convention, or a leftover row from before a
+    # rename) - each is its own OFF row, but starting the project is still
+    # a single action. Collapse to one row per project path, or Start All
+    # would launch the same project two or three times over and count it
+    # as that many separate projects. $allRows is already Port-ascending,
+    # so Group-Object keeps the lowest/primary port's row per project.
+    $toStart = @($toStart | Group-Object { Get-NormalizedPath $_.ProjectPath } | ForEach-Object { $_.Group[0] })
+
     if ($toStart.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Everything in '$label' is already running (or has no known path).", 'Nothing to Start', 'OK', 'Information') | Out-Null
+        Show-ThemedMessageBox -Message "Everything in '$label' is already running (or has no known path)." -Title 'Nothing to Start' | Out-Null
         return
     }
+    $script:GroupActionBusy = $true
+    $startAllButton.Enabled = $false
+    $stopAllButton.Enabled = $false
+    Start-ActionBusyIndicator -Determinate
     $started = 0
-    foreach ($row in $toStart) {
-        $rowLabel = if ($row.CustomName) { $row.CustomName } else { Split-Path -Leaf $row.ProjectPath }
-        if (-not (Test-PortCollision -ProjectPath $row.ProjectPath -Port ([int]$row.Port) -Label $rowLabel)) { continue }
-        if (Start-ProjectAtPath -ProjectPath $row.ProjectPath -CommandLine $row.CommandLine) { $started++ }
+    try {
+        for ($i = 0; $i -lt $toStart.Count; $i++) {
+            $row = $toStart[$i]
+            $rowLabel = if ($row.CustomName) { $row.CustomName } else { Split-Path -Leaf $row.ProjectPath }
+            if ((Test-PortCollision -ProjectPath $row.ProjectPath -Port ([int]$row.Port) -Label $rowLabel) -and
+                (Start-ProjectAtPath -ProjectPath $row.ProjectPath -CommandLine $row.CommandLine)) { $started++ }
+            Set-ActionBusyProgress -Progress (($i + 1) / [double]$toStart.Count)
+            # Pumps the message loop so the ring's repaint actually lands
+            # between projects - same idiom Wait-UiResponsive already uses
+            # elsewhere in this file.
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } finally {
+        # Runs (and hides the ring / re-enables the buttons) before the
+        # summary dialog below, not after - otherwise the ring keeps
+        # animating behind that modal, frozen-looking, until it's dismissed.
+        Stop-ActionBusyIndicator
+        $startAllButton.Enabled = $true
+        $stopAllButton.Enabled = $true
+        $script:GroupActionBusy = $false
     }
     Start-Sleep -Milliseconds 1000
     Refresh-Grid
-    [System.Windows.Forms.MessageBox]::Show("Started $started of $($toStart.Count) project(s) in '$label'.", 'Start All', 'OK', 'Information') | Out-Null
+    Show-ThemedMessageBox -Message "Started $started of $($toStart.Count) project(s) in '$label'." -Title 'Start All' | Out-Null
 }
 
 function Stop-GroupAll {
@@ -8101,34 +8318,53 @@ function Stop-GroupAll {
     # below) instead of this blocking dialog. The per-group context-menu
     # item still calls this without -SkipConfirm, so it keeps the dialog.
     param([string[]]$Names, [switch]$SkipConfirm)
+    if ($script:GroupActionBusy) { return }
 
     $Names = @($Names | Where-Object { $_ -and $script:Groups.ContainsKey($_) })
     if ($Names.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Pick at least one group first (or create one via Manage Groups).', 'No Group Selected', 'OK', 'Warning') | Out-Null
+        Show-ThemedMessageBox -Message 'Pick at least one group first (or create one via Manage Groups).' -Title 'No Group Selected' -Icon Warning | Out-Null
         return
     }
     $label = $Names -join ', '
     $paths = New-Object System.Collections.Generic.HashSet[string]
     foreach ($n in $Names) { foreach ($p in $script:Groups[$n]) { [void]$paths.Add((Get-NormalizedPath $p)) } }
     $allRows = @(Build-Rows -OnlyNode $false -RootDir '')
+    # Unlike the OFF/history rows above, each ON row here is a distinct
+    # live process with its own real PID - a project legitimately running
+    # on more than one port at once (e.g. prod + test both up) means more
+    # than one thing to actually stop, so this list is left as-is.
     $toStop = @($allRows | Where-Object { $_.Status -eq 'ON' -and $_.ProjectPath -and $paths.Contains((Get-NormalizedPath $_.ProjectPath)) })
 
     if ($toStop.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Nothing in '$label' is currently running.", 'Nothing to Stop', 'OK', 'Information') | Out-Null
+        Show-ThemedMessageBox -Message "Nothing in '$label' is currently running." -Title 'Nothing to Stop' | Out-Null
         return
     }
     if (-not $SkipConfirm) {
         $list = ($toStop | ForEach-Object { "$($_.ProcessName) (port $($_.Port))" }) -join "`n"
-        $confirm = [System.Windows.Forms.MessageBox]::Show("Stop these $($toStop.Count) process(es)?`n`n$list", 'Confirm Stop All', 'YesNo', 'Warning')
+        $confirm = Show-ThemedMessageBox -Message "Stop these $($toStop.Count) process(es)?`n`n$list" -Title 'Confirm Stop All' -Buttons YesNo -Icon Warning
         if ($confirm -ne 'Yes') { return }
     }
 
+    $script:GroupActionBusy = $true
+    $startAllButton.Enabled = $false
+    $stopAllButton.Enabled = $false
+    Start-ActionBusyIndicator -Determinate
     $stopped = 0
-    foreach ($row in $toStop) {
-        if (Stop-ProjectById -ProcId $row.ProcId -ProjectPath $row.ProjectPath) { $stopped++ }
+    try {
+        for ($i = 0; $i -lt $toStop.Count; $i++) {
+            $row = $toStop[$i]
+            if (Stop-ProjectById -ProcId $row.ProcId -ProjectPath $row.ProjectPath) { $stopped++ }
+            Set-ActionBusyProgress -Progress (($i + 1) / [double]$toStop.Count)
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } finally {
+        Stop-ActionBusyIndicator
+        $startAllButton.Enabled = $true
+        $stopAllButton.Enabled = $true
+        $script:GroupActionBusy = $false
     }
     Refresh-Grid
-    [System.Windows.Forms.MessageBox]::Show("Stopped $stopped of $($toStop.Count) process(es) in '$label'.", 'Stop All', 'OK', 'Information') | Out-Null
+    Show-ThemedMessageBox -Message "Stopped $stopped of $($toStop.Count) process(es) in '$label'." -Title 'Stop All' | Out-Null
 }
 
 # Stop All is destructive, so it keeps a confirm step — but as an inline
@@ -9252,6 +9488,10 @@ try {
     Start-UpdateCheck
 } catch {
     Write-AppErrorLog -Context 'Startup error' -Exception $_.Exception
+    # Stays on the native MessageBox deliberately - this is the last-resort
+    # catch around the app's own startup, so it must not depend on
+    # Show-ThemedMessageBox or anything else that startup might be the
+    # thing that failed to set up.
     [System.Windows.Forms.MessageBox]::Show("Startup error: $_", 'Error') | Out-Null
 }
 
